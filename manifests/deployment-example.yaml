@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-with-labeler
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      serviceAccountName: redis-master-label
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        command:
+        - redis-server
+        - --replicaof
+        - "redis-leader.default.svc.cluster.local"
+        - "6379"
+      - name: redis-master-label
+        image: redis-master-label:latest
+        env:
+        - name: HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        command:
+        - /app/redis-master-label
+        - --redis-addr=localhost:6379
+        - --label-key=redis-role
+        - --label-value=master
+        - --check-interval=10s
