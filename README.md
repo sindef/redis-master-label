@@ -20,6 +20,7 @@ Flags (all have sensible defaults):
 - `--redis-addr` (default `localhost:6379`)
 - `--redis-password` (default empty)
 - `--redis-tls` (default `false`)
+- `--redis-tls-skip-verify` (default `false`)
 - `--label-key` (default `redis-role`)
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
