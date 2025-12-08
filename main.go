@@ -15,14 +15,15 @@ import (
 )
 
 var (
-	redisAddr     = flag.String("redis-addr", "localhost:6379", "Redis server address")
-	redisPassword = flag.String("redis-password", "", "Redis password")
-	redisTLS      = flag.Bool("redis-tls", false, "Enable TLS for Redis connection")
-	labelKey      = flag.String("label-key", "redis-role", "Kubernetes label key to set")
-	labelValue    = flag.String("label-value", "master", "Kubernetes label value for master")
-	podName       = flag.String("pod-name", "", "Pod name to label (defaults to HOSTNAME env var)")
-	podNamespace  = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
-	checkInterval = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
+	redisAddr        = flag.String("redis-addr", "localhost:6379", "Redis server address")
+	redisPassword    = flag.String("redis-password", "", "Redis password")
+	redisTLS         = flag.Bool("redis-tls", false, "Enable TLS for Redis connection")
+	redisTLSInsecure = flag.Bool("redis-tls-insecure", false, "Skip TLS certificate verification for Redis connection")
+	labelKey         = flag.String("label-key", "redis-role", "Kubernetes label key to set")
+	labelValue       = flag.String("label-value", "master", "Kubernetes label value for master")
+	podName          = flag.String("pod-name", "", "Pod name to label (defaults to HOSTNAME env var)")
+	podNamespace     = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
+	checkInterval    = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
 )
 
 func main() {
@@ -62,7 +63,7 @@ func main() {
 
 	if *redisTLS {
 		redisOptions.TLSConfig = &tls.Config{
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: *redisTLSInsecure,
 		}
 	}
 
