@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -24,6 +26,15 @@ var (
 	podName            = flag.String("pod-name", "", "Pod name to label (defaults to HOSTNAME env var)")
 	podNamespace       = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
 	checkInterval      = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
+	healthPort         = flag.String("health-port", "8080", "Port for health check HTTP server")
+)
+
+var (
+	healthStatus struct {
+		mu                  sync.RWMutex
+		consecutiveFailures int
+		isHealthy           bool
+	}
 )
 
 func main() {
@@ -72,7 +83,19 @@ func main() {
 
 	ctx := context.Background()
 
+	// Start health check HTTP server
+	go startHealthServer(*healthPort)
+
+	// Initialize health status as healthy
+	healthStatus.mu.Lock()
+	healthStatus.isHealthy = true
+	healthStatus.consecutiveFailures = 0
+	healthStatus.mu.Unlock()
+
 	for {
+		// Update health status based on Redis connectivity
+		updateHealthStatus(ctx, rdb)
+
 		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
@@ -96,17 +119,19 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 		return fmt.Errorf("unexpected ROLE response format")
 	}
 
+	pod, err := clientset.CoreV1().Pods(*podNamespace).Get(ctx, *podName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get pod: %w", err)
+	}
+
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+
+	currentValue, exists := pod.Labels[*labelKey]
+
 	if roleStr == "master" {
-		pod, err := clientset.CoreV1().Pods(*podNamespace).Get(ctx, *podName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get pod: %w", err)
-		}
-
-		if pod.Labels == nil {
-			pod.Labels = make(map[string]string)
-		}
-
-		currentValue, exists := pod.Labels[*labelKey]
+		// Label the pod if it's master
 		if !exists || currentValue != *labelValue {
 			pod.Labels[*labelKey] = *labelValue
 			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
@@ -115,7 +140,63 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 			}
 			fmt.Printf("Labeled pod %s/%s with %s=%s\n", *podNamespace, *podName, *labelKey, *labelValue)
 		}
+	} else {
+		// Remove the label if it exists and the pod is no longer master
+		if exists && currentValue == *labelValue {
+			delete(pod.Labels, *labelKey)
+			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to remove pod label: %w", err)
+			}
+			fmt.Printf("Removed label %s from pod %s/%s (no longer master)\n", *labelKey, *podNamespace, *podName)
+		}
 	}
 
 	return nil
+}
+
+func startHealthServer(port string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		healthStatus.mu.RLock()
+		healthy := healthStatus.isHealthy
+		healthStatus.mu.RUnlock()
+
+		if healthy {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "OK\n")
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, "Unhealthy\n")
+		}
+	})
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	fmt.Printf("Starting health check server on port %s\n", port)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "health check server error: %v\n", err)
+	}
+}
+
+func updateHealthStatus(ctx context.Context, rdb *redis.Client) {
+	_, err := rdb.Do(ctx, "ROLE").Result()
+	if err != nil {
+		healthStatus.mu.Lock()
+		healthStatus.consecutiveFailures++
+		if healthStatus.consecutiveFailures >= 3 {
+			healthStatus.isHealthy = false
+		}
+		healthStatus.mu.Unlock()
+		return
+	}
+
+	// Success - reset failure counter and mark as healthy
+	healthStatus.mu.Lock()
+	healthStatus.consecutiveFailures = 0
+	healthStatus.isHealthy = true
+	healthStatus.mu.Unlock()
 }

@@ -5,15 +5,19 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 ## What it does
 - Connects to Redis and runs the `ROLE` command on a fixed interval.
 - If the instance reports `master`, it patches the current pod with a configurable label key/value.
+- If the instance is no longer `master`, it removes the label from the pod.
+- Provides a health check HTTP endpoint (`/healthz`) that monitors Redis connectivity.
 - Runs inside the cluster using in-cluster Kubernetes credentials.
 
 ## How it works
-1. Starts with flags/env for Redis connection, label key/value, pod name/namespace, and check interval.
+1. Starts with flags/env for Redis connection, label key/value, pod name/namespace, check interval, and health port.
 2. Builds a Kubernetes client from in-cluster config.
-3. On each interval:
-   - Executes `ROLE` against Redis.
+3. Starts an HTTP server for health checks on the configured port (default 8080).
+4. On each interval:
+   - Executes `ROLE` against Redis to check connectivity and update health status.
    - If the role is `master`, fetches the current pod and ensures the label key/value is set.
-4. Repeats forever.
+   - If the role is not `master` and the label exists, removes the label from the pod.
+5. Repeats forever.
 
 ## Configuration
 Flags (all have sensible defaults):
@@ -26,6 +30,7 @@ Flags (all have sensible defaults):
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
 - `--check-interval` (default `10s`)
+- `--health-port` (default `8080`)
 
 Environment defaults:
 - `HOSTNAME` used when `--pod-name` not provided.
@@ -37,7 +42,7 @@ go build -o redis-master-label .
 ./redis-master-label --redis-addr localhost:6379
 ```
 
-## Container build
+## Container build,
 ```bash
 # Build image using the provided Containerfile
 podman build -t redis-master-label:latest .
@@ -83,7 +88,22 @@ env:
 - Needs `get` and `update` on the Pod resource in its namespace.
 - The provided Role/RoleBinding in `manifests/` scope this to the pod’s namespace.
 
+## Health Check Endpoint
+
+The application provides a health check endpoint at `/healthz` that:
+- Returns `200 OK` when healthy
+- Returns `503 Service Unavailable` when unhealthy
+- Monitors Redis connectivity by executing the `ROLE` command
+- Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
+- Runs on port 8080 by default (configurable via `--health-port`)
+
+Example:
+```bash
+curl http://localhost:8080/healthz
+```
+
 ## Operational notes
-- Labels only applied when the instance is `master`; no action taken for replicas.
+- Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
-- If using TLS, set `--redis-tls` and `--redis-tls-skip-verify` if required. 
+- If using TLS, set `--redis-tls` and `--redis-tls-skip-verify` if required.
+- The health check endpoint can be used by Kubernetes liveness/readiness probes. 
