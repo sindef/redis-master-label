@@ -36,11 +36,12 @@ Environment defaults:
 - `HOSTNAME` used when `--pod-name` not provided.
 - `POD_NAMESPACE` used when `--pod-namespace` not provided.
 
-## Building and running locally
+## Building locally
 ```bash
 go build -o redis-master-label .
-./redis-master-label --redis-addr localhost:6379
 ```
+
+Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
 ## Container build,
 ```bash
