@@ -103,22 +103,34 @@ func main() {
 	}
 }
 
-func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes.Clientset) error {
+func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset kubernetes.Interface) error {
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
 	}
 
+	roleStr, err := roleFromResponse(role)
+	if err != nil {
+		return err
+	}
+
+	return applyLabel(ctx, clientset, roleStr)
+}
+
+func roleFromResponse(role interface{}) (string, error) {
 	roleArray, ok := role.([]interface{})
 	if !ok || len(roleArray) == 0 {
-		return fmt.Errorf("unexpected ROLE response format")
+		return "", fmt.Errorf("unexpected ROLE response format")
 	}
 
 	roleStr, ok := roleArray[0].(string)
 	if !ok {
-		return fmt.Errorf("unexpected ROLE response format")
+		return "", fmt.Errorf("unexpected ROLE response format")
 	}
+	return roleStr, nil
+}
 
+func applyLabel(ctx context.Context, clientset kubernetes.Interface, roleStr string) error {
 	pod, err := clientset.CoreV1().Pods(*podNamespace).Get(ctx, *podName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get pod: %w", err)
@@ -155,7 +167,7 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 	return nil
 }
 
-func startHealthServer(port string) {
+func healthHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		healthStatus.mu.RLock()
@@ -170,10 +182,13 @@ func startHealthServer(port string) {
 			fmt.Fprintf(w, "Unhealthy\n")
 		}
 	})
+	return mux
+}
 
+func startHealthServer(port string) {
 	server := &http.Server{
 		Addr:    ":" + port,
-		Handler: mux,
+		Handler: healthHandler(),
 	}
 
 	fmt.Printf("Starting health check server on port %s\n", port)
