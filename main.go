@@ -103,7 +103,14 @@ func main() {
 	}
 }
 
-func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset kubernetes.Interface) error {
+// roleQuerier answers context-bound Redis commands (ROLE) without requiring a
+// live connection, so the ROLE handling stays testable with a narrow stub.
+type roleQuerier interface {
+	Do(ctx context.Context, args ...interface{}) *redis.Cmd
+}
+
+// checkAndLabel reads the Redis ROLE reply and applies or removes the label.
+func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
@@ -197,7 +204,7 @@ func startHealthServer(port string) {
 	}
 }
 
-func updateHealthStatus(ctx context.Context, rdb *redis.Client) {
+func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
 	_, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		healthStatus.mu.Lock()
