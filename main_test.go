@@ -142,6 +142,64 @@ func TestCheckAndLabel_SlaveRoleWithoutLabelIsNoOp(t *testing.T) {
 	}
 }
 
+// A pod that is no longer master must lose the label key even when the value
+// under that key differs from --label-value, for example after a second writer
+// or a manual edit set it, or after --label-value changed while the pod was a
+// replica. Leaving the key in place would keep a Service selecting on that key
+// pointed at a non-master pod.
+func TestCheckAndLabel_NonMasterRemovesLabelWithForeignValue(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", map[string]string{testKey: "replica"}))
+
+	if err := applyLabel(context.Background(), cs, "slave"); err != nil {
+		t.Fatalf("applyLabel: %v", err)
+	}
+
+	pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if value, exists := pod.Labels[testKey]; exists {
+		t.Fatalf("label %s = %q still present, want the key removed", testKey, value)
+	}
+
+	updates := 0
+	for _, action := range cs.Actions() {
+		if action.GetVerb() == "update" {
+			updates++
+		}
+	}
+	if updates != 1 {
+		t.Fatalf("update calls = %d, want 1", updates)
+	}
+}
+
+// The same applies to any non-master role, not only "slave".
+func TestCheckAndLabel_NonMasterRolesRemoveForeignValueLabel(t *testing.T) {
+	defer configureTestFlags()()
+
+	for _, role := range []string{"slave", "sentinel"} {
+		t.Run(role, func(t *testing.T) {
+			cs := newPodClientset(testPod("test-pod", map[string]string{testKey: "previous-value", "keep": "me"}))
+
+			if err := applyLabel(context.Background(), cs, role); err != nil {
+				t.Fatalf("applyLabel: %v", err)
+			}
+
+			pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get pod: %v", err)
+			}
+			if value, exists := pod.Labels[testKey]; exists {
+				t.Fatalf("label %s = %q still present, want the key removed", testKey, value)
+			}
+			if pod.Labels["keep"] != "me" {
+				t.Fatalf("unrelated label keep = %q, want %q", pod.Labels["keep"], "me")
+			}
+		})
+	}
+}
+
 func TestCheckAndLabel_MissingPodReturnsError(t *testing.T) {
 	defer configureTestFlags()()
 	cs := newPodClientset()
@@ -201,6 +259,36 @@ func masterReply() []interface{} {
 		"master",
 		int64(12345),
 		[]interface{}{[]interface{}{"10.244.0.11", "6379", "12345"}},
+	}
+}
+
+// slaveReply mirrors the array layout Redis answers with for ROLE on a replica.
+func slaveReply() []interface{} {
+	return []interface{}{
+		"slave",
+		"10.244.0.10",
+		int64(6379),
+		"connected",
+		int64(12345),
+	}
+}
+
+// End-to-end through checkAndLabel: a full replica ROLE reply must still strip
+// a foreign value under the label key.
+func TestCheckAndLabel_SlaveReplyRemovesForeignValueLabel(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", map[string]string{testKey: "replica"}))
+
+	if err := checkAndLabel(context.Background(), stubRedis{reply: slaveReply()}, cs); err != nil {
+		t.Fatalf("checkAndLabel: %v", err)
+	}
+
+	pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if value, exists := pod.Labels[testKey]; exists {
+		t.Fatalf("label %s = %q still present, want the key removed", testKey, value)
 	}
 }
 
