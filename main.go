@@ -96,30 +96,42 @@ func main() {
 		// Update health status based on Redis connectivity
 		updateHealthStatus(ctx, rdb)
 
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
+		res, err := rdb.Do(ctx, "ROLE").Result()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error checking Redis role: failed to execute ROLE command: %v\n", err)
+			time.Sleep(*checkInterval)
+			continue
+		}
+
+		role, err := roleFromResponse(res)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
+			time.Sleep(*checkInterval)
+			continue
+		}
+
+		if err := checkAndLabel(ctx, clientset, *podNamespace, *podName, *labelKey, *labelValue, role); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
 		time.Sleep(*checkInterval)
 	}
 }
 
-func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes.Clientset) error {
-	role, err := rdb.Do(ctx, "ROLE").Result()
-	if err != nil {
-		return fmt.Errorf("failed to execute ROLE command: %w", err)
-	}
-
-	roleArray, ok := role.([]interface{})
+func roleFromResponse(res interface{}) (string, error) {
+	roleArray, ok := res.([]interface{})
 	if !ok || len(roleArray) == 0 {
-		return fmt.Errorf("unexpected ROLE response format")
+		return "", fmt.Errorf("unexpected ROLE response format")
 	}
 
-	roleStr, ok := roleArray[0].(string)
+	role, ok := roleArray[0].(string)
 	if !ok {
-		return fmt.Errorf("unexpected ROLE response format")
+		return "", fmt.Errorf("unexpected ROLE response format")
 	}
+	return role, nil
+}
 
-	pod, err := clientset.CoreV1().Pods(*podNamespace).Get(ctx, *podName, metav1.GetOptions{})
+func checkAndLabel(ctx context.Context, clientset kubernetes.Interface, ns, podName, labelKey, labelValue, role string) error {
+	pod, err := clientset.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get pod: %w", err)
 	}
@@ -128,34 +140,34 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 		pod.Labels = make(map[string]string)
 	}
 
-	currentValue, exists := pod.Labels[*labelKey]
+	currentValue, exists := pod.Labels[labelKey]
 
-	if roleStr == "master" {
+	if role == "master" {
 		// Label the pod if it's master
-		if !exists || currentValue != *labelValue {
-			pod.Labels[*labelKey] = *labelValue
-			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
+		if !exists || currentValue != labelValue {
+			pod.Labels[labelKey] = labelValue
+			_, err = clientset.CoreV1().Pods(ns).Update(ctx, pod, metav1.UpdateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to update pod label: %w", err)
 			}
-			fmt.Printf("Labeled pod %s/%s with %s=%s\n", *podNamespace, *podName, *labelKey, *labelValue)
+			fmt.Printf("Labeled pod %s/%s with %s=%s\n", ns, podName, labelKey, labelValue)
 		}
 	} else {
 		// Remove the label if it exists and the pod is no longer master
-		if exists && currentValue == *labelValue {
-			delete(pod.Labels, *labelKey)
-			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
+		if exists && currentValue == labelValue {
+			delete(pod.Labels, labelKey)
+			_, err = clientset.CoreV1().Pods(ns).Update(ctx, pod, metav1.UpdateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to remove pod label: %w", err)
 			}
-			fmt.Printf("Removed label %s from pod %s/%s (no longer master)\n", *labelKey, *podNamespace, *podName)
+			fmt.Printf("Removed label %s from pod %s/%s (no longer master)\n", labelKey, ns, podName)
 		}
 	}
 
 	return nil
 }
 
-func startHealthServer(port string) {
+func healthHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		healthStatus.mu.RLock()
@@ -170,10 +182,13 @@ func startHealthServer(port string) {
 			fmt.Fprintf(w, "Unhealthy\n")
 		}
 	})
+	return mux
+}
 
+func startHealthServer(port string) {
 	server := &http.Server{
 		Addr:    ":" + port,
-		Handler: mux,
+		Handler: healthHandler(),
 	}
 
 	fmt.Printf("Starting health check server on port %s\n", port)
@@ -182,7 +197,12 @@ func startHealthServer(port string) {
 	}
 }
 
-func updateHealthStatus(ctx context.Context, rdb *redis.Client) {
+// roleQuerier abstracts Redis's Do method so tests can stub ROLE responses.
+type roleQuerier interface {
+	Do(ctx context.Context, args ...interface{}) *redis.Cmd
+}
+
+func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
 	_, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		healthStatus.mu.Lock()
