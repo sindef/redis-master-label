@@ -11,10 +11,52 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 )
+
+// redisDoer answers context-bound commands (ROLE) without requiring a live
+// *redis.Client, so the role decision logic stays testable with a narrow fake.
+type redisDoer interface {
+	Do(ctx context.Context, args ...interface{}) (interface{}, error)
+}
+
+// podGetterUpdater reads one pod and writes labels back. A narrow interface
+// instead of the concrete *kubernetes.Clientset keeps the label decision logic
+// testable without a live Kubernetes API server.
+type podGetterUpdater interface {
+	GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error)
+	UpdatePod(ctx context.Context, pod *corev1.Pod) (*corev1.Pod, error)
+}
+
+// clientsetPods adapts *kubernetes.Clientset's typed CoreV1 client to
+// podGetterUpdater, so main wiring stays on concrete types.
+type clientsetPods struct {
+	pods corev1client.CoreV1Interface
+}
+
+func (c clientsetPods) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	return c.pods.Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+func (c clientsetPods) UpdatePod(ctx context.Context, pod *corev1.Pod) (*corev1.Pod, error) {
+	return c.pods.Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
+}
+
+// redisClientDoer adapts *redis.Client to redisDoer, since redis.Cmdable has
+// no Do method: the concrete client returns *redis.Cmd, while fake
+// implementations only need to return the plain reply.
+type redisClientDoer struct {
+	client *redis.Client
+}
+
+func (r redisClientDoer) Do(ctx context.Context, args ...interface{}) (interface{}, error) {
+	val, err := r.client.Do(ctx, args...).Result()
+	return val, err
+}
 
 var (
 	redisAddr          = flag.String("redis-addr", "localhost:6379", "Redis server address")
@@ -83,6 +125,9 @@ func main() {
 
 	ctx := context.Background()
 
+	pods := clientsetPods{pods: clientset.CoreV1()}
+	doer := redisClientDoer{client: rdb}
+
 	// Start health check HTTP server
 	go startHealthServer(*healthPort)
 
@@ -94,32 +139,44 @@ func main() {
 
 	for {
 		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
+		updateHealthStatus(ctx, doer)
 
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
+		if err := checkAndLabel(ctx, doer, pods); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
 		time.Sleep(*checkInterval)
 	}
 }
 
-func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes.Clientset) error {
-	role, err := rdb.Do(ctx, "ROLE").Result()
-	if err != nil {
-		return fmt.Errorf("failed to execute ROLE command: %w", err)
-	}
-
+// roleFromResponse parses the reply of the Redis ROLE command into its role
+// string ("master" for a primary, "slave" or "sentinel" otherwise). Keeping the
+// parsing isolated makes the master/replica decision testable on its own.
+func roleFromResponse(role interface{}) (string, error) {
 	roleArray, ok := role.([]interface{})
 	if !ok || len(roleArray) == 0 {
-		return fmt.Errorf("unexpected ROLE response format")
+		return "", fmt.Errorf("unexpected ROLE response format")
 	}
 
 	roleStr, ok := roleArray[0].(string)
 	if !ok {
-		return fmt.Errorf("unexpected ROLE response format")
+		return "", fmt.Errorf("unexpected ROLE response format")
 	}
 
-	pod, err := clientset.CoreV1().Pods(*podNamespace).Get(ctx, *podName, metav1.GetOptions{})
+	return roleStr, nil
+}
+
+func checkAndLabel(ctx context.Context, rdb redisDoer, pods podGetterUpdater) error {
+	role, err := rdb.Do(ctx, "ROLE")
+	if err != nil {
+		return fmt.Errorf("failed to execute ROLE command: %w", err)
+	}
+
+	roleStr, err := roleFromResponse(role)
+	if err != nil {
+		return err
+	}
+
+	pod, err := pods.GetPod(ctx, *podNamespace, *podName)
 	if err != nil {
 		return fmt.Errorf("failed to get pod: %w", err)
 	}
@@ -134,7 +191,7 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 		// Label the pod if it's master
 		if !exists || currentValue != *labelValue {
 			pod.Labels[*labelKey] = *labelValue
-			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
+			_, err = pods.UpdatePod(ctx, pod)
 			if err != nil {
 				return fmt.Errorf("failed to update pod label: %w", err)
 			}
@@ -144,7 +201,7 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 		// Remove the label if it exists and the pod is no longer master
 		if exists && currentValue == *labelValue {
 			delete(pod.Labels, *labelKey)
-			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
+			_, err = pods.UpdatePod(ctx, pod)
 			if err != nil {
 				return fmt.Errorf("failed to remove pod label: %w", err)
 			}
@@ -155,7 +212,7 @@ func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset *kubernetes
 	return nil
 }
 
-func startHealthServer(port string) {
+func healthHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		healthStatus.mu.RLock()
@@ -170,10 +227,13 @@ func startHealthServer(port string) {
 			fmt.Fprintf(w, "Unhealthy\n")
 		}
 	})
+	return mux
+}
 
+func startHealthServer(port string) {
 	server := &http.Server{
 		Addr:    ":" + port,
-		Handler: mux,
+		Handler: healthHandler(),
 	}
 
 	fmt.Printf("Starting health check server on port %s\n", port)
@@ -182,8 +242,8 @@ func startHealthServer(port string) {
 	}
 }
 
-func updateHealthStatus(ctx context.Context, rdb *redis.Client) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
+func updateHealthStatus(ctx context.Context, rdb redisDoer) {
+	_, err := rdb.Do(ctx, "ROLE")
 	if err != nil {
 		healthStatus.mu.Lock()
 		healthStatus.consecutiveFailures++
