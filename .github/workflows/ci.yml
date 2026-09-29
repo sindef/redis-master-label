@@ -35,6 +35,12 @@ jobs:
       - name: Test (race)
         run: CGO_ENABLED=1 go test -race -count=1 ./...
 
+      - name: Check Go module files
+        run: |
+          go mod tidy -diff
+          go mod verify
+          git diff --exit-code -- go.mod go.sum
+
       - name: Export Go modules graph
         run: go list -m -json -e all > /dev/null
 
