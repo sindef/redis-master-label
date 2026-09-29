@@ -42,3 +42,24 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/workdir ghcr.io/yannh/kubeconform:v0.6.7 \
             -strict -summary /workdir/manifests
+
+  # Keeps the `update-go_modules-graph` status check reporting on every push and
+  # pull request: it rebuilds the module graph from go.mod/go.sum and fails if
+  # the graph cannot be produced (for example when go.sum is missing an entry).
+  # The check used to be dropped whenever this workflow's job list was reshuffled,
+  # which left pull requests without it.
+  update-go_modules-graph:
+    name: update-go_modules-graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          go-version-file: go.mod
+
+      - name: Update go_modules graph
+        run: |
+          go mod graph > go_modules_graph.txt
+          test -s go_modules_graph.txt
