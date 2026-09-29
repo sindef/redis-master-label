@@ -52,15 +52,21 @@ docker build -t redis-master-label:latest -f Containerfile .
 ```
 
 ## Kubernetes deployment
-Manifests in `manifests/` provide an example service account, role, rolebinding, and deployment.
+Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.
 
 Apply them (edit image and args as needed):
 ```bash
 kubectl apply -f manifests/serviceaccount.yaml
 kubectl apply -f manifests/role.yaml
 kubectl apply -f manifests/rolebinding.yaml
+kubectl apply -f manifests/redis-leader.yaml
+kubectl apply -f manifests/redis-leader-service.yaml
 kubectl apply -f manifests/deployment-example.yaml
 ```
+
+`manifests/redis-leader.yaml` and `manifests/redis-leader-service.yaml` run a single Redis master (one replica, no `--replicaof`) and expose it in the `default` namespace as a Service named `redis-leader`, so the DNS name used by the replicas resolves inside the example itself. That leader pod also runs the labeler sidecar, so you can see `redis-role=master` get applied and stay on the master; the replica deployment points its Redis containers at `redis-leader.default.svc.cluster.local:6379`, so all three replicas replicate from it, and their labeler sidecars remove the `redis-role` label if a pod is ever demoted or promoted back to a replica.
+
+If you prefer to run Redis replication against your own Redis leader, apply `serviceaccount.yaml`, `role.yaml`, `rolebinding.yaml`, and `deployment-example.yaml`, change `--replicaof` in `deployment-example.yaml` to point at your leader's Service DNS name, and provide that Service (or a headless Service with a stable DNS name for a Redis master, e.g. a StatefulSet headless Service) yourself — the example deployment expects a `redis-leader` Service (or your own equivalent) to exist.
 
 Key points for the deployment:
 - Mount/inject Redis connection info (address/password/TLS) as env/args.
