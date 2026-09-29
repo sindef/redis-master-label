@@ -377,6 +377,49 @@ func TestApplyLabel_UpdateErrorReturnsWrappedError(t *testing.T) {
 	}
 }
 
+func TestApplyLabel_MasterRoleWithWrongValueRewritesLabel(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", map[string]string{testKey: "replica"}))
+
+	if err := applyLabel(context.Background(), cs, "master"); err != nil {
+		t.Fatalf("applyLabel: %v", err)
+	}
+
+	pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if pod.Labels[testKey] != testValue {
+		t.Fatalf("label %s = %q, want %q", testKey, pod.Labels[testKey], testValue)
+	}
+}
+
+// TestApplyLabel_SlaveRoleWithForeignValueKeepsLabelNoUpdate was removed:
+// since the label-removal fix the key is deleted for every non-master role
+// whatever value it holds, so this obsolete test contradicted
+// TestCheckAndLabel_NonMasterRemovesLabelWithForeignValue.
+
+func TestCheckAndLabel_MasterReplyAppliesLabel(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", nil))
+
+	if err := checkAndLabel(context.Background(), stubRedis{reply: masterReply()}, cs); err != nil {
+		t.Fatalf("checkAndLabel: %v", err)
+	}
+
+	pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if pod.Labels[testKey] != testValue {
+		t.Fatalf("label %s = %q, want %q", testKey, pod.Labels[testKey], testValue)
+	}
+}
+
+// TestCheckAndLabel_SlaveReplyRemovesLabel was removed: obsolete duplicate of
+// TestCheckAndLabel_SlaveReplyRemovesForeignValueLabel above (its canned
+// replica reply repeated the same stubRedis/masterReply fixtures).
+
 func TestStartHealthServer_BindFailureReturnsError(t *testing.T) {
 	_, err := startHealthServer("999999999")
 	if err == nil {
