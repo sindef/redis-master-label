@@ -103,7 +103,13 @@ func main() {
 	}
 }
 
-func checkAndLabel(ctx context.Context, rdb *redis.Client, clientset kubernetes.Interface) error {
+// redisDoer abstracts the do-method of *redis.Client so tests can drive ROLE
+// replies without a live server.
+type redisDoer interface {
+	Do(ctx context.Context, args ...interface{}) *redis.Cmd
+}
+
+func checkAndLabel(ctx context.Context, rdb redisDoer, clientset kubernetes.Interface) error {
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
@@ -197,7 +203,7 @@ func startHealthServer(port string) {
 	}
 }
 
-func updateHealthStatus(ctx context.Context, rdb *redis.Client) {
+func updateHealthStatus(ctx context.Context, rdb redisDoer) {
 	_, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		healthStatus.mu.Lock()
