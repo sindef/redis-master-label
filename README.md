@@ -93,7 +93,19 @@ env:
 
 ## RBAC requirements
 - Needs `get` and `update` on the Pod resource in its namespace.
-- The provided Role/RoleBinding in `manifests/` scope this to the pod’s namespace.
+- Applying the provided manifests into any namespace other than `default` fails the labeler with `get` errors on every check interval, because each manifest pins `namespace: default` and the kubelet binds the pod at deploy time, so the labeler never labels anything.
+
+### Namespacing caveat
+
+Everything in `manifests/` is fixed to the `default` namespace:
+
+- `manifests/serviceaccount.yaml` — ServiceAccount lives in `default`.
+- `manifests/role.yaml` — Role is scoped to the `default` namespace.
+- `manifests/rolebinding.yaml` — RoleBinding references the role and the service account in `default`.
+- `manifests/redis-leader.yaml` and `manifests/redis-leader-service.yaml` — expose `redis-leader.default.svc.cluster.local`, referenced by name from the replica deployment.
+- `manifests/deployment-example.yaml` — deployed into `default` and points at the `redis-leader` Service.
+
+At runtime the binary reads its namespace from the pod itself (the `POD_NAMESPACE` env var, injected from the Downward API in `manifests/deployment-example.yaml`), not from anything in the manifests. If you deploy into a different namespace, edit the `metadata.namespace` (and `subjects[].namespace` in the RoleBinding) of each manifest before applying, or template them per namespace — otherwise the pod gets a service account with no permissions in its own namespace.
 
 ## Health Check Endpoint
 
