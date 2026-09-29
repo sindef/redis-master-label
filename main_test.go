@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -203,5 +207,84 @@ func TestHealthHandler_UnhealthyReturns503(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+func TestStartHealthServer_BindFailureReturnsError(t *testing.T) {
+	// Invalid port mirrors a bad --health-port value; the bind must fail
+	// deterministically with no listener created.
+	errCh := make(chan error, 1)
+	ln, err := startHealthServer("notaport", errCh)
+	if err == nil {
+		if ln != nil {
+			ln.Close()
+		}
+		t.Fatal("startHealthServer on taken port, want error")
+	}
+	if ln != nil {
+		t.Fatal("listener must be nil on bind failure")
+	}
+	if !strings.HasPrefix(err.Error(), "failed to bind health check server on port notaport") {
+		t.Fatalf("error = %q, want bind failure message", err)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("unexpected send on error channel: %v", err)
+	default:
+	}
+}
+
+func TestStartHealthServer_ServesHealthzAfterBind(t *testing.T) {
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, false)
+
+	errCh := make(chan error, 1)
+	ln, err := startHealthServer("0", errCh)
+	if err != nil {
+		t.Fatalf("startHealthServer: %v", err)
+	}
+	defer ln.Close()
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/healthz", ln.Addr().String()))
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "OK\n" {
+		t.Fatalf("body = %q, want %q", body, "OK\n")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("unexpected send on error channel: %v", err)
+	default:
+	}
+}
+
+func TestStartHealthServer_ErrorChannelReportsServeDeath(t *testing.T) {
+	errCh := make(chan error, 1)
+	ln, err := startHealthServer("0", errCh)
+	if err != nil {
+		t.Fatalf("startHealthServer: %v", err)
+	}
+
+	// Closing the listener out from under the server must surface on errCh.
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !strings.HasPrefix(err.Error(), "health check server error:") {
+			t.Fatalf("error = %q, want prefixed serve error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no error reported after listener close")
 	}
 }
