@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/go-redis/redis/v8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 const (
@@ -41,6 +46,13 @@ func setHealthStatus(failures int, healthy bool) {
 	defer healthStatus.mu.Unlock()
 	healthStatus.consecutiveFailures = failures
 	healthStatus.isHealthy = healthy
+}
+
+// healthSnapshot reads the package-level health status under the lock.
+func healthSnapshot() (bool, int) {
+	healthStatus.mu.RLock()
+	defer healthStatus.mu.RUnlock()
+	return healthStatus.isHealthy, healthStatus.consecutiveFailures
 }
 
 func newPodClientset(pods ...runtime.Object) *k8sfake.Clientset {
@@ -137,6 +149,58 @@ func TestCheckAndLabel_MissingPodReturnsError(t *testing.T) {
 	}
 }
 
+func TestCheckAndLabel_RedisErrorReturnsWrappedError(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", nil))
+
+	err := checkAndLabel(context.Background(), stubRedis{err: errors.New("connection refused")}, cs)
+	if err == nil {
+		t.Fatal("checkAndLabel with Redis error, want error")
+	}
+	if !strings.HasPrefix(err.Error(), "failed to execute ROLE command") {
+		t.Fatalf("error = %v, want wrapped ROLE command failure", err)
+	}
+}
+
+func TestCheckAndLabel_MalformedReplyReturnsError(t *testing.T) {
+	defer configureTestFlags()()
+
+	for name, reply := range map[string]interface{}{
+		"nil reply":                nil,
+		"empty role array":         []interface{}{},
+		"non-array reply":          "master",
+		"non-string first element": []interface{}{int64(12345)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs := newPodClientset(testPod("test-pod", nil))
+
+			err := checkAndLabel(context.Background(), stubRedis{reply: reply}, cs)
+			if err == nil || err.Error() != "unexpected ROLE response format" {
+				t.Fatalf("error = %v, want %q", err, "unexpected ROLE response format")
+			}
+		})
+	}
+}
+
+// stubRedis replays a canned ROLE reply or error without a live connection.
+type stubRedis struct {
+	reply interface{}
+	err   error
+}
+
+func (s stubRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	return redis.NewCmdResult(s.reply, s.err)
+}
+
+// masterReply mirrors the array layout Redis answers with for ROLE on a primary.
+func masterReply() []interface{} {
+	return []interface{}{
+		"master",
+		int64(12345),
+		[]interface{}{[]interface{}{"10.244.0.11", "6379", "12345"}},
+	}
+}
+
 func TestRoleFromResponse(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -203,5 +267,81 @@ func TestHealthHandler_UnhealthyReturns503(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+func TestApplyLabel_UpdateErrorReturnsWrappedError(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", nil))
+	cs.PrependReactor("update", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("update rejected")
+	})
+
+	err := applyLabel(context.Background(), cs, "master")
+	if err == nil {
+		t.Fatal("applyLabel with update error, want error")
+	}
+	if !strings.HasPrefix(err.Error(), "failed to update pod label") {
+		t.Fatalf("error = %v, want wrapped pod update failure", err)
+	}
+}
+
+func TestUpdateHealthStatus_FailureThreshold(t *testing.T) {
+	rdbFail := stubRedis{err: errors.New("connection refused")}
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	for i := 1; i <= 5; i++ {
+		updateHealthStatus(context.Background(), rdbFail)
+
+		healthy, failures := healthSnapshot()
+		if want := i < 3; healthy != want {
+			t.Errorf("after %d consecutive failures, isHealthy = %v, want %v", i, healthy, want)
+		}
+		if failures != i {
+			t.Errorf("after %d consecutive failures, consecutiveFailures = %d, want %d", i, failures, i)
+		}
+	}
+}
+
+func TestUpdateHealthStatus_ResetAfterFailure(t *testing.T) {
+	rdbFail := stubRedis{err: errors.New("connection refused")}
+	rdbOk := stubRedis{reply: masterReply()}
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	for i := 0; i < 2; i++ {
+		updateHealthStatus(context.Background(), rdbFail)
+	}
+	if healthy, failures := healthSnapshot(); healthy != true || failures != 2 {
+		t.Fatalf("health after 2 failures: isHealthy = %v, failures = %d, want true / 2", healthy, failures)
+	}
+
+	updateHealthStatus(context.Background(), rdbOk)
+	healthy, failures := healthSnapshot()
+	if !healthy {
+		t.Error("isHealthy after a successful ROLE = false, want true")
+	}
+	if failures != 0 {
+		t.Errorf("consecutiveFailures after a successful ROLE = %d, want 0", failures)
+	}
+}
+
+func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
+	rdbFail := stubRedis{err: errors.New("connection refused")}
+	rdbOk := stubRedis{reply: masterReply()}
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	for i := 0; i < 3; i++ {
+		updateHealthStatus(context.Background(), rdbFail)
+	}
+	if healthy, _ := healthSnapshot(); healthy != false {
+		t.Fatal("isHealthy = true after 3 failures, want false")
+	}
+
+	updateHealthStatus(context.Background(), rdbOk)
+	if healthy, _ := healthSnapshot(); healthy != true {
+		t.Error("isHealthy stays false after one successful ROLE, want true")
 	}
 }
