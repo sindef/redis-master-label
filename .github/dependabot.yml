@@ -38,9 +38,10 @@ updates:
           - minor
           - patch
 
-  # Container base images. The repository's only build file is `Containerfile`,
-  # and Dependabot's docker ecosystem only scans Dockerfile file names, so this
-  # entry stays ready for a Dockerfile added later and reports nothing today.
+  # Container base images in the repository's only build file, `Dockerfile`
+  # (formerly named `Containerfile`). Dependabot's docker ecosystem only scans
+  # Dockerfile file names, so the rename is what makes base-image bumps
+  # (for example `alpine:3.20`, `golang:1.27-alpine`) arrive as pull requests.
   - package-ecosystem: docker
     directory: "/"
     schedule:

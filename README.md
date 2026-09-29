@@ -43,12 +43,12 @@ go build -o redis-master-label .
 
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
-## Container build,
+## Container build
 ```bash
-# Build image using the provided Containerfile
+# Build image using the provided Dockerfile
 podman build -t redis-master-label:latest .
 # or
-docker build -t redis-master-label:latest -f Containerfile .
+docker build -t redis-master-label:latest .
 ```
 
 ## Kubernetes deployment
