@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 
@@ -283,6 +286,81 @@ func TestApplyLabel_UpdateErrorReturnsWrappedError(t *testing.T) {
 	}
 	if !strings.HasPrefix(err.Error(), "failed to update pod label") {
 		t.Fatalf("error = %v, want wrapped pod update failure", err)
+	}
+}
+
+func TestStartHealthServer_BindFailureReturnsError(t *testing.T) {
+	_, err := startHealthServer("999999999")
+	if err == nil {
+		t.Fatal("startHealthServer with invalid port, want bind error")
+	}
+	if !strings.HasPrefix(err.Error(), "failed to bind health check server on port 999999999") {
+		t.Fatalf("error = %v, want bind failure message", err)
+	}
+}
+
+func TestStartHealthServer_BindConflictReturnsError(t *testing.T) {
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer listener.Close()
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+
+	_, err = startHealthServer(port)
+	if err == nil {
+		t.Fatalf("startHealthServer on occupied port %s, want bind error", port)
+	}
+	if !strings.HasPrefix(err.Error(), "failed to bind health check server on port "+port) {
+		t.Fatalf("error = %v, want bind failure message", err)
+	}
+}
+
+func TestStartHealthServer_ServesHealthzAfterBind(t *testing.T) {
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, false)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer listener.Close()
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+
+	errCh := serveHealth(listener)
+
+	resp, err := http.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("health server reported unexpected error: %v", err)
+	default:
+	}
+}
+
+func TestStartHealthServer_ErrorChannelReportsServeDeath(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+
+	errCh := serveHealth(listener)
+	listener.Close()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("error channel entry is nil, want server failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("health server Serve did not report its death on the error channel")
 	}
 }
 

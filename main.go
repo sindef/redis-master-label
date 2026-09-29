@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -83,8 +84,14 @@ func main() {
 
 	ctx := context.Background()
 
-	// Start health check HTTP server
-	go startHealthServer(*healthPort)
+	// Bind the health check HTTP server before entering the main loop so a
+	// bind failure (port taken, invalid --health-port) aborts startup instead
+	// of silently running without /healthz.
+	errCh, err := startHealthServer(*healthPort)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to bind health check server on port %s: %v\n", *healthPort, err)
+		os.Exit(1)
+	}
 
 	// Initialize health status as healthy
 	healthStatus.mu.Lock()
@@ -93,6 +100,16 @@ func main() {
 	healthStatus.mu.Unlock()
 
 	for {
+		// Surface an unexpected health server death without blocking the loop.
+		select {
+		case err := <-errCh:
+			if err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "health check server error: %v\n", err)
+				os.Exit(1)
+			}
+		default:
+		}
+
 		// Update health status based on Redis connectivity
 		updateHealthStatus(ctx, rdb)
 
@@ -192,16 +209,34 @@ func healthHandler() http.Handler {
 	return mux
 }
 
-func startHealthServer(port string) {
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: healthHandler(),
+// startHealthServer owns the bind: it returns the net.Listener (owned by the
+// caller so Serve errors stay visible) plus a buffered channel reporting a
+// fatal Serve error. A bind failure returns an error before main's loop runs.
+func startHealthServer(port string) (<-chan error, error) {
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind health check server on port %s: %v", port, err)
 	}
 
 	fmt.Printf("Starting health check server on port %s\n", port)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "health check server error: %v\n", err)
+	return serveHealth(listener), nil
+}
+
+// serveHealth runs the health server on an already-bound listener and reports
+// a fatal Serve error (http.ErrServerClosed excluded) on a buffered channel.
+func serveHealth(listener net.Listener) <-chan error {
+	errCh := make(chan error, 1)
+	server := &http.Server{
+		Handler: healthHandler(),
 	}
+
+	go func() {
+		if serveErr := server.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			errCh <- serveErr
+		}
+	}()
+
+	return errCh
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
