@@ -1,0 +1,57 @@
+# Dependabot replaces the Renovate config that lived in renovate.json.
+# This repository is hosted on GitHub, so Dependabot needs no app installation
+# and the Renovate config never produced a dependency pull request here.
+# Security updates stay independent of this file: Dependabot opens security
+# pull requests immediately and unscheduled by default.
+version: 2
+
+updates:
+  # Go module dependencies (go.mod / go.sum).
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      go-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Actions used by .github/workflows/ci.yml.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Container base images. The repository's only build file is `Containerfile`,
+  # and Dependabot's docker ecosystem only scans Dockerfile file names, so this
+  # entry stays ready for a Dockerfile added later and reports nothing today.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      docker-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
