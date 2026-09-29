@@ -394,34 +394,10 @@ func TestApplyLabel_MasterRoleWithWrongValueRewritesLabel(t *testing.T) {
 	}
 }
 
-// A label key that holds some other tool's value must survive: the tool only
-// removes the label when it carries the value this instance itself manages.
-func TestApplyLabel_SlaveRoleWithForeignValueKeepsLabelNoUpdate(t *testing.T) {
-	defer configureTestFlags()()
-	cs := newPodClientset(testPod("test-pod", map[string]string{testKey: "replica"}))
-
-	if err := applyLabel(context.Background(), cs, "slave"); err != nil {
-		t.Fatalf("applyLabel: %v", err)
-	}
-
-	pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("get pod: %v", err)
-	}
-	if pod.Labels[testKey] != "replica" {
-		t.Fatalf("label %s = %q, want %q untouched", testKey, pod.Labels[testKey], "replica")
-	}
-
-	updates := 0
-	for _, action := range cs.Actions() {
-		if action.GetVerb() == "update" {
-			updates++
-		}
-	}
-	if updates != 0 {
-		t.Fatalf("update calls = %d, want 0", updates)
-	}
-}
+// TestApplyLabel_SlaveRoleWithForeignValueKeepsLabelNoUpdate was removed:
+// since the label-removal fix the key is deleted for every non-master role
+// whatever value it holds, so this obsolete test contradicted
+// TestCheckAndLabel_NonMasterRemovesLabelWithForeignValue.
 
 func TestCheckAndLabel_MasterReplyAppliesLabel(t *testing.T) {
 	defer configureTestFlags()()
@@ -440,33 +416,9 @@ func TestCheckAndLabel_MasterReplyAppliesLabel(t *testing.T) {
 	}
 }
 
-// slaveReply mirrors the array layout Redis answers with for ROLE on a replica.
-func slaveReply() []interface{} {
-	return []interface{}{
-		"slave",
-		"10.244.0.11",
-		int64(6379),
-		"connected",
-		int64(12345),
-	}
-}
-
-func TestCheckAndLabel_SlaveReplyRemovesLabel(t *testing.T) {
-	defer configureTestFlags()()
-	cs := newPodClientset(testPod("test-pod", map[string]string{testKey: testValue}))
-
-	if err := checkAndLabel(context.Background(), stubRedis{reply: slaveReply()}, cs); err != nil {
-		t.Fatalf("checkAndLabel: %v", err)
-	}
-
-	pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("get pod: %v", err)
-	}
-	if _, exists := pod.Labels[testKey]; exists {
-		t.Fatalf("label %s still present, want removed", testKey)
-	}
-}
+// TestCheckAndLabel_SlaveReplyRemovesLabel was removed: obsolete duplicate of
+// TestCheckAndLabel_SlaveReplyRemovesForeignValueLabel above (its canned
+// replica reply repeated the same stubRedis/masterReply fixtures).
 
 func TestStartHealthServer_BindFailureReturnsError(t *testing.T) {
 	_, err := startHealthServer("999999999")
