@@ -177,8 +177,11 @@ func applyLabel(ctx context.Context, clientset kubernetes.Interface, roleStr str
 			fmt.Printf("Labeled pod %s/%s with %s=%s\n", *podNamespace, *podName, *labelKey, *labelValue)
 		}
 	} else {
-		// Remove the label if it exists and the pod is no longer master
-		if exists && currentValue == *labelValue {
+		// Remove the label whenever the pod is no longer master and the key is
+		// present, whatever value it currently holds. A value-scoped check would
+		// leave a foreign or stale value under the key, so a Service selecting
+		// on that key would keep routing to a pod that is no longer master.
+		if exists {
 			delete(pod.Labels, *labelKey)
 			_, err = clientset.CoreV1().Pods(*podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
 			if err != nil {
