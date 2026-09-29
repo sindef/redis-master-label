@@ -1,0 +1,57 @@
+# Dependabot version updates (migrated from renovate.json).
+#
+# Why Dependabot: this repository is hosted on GitHub, so Dependabot needs no
+# app install or hosted runner. Renovate was configured (renovate.json) but
+# never opened a pull request and left no Dependency Dashboard, so the Renovate
+# setup was removed in favor of this file.
+#
+# Note: the base image is declared in `Containerfile`. Dependabot's docker
+# ecosystem scans Dockerfile filenames; it may not pick up `Containerfile`
+# (long-open upstream request). The ecosystem is listed anyway so Dockerfiles
+# are covered if added later.
+version: 2
+updates:
+  # Go module dependencies (go.mod / go.sum).
+  - package-ecosystem: "go"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      go-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used in .github/workflows/.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Container base images (Dockerfile/Containerfile).
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      docker-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
