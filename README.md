@@ -5,7 +5,7 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 ## What it does
 - Connects to Redis and runs the `ROLE` command on a fixed interval.
 - If the instance reports `master`, it patches the current pod with a configurable label key/value.
-- If the instance is no longer `master`, it removes the label from the pod.
+- If the instance is no longer `master`, it removes the label from the pod (the key is removed whenever it is present, whatever value it holds; the check is not scoped to `--label-value`).
 - Provides a health check HTTP endpoint (`/healthz`) that monitors Redis connectivity.
 - Runs inside the cluster using in-cluster Kubernetes credentials.
 
@@ -16,7 +16,7 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 4. On each interval:
    - Executes `ROLE` against Redis to check connectivity and update health status.
    - If the role is `master`, fetches the current pod and ensures the label key/value is set.
-   - If the role is not `master` and the label exists, removes the label from the pod.
+   - If the role is not `master` and the label key exists, removes the label key from the pod. The value currently under that key does not matter: only the value `--label-value` is compared when adding the label.
 5. Repeats forever.
 
 ## Configuration
