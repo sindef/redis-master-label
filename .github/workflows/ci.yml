@@ -36,3 +36,34 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/workdir ghcr.io/yannh/kubeconform:v0.6.7 \
             -strict -summary /workdir/manifests
+
+  # Dependency-tooling job recorded for this repository. It exports the module
+  # graph on every pull request and on main: the JSON form is consumed by
+  # dependency tooling, the plain-text form is the module list diffed between
+  # revisions. The job name must stay `update-go_modules-graph` so the recorded
+  # check keeps reporting.
+  update-go_modules-graph:
+    name: update-go_modules-graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          go-version-file: go.mod
+
+      - name: update-go_modules-graph
+        run: |
+          go list -m -json -e all > go-modules-graph.json
+          go list -m -e -f '{{.Path}} {{.Version}}' all > go-modules-graph.txt
+          echo "Exported module graph: $(wc -l < go-modules-graph.json) JSON lines, $(wc -l < go-modules-graph.txt) modules"
+
+      - name: Upload Go modules graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-modules-graph
+          path: |
+            go-modules-graph.json
+            go-modules-graph.txt
+          if-no-files-found: error
