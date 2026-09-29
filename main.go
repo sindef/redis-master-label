@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -83,8 +84,17 @@ func main() {
 
 	ctx := context.Background()
 
-	// Start health check HTTP server
-	go startHealthServer(*healthPort)
+	// Start health check HTTP server. Bind the listener up front so a
+	// failed bind (port already in use, invalid --health-port) stops this
+	// process instead of leaving it alive without a health endpoint.
+	healthErrCh := make(chan error, 1)
+
+	healthLn, err := startHealthServer(*healthPort, healthErrCh)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer healthLn.Close()
 
 	// Initialize health status as healthy
 	healthStatus.mu.Lock()
@@ -93,6 +103,16 @@ func main() {
 	healthStatus.mu.Unlock()
 
 	for {
+		// If the health server died after a successful start, exit non-zero
+		// so the container gets restarted instead of running without a
+		// health endpoint.
+		select {
+		case err := <-healthErrCh:
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		default:
+		}
+
 		// Update health status based on Redis connectivity
 		updateHealthStatus(ctx, rdb)
 
@@ -192,16 +212,25 @@ func healthHandler() http.Handler {
 	return mux
 }
 
-func startHealthServer(port string) {
+func startHealthServer(port string, errCh chan<- error) (net.Listener, error) {
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind health check server on port %s: %v", port, err)
+	}
+
 	server := &http.Server{
-		Addr:    ":" + port,
 		Handler: healthHandler(),
 	}
 
 	fmt.Printf("Starting health check server on port %s\n", port)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "health check server error: %v\n", err)
-	}
+
+	go func() {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("health check server error: %v", err)
+		}
+	}()
+
+	return ln, nil
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
