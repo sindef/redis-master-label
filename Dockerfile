@@ -24,7 +24,7 @@ LABEL org.opencontainers.image.title="redis-master-label" \
       org.opencontainers.image.version="${VERSION}"
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
 
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN apk --no-cache add ca-certificates
 
