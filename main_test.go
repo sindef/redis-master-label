@@ -476,6 +476,289 @@ func TestReleaseImageCheck_RejectsLatestFixture(t *testing.T) {
 	}
 }
 
+// The build file's final stage is the shipping image. It must create a
+// dedicated account and select it with USER: without USER the container runs
+// as uid 0 whatever the manifests declare, and runAsNonRoot then makes the
+// kubelet refuse to start the pod.
+const dockerfilePath = "Dockerfile"
+
+// boolPtr is shorthand for the *bool securityContext fields.
+func boolPtr(v bool) *bool { return &v }
+
+// restrictedSecurityContextProblem returns why a sidecar container is not
+// restricted enough to run the labeler, or nil when it is. The declared shape
+// matters as much as the declared values: an omitted runAsNonRoot is not the
+// same defence as runAsNonRoot: true.
+func restrictedSecurityContextProblem(sc *containerSecurityContext) error {
+	if sc == nil {
+		return errors.New("no securityContext: the container runs with the image defaults (uid 0 when the image sets no USER)")
+	}
+	if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+		return errors.New("runAsNonRoot must be true")
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		return errors.New("allowPrivilegeEscalation must be false")
+	}
+	if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+		return errors.New("readOnlyRootFilesystem must be true")
+	}
+	if !dropsAllCapabilities(sc.Capabilities.Drop) {
+		return errors.New(`capabilities.drop must include "ALL"`)
+	}
+	return nil
+}
+
+func dropsAllCapabilities(drop []string) bool {
+	for _, capability := range drop {
+		if strings.EqualFold(capability, "ALL") {
+			return true
+		}
+	}
+	return false
+}
+
+// Both example deployments must run the labeler unprivileged: runAsNonRoot
+// keeps uid 0 out, readOnlyRootFilesystem blocks writes to the container
+// filesystem, allowPrivilegeEscalation: false blocks setuid-style escalation
+// and dropping ALL capabilities removes the remaining kernel powers. The
+// binary only reads Redis and calls the Kubernetes API with its mounted
+// credentials, so nothing here costs it any function.
+func TestManifestSidecarsRunUnprivileged(t *testing.T) {
+	containers, err := sidecarContainers(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) == 0 {
+		t.Fatal("no sidecar container found in manifests: the securityContext check ran against nothing")
+	}
+	if len(containers) != 2 {
+		t.Fatalf("sidecar containers = %d, want the two example deployments", len(containers))
+	}
+
+	for _, c := range containers {
+		if err := restrictedSecurityContextProblem(c.SecurityContext); err != nil {
+			t.Errorf("%s/%s: %v", c.Manifest, c.Name, err)
+			continue
+		}
+		if c.SecurityContext.RunAsUser != nil && *c.SecurityContext.RunAsUser == 0 {
+			t.Errorf("%s/%s: runAsUser = 0, want the image's non-root uid", c.Manifest, c.Name)
+		}
+	}
+}
+
+// The pre-fix failure mode at container level: no securityContext, or a
+// partial one, must be reported instead of passing as "restricted".
+func TestRestrictedSecurityContextProblem_RegressionFixtures(t *testing.T) {
+	if err := restrictedSecurityContextProblem(nil); err == nil {
+		t.Error("nil securityContext accepted, want the missing-context failure")
+	}
+
+	restricted := &containerSecurityContext{
+		RunAsNonRoot:             boolPtr(true),
+		AllowPrivilegeEscalation: boolPtr(false),
+		ReadOnlyRootFilesystem:   boolPtr(true),
+	}
+	restricted.Capabilities.Drop = []string{"ALL"}
+	if err := restrictedSecurityContextProblem(restricted); err != nil {
+		t.Fatalf("restricted securityContext rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*containerSecurityContext){
+		"runAsNonRoot missing":     func(sc *containerSecurityContext) { sc.RunAsNonRoot = nil },
+		"runAsNonRoot false":       func(sc *containerSecurityContext) { sc.RunAsNonRoot = boolPtr(false) },
+		"privilege escalation":     func(sc *containerSecurityContext) { sc.AllowPrivilegeEscalation = boolPtr(true) },
+		"privilege escalation nil": func(sc *containerSecurityContext) { sc.AllowPrivilegeEscalation = nil },
+		"writable root filesystem": func(sc *containerSecurityContext) { sc.ReadOnlyRootFilesystem = boolPtr(false) },
+		"capabilities kept":        func(sc *containerSecurityContext) { sc.Capabilities.Drop = []string{"NET_BIND_SERVICE"} },
+		"capabilities empty":       func(sc *containerSecurityContext) { sc.Capabilities.Drop = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			sc := *restricted
+			mutate(&sc)
+			if err := restrictedSecurityContextProblem(&sc); err == nil {
+				t.Error("accepted a securityContext that does not meet the restricted shape")
+			}
+		})
+	}
+}
+
+// The same failure mode one level up: a manifest whose labeler omits
+// securityContext must be reported by the manifest reader, and adding the
+// block must clear it. This is the check that would have failed before the fix.
+func TestManifestSidecarsRunUnprivileged_MissingContextFails(t *testing.T) {
+	dir := t.TempDir()
+	withoutContext := "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: redis\n        image: redis:7-alpine\n      - name: redis-master-label\n        image: ghcr.io/redis-master-label/redis-master-label:v0.1.0\n        command:\n        - /app/redis-master-label\n"
+	if err := os.WriteFile(filepath.Join(dir, "deployment-nosec.yaml"), []byte(withoutContext), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	containers, err := sidecarContainers(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("sidecar containers = %d, want 1", len(containers))
+	}
+	if err := restrictedSecurityContextProblem(containers[0].SecurityContext); err == nil {
+		t.Error("labeler without securityContext accepted, want the missing-context failure")
+	}
+
+	withContext := withoutContext + "        securityContext:\n          runAsNonRoot: true\n          allowPrivilegeEscalation: false\n          readOnlyRootFilesystem: true\n          capabilities:\n            drop:\n            - ALL\n"
+	if err := os.WriteFile(filepath.Join(dir, "deployment-withsec.yaml"), []byte(withContext), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "deployment-nosec.yaml")); err != nil {
+		t.Fatal(err)
+	}
+
+	containers, err = sidecarContainers(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("sidecar containers = %d, want 1", len(containers))
+	}
+	if err := restrictedSecurityContextProblem(containers[0].SecurityContext); err != nil {
+		t.Errorf("securityContext in the manifest was not read back: %v", err)
+	}
+}
+
+// The shipping image is the final build stage of the Dockerfile. It must
+// create its own account and select it with USER; otherwise the container runs
+// as the base image's default uid (0 on alpine) and every manifest defence is
+// either useless or rejected by the kubelet.
+func TestDockerfileFinalStageRunsAsNonRootUser(t *testing.T) {
+	user, createsUser, err := dockerfileFinalStageUser(dockerfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user == "" {
+		t.Fatal("final build stage has no USER: the shipping image runs as the base image's default user (uid 0 for alpine)")
+	}
+	if !createsUser {
+		t.Errorf("final build stage selects USER %s but never creates that account (no adduser/addgroup)", user)
+	}
+
+	uid := strings.SplitN(user, ":", 2)[0]
+	if strings.EqualFold(uid, "root") {
+		t.Errorf("final build stage selects USER %q, want an unprivileged user", user)
+	}
+	n, err := strconv.ParseInt(uid, 10, 64)
+	if err != nil {
+		t.Fatalf("final build stage USER %q has no numeric uid: %v", user, err)
+	}
+	if n == 0 {
+		t.Errorf("final build stage USER %q is uid 0, want an unprivileged uid", user)
+	}
+}
+
+// The image and the manifests must agree on who runs the labeler. runAsNonRoot
+// is satisfied by any non-root uid, so the manifests pin the uid the final
+// image stage creates; a mismatch means the manifests and the image drifted
+// apart.
+func TestManifestRunAsUserMatchesImageUser(t *testing.T) {
+	user, _, err := dockerfileFinalStageUser(dockerfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, err := strconv.ParseInt(strings.SplitN(user, ":", 2)[0], 10, 64)
+	if err != nil {
+		t.Fatalf("final build stage USER %q has no numeric uid: %v", user, err)
+	}
+
+	containers, err := sidecarContainers(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) == 0 {
+		t.Fatal("no sidecar container found in manifests: the runAsUser check ran against nothing")
+	}
+	for _, c := range containers {
+		if c.SecurityContext == nil || c.SecurityContext.RunAsUser == nil {
+			t.Errorf("%s/%s: runAsUser is not pinned, want the image uid %d", c.Manifest, c.Name, uid)
+			continue
+		}
+		if *c.SecurityContext.RunAsUser != uid {
+			t.Errorf("%s/%s: runAsUser = %d, want the image uid %d", c.Manifest, c.Name, *c.SecurityContext.RunAsUser, uid)
+		}
+	}
+}
+
+// The pre-fix failure mode of the build file: a final stage with no USER (or
+// with root/0) must be rejected, and a USER in an earlier builder stage must
+// not count as the shipping image's user.
+func TestDockerfileFinalStageUser_RegressionFixtures(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	tests := []struct {
+		name        string
+		content     string
+		wantUser    string
+		wantCreates bool
+	}{
+		{
+			name:        "no USER in the final stage",
+			content:     "FROM golang:1.27-alpine AS builder\nUSER builder\nRUN go build .\n\nFROM alpine:3.24\nRUN apk --no-cache add ca-certificates\nENTRYPOINT [\"/app/redis-master-label\"]\n",
+			wantUser:    "",
+			wantCreates: false,
+		},
+		{
+			name:        "USER root",
+			content:     "FROM alpine:3.24\nRUN adduser -S labeler\nUSER root\n",
+			wantUser:    "root",
+			wantCreates: true,
+		},
+		{
+			name:        "USER 0:0",
+			content:     "FROM alpine:3.24\nRUN adduser -S labeler\nUSER 0:0\n",
+			wantUser:    "0:0",
+			wantCreates: true,
+		},
+		{
+			name:        "USER without creating the account",
+			content:     "FROM alpine:3.24\nUSER 10001:10001\n",
+			wantUser:    "10001:10001",
+			wantCreates: false,
+		},
+		{
+			name:        "unprivileged user created and selected",
+			content:     "FROM alpine:3.24\nRUN apk --no-cache add ca-certificates && addgroup -S -g 10001 labeler && adduser -S -u 10001 -G labeler -H labeler\nUSER 10001:10001\n",
+			wantUser:    "10001:10001",
+			wantCreates: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := write(strings.ReplaceAll(tt.name, " ", "-")+".Dockerfile", tt.content)
+			user, createsUser, err := dockerfileFinalStageUser(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if user != tt.wantUser {
+				t.Errorf("user = %q, want %q", user, tt.wantUser)
+			}
+			if createsUser != tt.wantCreates {
+				t.Errorf("createsUser = %v, want %v", createsUser, tt.wantCreates)
+			}
+		})
+	}
+
+	if _, _, err := dockerfileFinalStageUser(filepath.Join(dir, "missing.Dockerfile")); err == nil {
+		t.Error("missing build file accepted, want a read error")
+	}
+	if _, _, err := dockerfileFinalStageUser(write("no-from.Dockerfile", "RUN true\n")); err == nil {
+		t.Error("build file without FROM accepted, want an error")
+	}
+}
+
 func TestVersionDefaultsToDev(t *testing.T) {
 	if version != "dev" {
 		t.Fatalf("version = %q, want the unstamped default \"dev\"", version)
