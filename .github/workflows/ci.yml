@@ -79,3 +79,31 @@ jobs:
               ;;
           esac
           docker build -t ci-check:test -f "$build_file" .
+
+      # The version the image reports is documented behavior (README: an
+      # unstamped build reports `dev`, a release reports its tag), and `go test`
+      # cannot see a regression here because tests compile without the linker
+      # stamp. So run the built image: no --build-arg VERSION must print
+      # "redis-master-label dev" rather than an empty version, and
+      # --build-arg VERSION=v9.9.9 must print exactly that tag.
+      - name: Verify image version output
+        run: |
+          build_file=Dockerfile
+          [ -f "$build_file" ] || build_file=Containerfile
+
+          docker build -t ci-check:unstamped -f "$build_file" .
+          got=$(docker run --rm ci-check:unstamped --version)
+          want="redis-master-label dev"
+          if [ "$got" != "$want" ]; then
+            echo "image built with no --build-arg VERSION must report '$want', got '$got'" >&2
+            exit 1
+          fi
+
+          tag=v9.9.9
+          docker build --build-arg VERSION="$tag" -t ci-check:stamped -f "$build_file" .
+          got=$(docker run --rm ci-check:stamped --version)
+          want="redis-master-label $tag"
+          if [ "$got" != "$want" ]; then
+            echo "image built with --build-arg VERSION=$tag must report '$want', got '$got'" >&2
+            exit 1
+          fi

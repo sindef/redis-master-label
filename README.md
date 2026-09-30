@@ -54,8 +54,10 @@ docker build --build-arg VERSION=v0.1.0 -t redis-master-label:v0.1.0 .
 ```
 
 `--build-arg VERSION` stamps the binary's `--version` output and the image's
-`org.opencontainers.image.version` label. Without it the build still succeeds,
-just reporting `dev`.
+`org.opencontainers.image.version` label. The build file defaults `VERSION` to
+`dev` (with a shell fallback for an empty value), so a plain `docker build .`
+still succeeds and reports `redis-master-label dev`; a `vX.Y.Z` tag passed
+through `--build-arg` is reported exactly.
 
 ## Releases
 Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
