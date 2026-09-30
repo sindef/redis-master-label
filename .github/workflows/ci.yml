@@ -49,6 +49,15 @@ jobs:
           docker run --rm -v "$PWD":/workdir ghcr.io/yannh/kubeconform:v0.6.7 \
             -strict -summary /workdir/manifests
 
+      # The image is deployable output: both example manifests run the binary
+      # the build file produces, so a broken or stale build file must fail the
+      # pull request instead of being found when the image is built by hand.
+      - name: Build container image
+        run: |
+          build_file=Containerfile
+          [ -f "$build_file" ] || build_file=Dockerfile
+          docker build -t ci-check:test -f "$build_file" .
+
   # Keeps the `update-go_modules-graph` status check reporting on every push and
   # pull request: it rebuilds the module graph from go.mod/go.sum and fails if
   # the graph cannot be produced (for example when go.sum is missing an entry).
