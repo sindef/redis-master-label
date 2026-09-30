@@ -68,10 +68,28 @@ name, `GITHUB_TOKEN` with `packages: write`). The image carries provenance and
 SBOM attestations, and the workflow's step summary reports the pushed digest.
 Nothing floating (`:latest`) is ever published.
 
-Release checklist:
-1. Bump the tag in both `manifests/deployment-example.yaml` and
-   `manifests/redis-leader.yaml` to the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`.
-2. Push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+### Release checklist
+
+The pinned image reference must be identical in three places: the example
+manifests that deploy it and `main_test.go`, whose `releaseImage` constant pins
+what `TestManifestsPinVersionedReleaseImage` accepts. The release workflow's
+Test step runs `go test -count=1 ./...` before it builds or publishes anything,
+so push a stale pin and no image is released — and the test's error text says
+the manifest image "is not the pinned release image", which points at the YAML
+even when the stale string lives in `main_test.go`.
+
+1. Bump the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`
+   reference in every one of these files:
+   - `main_test.go` — `const releaseImage = "..."`
+   - `manifests/deployment-example.yaml`
+   - `manifests/redis-leader.yaml`
+2. Commit the bumps, verify the gate locally, then tag that commit:
+   ```bash
+   go test -count=1 ./...
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+   The tag push starts the release workflow (vet + tests, then build and push
+   `ghcr.io/<owner>/redis-master-label:<tag>`).
 3. Apply the updated manifests; the pinned tag rolls out the new image.
 
 Rollback: redeploy the previous release's full image reference
