@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -270,6 +272,72 @@ func slaveReply() []interface{} {
 		int64(6379),
 		"connected",
 		int64(12345),
+	}
+}
+
+// Every --flag a sidecar container uses in manifests/*.yaml must be defined in
+// the binary's flag set (flag.CommandLine). kubeconform only checks Kubernetes
+// schemas and never inspects container args, so without this check a mistyped
+// or renamed flag passes CI and only crashes the sidecar at runtime, where the
+// flag package exits with status 2 and the pod CrashLoops.
+func TestManifestFlagsDefined(t *testing.T) {
+	unknown, sidecars, err := sidecarFlagUsages(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sidecars == 0 {
+		t.Fatal("no sidecar container found in manifests: the flag check ran against nothing")
+	}
+
+	if len(unknown) > 0 {
+		for _, usage := range unknown {
+			t.Errorf("unknown flag in manifest: %s", usage)
+		}
+	}
+}
+
+// The reported failure mode: a mistyped flag (for example --redis-adr after a
+// --redis-addr rename) in a manifest must fail this test, not pass CI and
+// crash the sidecar at runtime with flag package status 2.
+func TestManifestFlagsDefined_UnknownFlagFails(t *testing.T) {
+	dir := t.TempDir()
+	manifest := "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: redis\n        image: redis:7-alpine\n        command:\n        - redis-server\n      - name: redis-master-label\n        image: redis-master-label:latest\n        command:\n        - /app/redis-master-label\n        - --redis-addr=localhost:6379\n        - --redis-adr=localhost:6379\n"
+	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "deployment-typo.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	unknown, sidecars, err := sidecarFlagUsages(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sidecars != 1 {
+		t.Fatalf("sidecars = %d, want 1", sidecars)
+	}
+	if len(unknown) != 1 || unknown[0] != "deployment-typo.yaml/redis-master-label:redis-adr" {
+		t.Fatalf("unknown = %v, want the --redis-adr usage reported", unknown)
+	}
+
+	// A well-typed same manifest yields no unknown flags.
+	if err := os.Remove(filepath.Join(dir, "deployment-typo.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	good := strings.ReplaceAll(manifest, "--redis-adr", "--redis-password")
+	if err := os.WriteFile(filepath.Join(dir, "deployment-good.yaml"), []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unknown, sidecars, err = sidecarFlagUsages(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %v, want none after fixing the typo", unknown)
+	}
+	if sidecars != 1 {
+		t.Fatalf("sidecars = %d, want 1", sidecars)
 	}
 }
 
