@@ -25,7 +25,11 @@ spec:
         - "redis-leader.default.svc.cluster.local"
         - "6379"
       - name: redis-master-label
-        image: redis-master-label:latest
+        # Published by .github/workflows/release.yml when a vX.Y.Z tag is
+        # pushed. Pin a registry-qualified, versioned tag so the image is
+        # pullable (an unqualified name defaults to docker.io and :latest
+        # forces re-pull/rebuild) and so a bad release can be rolled back.
+        image: ghcr.io/redis-master-label/redis-master-label:v0.1.0
         env:
         - name: HOSTNAME
           valueFrom:

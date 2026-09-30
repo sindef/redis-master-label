@@ -45,11 +45,37 @@ Note: running the binary outside a cluster is not supported. It builds its Kuber
 
 ## Container build
 ```bash
-# Build image using the provided Dockerfile
-podman build -t redis-master-label:latest .
+# Build a local test image with a version stamp (the release workflow passes
+# the pushed vX.Y.Z tag the same way)
+podman build --build-arg VERSION=v0.0.0-local -t redis-master-label:v0.0.0-local .
 # or
-docker build -t redis-master-label:latest .
+docker build --build-arg VERSION=v0.0.0-local -t redis-master-label:v0.0.0-local .
+# The binary reports its build version and needs no cluster for this:
+docker run --rm redis-master-label:v0.0.0-local --version
 ```
+
+## Releases
+Published images are built by `.github/workflows/release.yml`. Pushing a
+`vX.Y.Z` tag runs `go vet`/`go test`, builds the image with the tag stamped
+into the binary (`--version` prints it) and into the `org.opencontainers.image.version`
+label, and pushes it to GitHub Container Registry:
+
+```
+ghcr.io/<owner>/redis-master-label:vX.Y.Z
+```
+
+Only the pushed tag is published; no floating `:latest` tag exists, so a bad
+release can be rolled back by pointing the manifests at the previous tag again.
+The tag carries provenance and SBOM attestations.
+
+To cut a release:
+1. Bump the `image:` reference in `manifests/deployment-example.yaml` and
+   `manifests/redis-leader.yaml` to the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z` tag.
+2. Commit, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+If your repository lives under a different GitHub owner, change the
+`ghcr.io/<owner>/redis-master-label` prefix in both manifests accordingly; the
+release workflow derives the same prefix from `GITHUB_REPOSITORY`.
 
 ## Kubernetes deployment
 Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.

@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -510,6 +516,116 @@ func TestUpdateHealthStatus_FailureThreshold(t *testing.T) {
 		if failures != i {
 			t.Errorf("after %d consecutive failures, consecutiveFailures = %d, want %d", i, failures, i)
 		}
+	}
+}
+
+// Release image reference the example manifests must pin. The release
+// workflow publishes exactly this image on the vX.Y.Z tag push.
+const (
+	releaseImageRepo = "ghcr.io/redis-master-label/redis-master-label"
+	releaseImageTag  = "v0.1.0"
+)
+
+// manifestLabelerImage decodes one manifest and returns the image of the
+// redis-master-label sidecar container.
+func manifestLabelerImage(t *testing.T, path string) string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	jsonData, err := k8syaml.ToJSON(data)
+	if err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+
+	var doc struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Name  string `json:"name"`
+						Image string `json:"image"`
+					} `json:"containers"`
+				} `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(jsonData, &doc); err != nil {
+		t.Fatalf("unmarshal %s: %v", path, err)
+	}
+
+	image := ""
+	found := 0
+	for _, c := range doc.Spec.Template.Spec.Containers {
+		if c.Name == "redis-master-label" {
+			found++
+			image = c.Image
+		}
+	}
+	if found != 1 {
+		t.Fatalf("%s: found %d redis-master-label containers, want 1", path, found)
+	}
+	return image
+}
+
+func TestManifestsPinVersionedPublishedImage(t *testing.T) {
+	want := releaseImageRepo + ":" + releaseImageTag
+	for _, mf := range []string{
+		"manifests/deployment-example.yaml",
+		"manifests/redis-leader.yaml",
+	} {
+		if got := manifestLabelerImage(t, mf); got != want {
+			t.Errorf("%s: image = %q, want registry-qualified versioned tag %q (unqualified or :latest names resolve against docker.io and cannot be pulled)", mf, got, want)
+		}
+	}
+}
+
+// The pinned tag must be a semver release tag, matching the release workflow
+// trigger (vX.Y.Z), not a floating branch or digest alias.
+func TestReleaseImageTagIsSemver(t *testing.T) {
+	ok, err := regexp.MatchString(`^v[0-9]+\.[0-9]+\.[0-9]+`, releaseImageTag)
+	if err != nil {
+		t.Fatalf("regexp: %v", err)
+	}
+	if !ok {
+		t.Fatalf("releaseImageTag %q is not a vX.Y.Z semver tag", releaseImageTag)
+	}
+}
+
+// Prove the check catches the failure mode the reviewer cited: an unqualified
+// :latest image in a manifest is reported, not silently accepted.
+func TestManifestLabelerImageDetectsUnqualifiedLatest(t *testing.T) {
+	original := releaseImageRepo + ":" + releaseImageTag
+	data, err := os.ReadFile("manifests/redis-leader.yaml")
+	if err != nil {
+		t.Fatalf("read redis-leader.yaml: %v", err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "redis-leader.yaml")
+	content := strings.Replace(string(data), original, "redis-master-label:latest", 1)
+	if content == string(data) {
+		t.Fatal("fixture: could not inject the :latest image")
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write temp manifest: %v", err)
+	}
+	if got := manifestLabelerImage(t, path); got != "redis-master-label:latest" {
+		t.Fatalf("manifestLabelerImage = %q, want the injected unqualified :latest image", got)
+	}
+}
+
+func TestVersionDefaultIsDev(t *testing.T) {
+	if version != "dev" {
+		t.Fatalf("version = %q, want dev (release builds override it via -ldflags -X)", version)
+	}
+}
+
+func TestVersionFlagRegistered(t *testing.T) {
+	if flag.Lookup("version") == nil {
+		t.Fatal("--version flag not registered")
 	}
 }
 
