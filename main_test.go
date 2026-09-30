@@ -775,6 +775,72 @@ func TestVersionFlagRegistered(t *testing.T) {
 	}
 }
 
+// The reviewed defect: the build file expanded an empty VERSION into
+// `-ldflags "-X main.version="`, which overrides main.go's `var version = "dev"`,
+// so `docker build .` (the command the README documents) produced an image whose
+// `--version` printed an empty version. `go test` compiles without the linker
+// stamp, so this reads the build file instead.
+func TestBuildFileStampsDevWhenVersionUnset(t *testing.T) {
+	buildFile, err := locateBuildFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := buildFileUnstampedVersion(buildFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != version {
+		t.Fatalf("%s stamps version %q for a build with no --build-arg VERSION, want %q (the unstamped default in main.go)", buildFile, got, version)
+	}
+}
+
+// The failure mode and its two accepted fixes must be distinguished: an empty
+// ARG VERSION expanded unconditionally stamps an empty version, while a non-empty
+// default or a shell fallback keeps "dev" - and a tag supplied through
+// --build-arg VERSION still reaches the linker in every accepted variant.
+func TestBuildFileUnstampedVersion_RejectsEmptyVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Dockerfile")
+
+	broken := "FROM golang:1.27-alpine\nARG VERSION=\"\"\nRUN CGO_ENABLED=0 GOOS=linux go build -ldflags \"-X main.version=${VERSION}\" -o redis-master-label .\n"
+	writeBuildFile(t, path, broken)
+	got, err := buildFileUnstampedVersion(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("unstamped version = %q, want \"\" for the reviewed broken build file", got)
+	}
+
+	fixedDefault := strings.Replace(broken, `ARG VERSION=""`, "ARG VERSION=dev", 1)
+	writeBuildFile(t, path, fixedDefault)
+	if got, err = buildFileUnstampedVersion(path); err != nil || got != "dev" {
+		t.Fatalf("ARG VERSION=dev: unstamped version = %q, err = %v, want \"dev\"", got, err)
+	}
+
+	fixedFallback := "FROM golang:1.27-alpine\nARG VERSION=\"\"\nRUN VERSION=\"${VERSION:-dev}\" && CGO_ENABLED=0 GOOS=linux go build -ldflags \"-X main.version=${VERSION}\" -o redis-master-label .\n"
+	writeBuildFile(t, path, fixedFallback)
+	if got, err = buildFileUnstampedVersion(path); err != nil || got != "dev" {
+		t.Fatalf("shell fallback: unstamped version = %q, err = %v, want \"dev\"", got, err)
+	}
+
+	// A build step that stops passing ${VERSION} to the linker breaks
+	// --build-arg VERSION=<tag>, so it must be rejected as unsupported.
+	noStamp := "FROM golang:1.27-alpine\nARG VERSION=dev\nRUN CGO_ENABLED=0 GOOS=linux go build -o redis-master-label .\n"
+	writeBuildFile(t, path, noStamp)
+	if _, err = buildFileUnstampedVersion(path); err == nil {
+		t.Fatal("build file without a version-stamping go build step was accepted")
+	}
+}
+
+func writeBuildFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHealthHandler_HealthyReturns200(t *testing.T) {
 	setHealthStatus(0, true)
 	defer setHealthStatus(0, false)
