@@ -26,10 +26,23 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o r
 
 FROM alpine:3.24
 
-RUN apk --no-cache add ca-certificates
+# ca-certificates for TLS-enabled Redis connections, plus the dedicated
+# unprivileged account the container runs as. The uid/gid are also pinned in
+# the example manifests' securityContext (runAsUser/runAsGroup), so the image
+# and the manifests agree on who runs the labeler.
+RUN apk --no-cache add ca-certificates \
+ && addgroup -S -g 10001 labeler \
+ && adduser -S -u 10001 -G labeler -H labeler
 
 WORKDIR /app
 
 COPY --from=builder /build/redis-master-label .
+
+# The labeler only reads Redis and calls the Kubernetes API with its mounted
+# credentials, so it needs no privileges at all. Without USER the final stage
+# runs as uid 0, which the manifests' runAsNonRoot cannot fix (the kubelet
+# rejects the container instead) and which any namespace enforcing the
+# restricted Pod Security Standard rejects outright.
+USER 10001:10001
 
 ENTRYPOINT ["/app/redis-master-label"]

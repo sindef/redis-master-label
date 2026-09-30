@@ -18,6 +18,11 @@ import (
 // only crash the sidecar at runtime, where the flag package exits with status
 // 2 and the pod CrashLoops. The test lives in main_test.go
 // (TestManifestFlagsDefined); this file holds the shared parsing helpers.
+//
+// The same file holds the readers for the other two things CI cannot see:
+// the sidecar containers' securityContext (main_test.go,
+// TestManifestSidecarsRunUnprivileged) and the USER the build file's final
+// stage selects (dockerfileFinalStageUser, TestDockerfileFinalStageRunsAsNonRootUser).
 
 // manifestDir is where the example manifests live relative to the repo root.
 const manifestDir = "manifests"
@@ -27,18 +32,34 @@ const manifestDir = "manifests"
 // redis-server --replicaof) carry flags from different binaries.
 const sidecarImage = "redis-master-label"
 
-// podSpecManifest holds just the container command/args. Only fields present
-// in the example manifests are decoded; manifests without a Pod spec (like
-// Services) simply have no containers.
+// containerSecurityContext holds the container securityContext fields the
+// example manifests must set to run the labeler unprivileged. The booleans are
+// pointers so an absent field is distinguishable from an explicit false: an
+// omitted runAsNonRoot is not the same defence as runAsNonRoot: true.
+type containerSecurityContext struct {
+	RunAsNonRoot             *bool  `json:"runAsNonRoot"`
+	RunAsUser                *int64 `json:"runAsUser"`
+	RunAsGroup               *int64 `json:"runAsGroup"`
+	AllowPrivilegeEscalation *bool  `json:"allowPrivilegeEscalation"`
+	ReadOnlyRootFilesystem   *bool  `json:"readOnlyRootFilesystem"`
+	Capabilities             struct {
+		Drop []string `json:"drop"`
+	} `json:"capabilities"`
+}
+
+// podSpecManifest holds just the container command/args and securityContext.
+// Only fields present in the example manifests are decoded; manifests without
+// a Pod spec (like Services) simply have no containers.
 type podSpecManifest struct {
 	Spec struct {
 		Template struct {
 			Spec struct {
 				Containers []struct {
-					Name    string
-					Image   string
-					Command []string
-					Args    []string
+					Name            string
+					Image           string
+					Command         []string
+					Args            []string
+					SecurityContext *containerSecurityContext `json:"securityContext"`
 				}
 			}
 		}
@@ -129,6 +150,104 @@ func sidecarImages(dir string) (images []string, sidecars int, err error) {
 		}
 	}
 	return images, sidecars, readErr
+}
+
+// sidecarContainer is one labeler container found in a manifest, together with
+// the manifest file it came from so a failure names the right deployment.
+type sidecarContainer struct {
+	Manifest        string
+	Name            string
+	SecurityContext *containerSecurityContext
+}
+
+// sidecarContainers returns every labeler container across manifests/*.yaml
+// with its securityContext, so a test can prove each example deployment runs
+// the sidecar unprivileged. Used by the securityContext regression tests in
+// main_test.go.
+func sidecarContainers(dir string) ([]sidecarContainer, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var containers []sidecarContainer
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		doc, err := readPodSpecManifest(path)
+		if err != nil {
+			return nil, fmt.Errorf("parse manifest: %w", err)
+		}
+		for _, c := range doc.Spec.Template.Spec.Containers {
+			if strings.Contains(c.Image, sidecarImage) {
+				containers = append(containers, sidecarContainer{
+					Manifest:        entry.Name(),
+					Name:            c.Name,
+					SecurityContext: c.SecurityContext,
+				})
+			}
+		}
+	}
+	return containers, nil
+}
+
+// dockerfileFinalStageUser reports the USER value the build file's final stage
+// selects (the shipping image) and whether that stage creates a dedicated
+// account first. An empty user means the stage never selects one, so the
+// container runs as whatever the base image defaults to (uid 0 for alpine).
+// The final stage is found by taking the last FROM line, so a USER in an
+// earlier builder stage does not count.
+func dockerfileFinalStageUser(path string) (user string, createsUser bool, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	finalStage := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FROM ") {
+			finalStage = i
+		}
+	}
+	if finalStage < 0 {
+		return "", false, fmt.Errorf("%s: no FROM stage found", path)
+	}
+
+	for _, line := range lines[finalStage+1:] {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if createsAccount(trimmed) {
+			createsUser = true
+		}
+		if strings.HasPrefix(strings.ToUpper(trimmed), "USER ") {
+			fields := strings.Fields(trimmed)
+			if len(fields) > 1 {
+				user = fields[1]
+			}
+		}
+	}
+	return user, createsUser, nil
+}
+
+// createsAccount reports whether a build line creates a user or group, whether
+// it stands alone (USER/ADDUSER instructions) or is one command in a shell
+// RUN line joined with && (as in `RUN apk add ... && adduser ...`).
+func createsAccount(line string) bool {
+	lower := strings.ToLower(line)
+	for _, cmd := range []string{"adduser", "useradd", "addgroup", "groupadd"} {
+		if strings.Contains(lower, cmd+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 // sidecarFlagUsages walks manifests/*.yaml and returns one entry per --flag

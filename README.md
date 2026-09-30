@@ -98,6 +98,34 @@ Key points for the deployment:
 - Inject Redis connection info via args (address, TLS) and the credential via the `REDIS_PASSWORD` env var from a Secret (see "Example usage in a pod").
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
+- Run the labeler unprivileged (see "Running unprivileged" below).
+
+### Running unprivileged
+The labeler only reads Redis and calls the Kubernetes API with its mounted
+credentials, so it needs no privileges and writes nothing to disk. Both
+example deployments therefore declare this `securityContext` on the
+`redis-master-label` container:
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+  seccompProfile:
+    type: RuntimeDefault
+```
+That is the shape the restricted Pod Security Standard requires, so the
+manifests are accepted by a namespace enforcing it. The uid matches the image:
+the final Dockerfile stage creates the `labeler` account (uid/gid 10001) and
+selects it with `USER 10001:10001`, so the shipping image no longer runs as
+root even when a manifest is applied without the block above. Copy the block
+into your own pod spec when you run the sidecar elsewhere — the cluster needs
+`runAsNonRoot` there to enforce the image's non-root user instead of accepting
+uid 0.
 
 ## Example usage in a pod
 In your pod spec (sidecar pattern), pass connection settings as args and the credential as an env var backed by a Secret:

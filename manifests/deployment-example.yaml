@@ -55,3 +55,19 @@ spec:
         - --label-key=redis-role
         - --label-value=master
         - --check-interval=10s
+        # The labeler needs no privileges - it only reads Redis and calls the
+        # Kubernetes API with its mounted credentials - and works fine with a
+        # read-only root filesystem. Without this block the container ran as
+        # uid 0 with the image's default (root) user, which namespaces
+        # enforcing the restricted Pod Security Standard reject.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
