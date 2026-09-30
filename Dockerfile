@@ -5,9 +5,13 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go .
+# Copy the whole package, not named files: `go build main.go` compiles exactly
+# the named files and ignores the rest of package main, so the image silently
+# diverges from what CI (`go build ./...`) and the README
+# (`go build -o redis-master-label .`) compile.
+COPY *.go ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o redis-master-label main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o redis-master-label .
 
 FROM alpine:3.20
 
