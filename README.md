@@ -31,6 +31,7 @@ Flags (all have sensible defaults):
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
 - `--check-interval` (default `10s`)
 - `--health-port` (default `8080`)
+- `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
 Environment defaults:
 - `HOSTNAME` used when `--pod-name` not provided.
@@ -47,10 +48,34 @@ Note: running the binary outside a cluster is not supported. It builds its Kuber
 ## Container build
 ```bash
 # Build image using the provided Dockerfile
-podman build -t redis-master-label:latest .
+podman build --build-arg VERSION=v0.1.0 -t redis-master-label:v0.1.0 .
 # or
-docker build -t redis-master-label:latest .
+docker build --build-arg VERSION=v0.1.0 -t redis-master-label:v0.1.0 .
 ```
+
+`--build-arg VERSION` stamps the binary's `--version` output and the image's
+`org.opencontainers.image.version` label. Without it the build still succeeds,
+just reporting `dev`.
+
+## Releases
+Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
+the tag-push workflow runs `go vet` and the full test suite, then builds the
+image with `--build-arg VERSION=<tag>` and pushes exactly
+`ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
+name, `GITHUB_TOKEN` with `packages: write`). The image carries provenance and
+SBOM attestations, and the workflow's step summary reports the pushed digest.
+Nothing floating (`:latest`) is ever published.
+
+Release checklist:
+1. Bump the tag in both `manifests/deployment-example.yaml` and
+   `manifests/redis-leader.yaml` to the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`.
+2. Push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+3. Apply the updated manifests; the pinned tag rolls out the new image.
+
+Rollback: redeploy the previous release's full image reference
+(`kubectl set image ...` or re-applying the manifest with the older tag) —
+every published tag stays available in GHCR.
+
 
 ## Kubernetes deployment
 Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.

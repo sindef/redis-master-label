@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -416,6 +419,76 @@ func TestResolveRedisPassword(t *testing.T) {
 	*redisPassword = "flag-secret"
 	if got := resolveRedisPassword(); got != "flag-secret" {
 		t.Fatalf("resolveRedisPassword with flag set = %q, want the flag value (flag must override env)", got)
+	}
+}
+
+// The released image: both example sidecars must run exactly this reference.
+const releaseImage = "ghcr.io/redis-master-label/redis-master-label:v0.1.0"
+
+// releaseImageCheck validates one sidecar image reference against the pin.
+func releaseImageCheck(image string) error {
+	if image == releaseImage {
+		return nil
+	}
+	if strings.HasSuffix(image, ":latest") {
+		return fmt.Errorf("floating :latest tag: %q (ImagePullBackOff / stale-pod failure mode), want the pinned %q", image, releaseImage)
+	}
+	return fmt.Errorf("image %q is not the pinned release image %q", image, releaseImage)
+}
+
+// Both example sidecars must pin exactly the registry-qualified versioned
+// release image. A floating tag or an unqualifiable image name is exactly what
+// shipped the ImagePullBackOff failure mode the manifests suffered before.
+func TestManifestsPinVersionedReleaseImage(t *testing.T) {
+	images, sidecars, err := sidecarImages(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sidecars == 0 {
+		t.Fatal("no sidecar container found in manifests: the image check ran against nothing")
+	}
+	if len(images) != 2 {
+		t.Fatalf("sidecar image across manifests = %d entries, want the two example deployments", len(images))
+	}
+	for _, image := range images {
+		if err := releaseImageCheck(image); err != nil {
+			t.Errorf("%s", err)
+		}
+	}
+}
+
+// The pinned tag must be a strict semver vX.Y.Z so the release workflow's tag
+// pattern, the manifest pin and the OCI version label stay in one scheme.
+func TestReleaseImagePinnedTagIsSemver(t *testing.T) {
+	tag := releaseImage[strings.LastIndex(releaseImage, ":")+1:]
+	if ok, err := regexp.MatchString(`^v[0-9]+\.[0-9]+\.[0-9]+$`, tag); err != nil || !ok {
+		t.Fatalf("pinned release tag %q is not vMAJOR.MINOR.PATCH", tag)
+	}
+}
+
+// The :latest regression fixture: the checker must reject the exact failure
+// mode the manifests had, not merely accept the current pin.
+func TestReleaseImageCheck_RejectsLatestFixture(t *testing.T) {
+	for _, image := range []string{"redis-master-label:latest", "ghcr.io/redis-master-label/redis-master-label:latest", "redis:7-alpine"} {
+		if err := releaseImageCheck(image); err == nil {
+			t.Fatalf("releaseImageCheck(%q) accepted a non-pinned image", image)
+		}
+	}
+}
+
+func TestVersionDefaultsToDev(t *testing.T) {
+	if version != "dev" {
+		t.Fatalf("version = %q, want the unstamped default \"dev\"", version)
+	}
+}
+
+func TestVersionFlagRegistered(t *testing.T) {
+	f := flag.CommandLine.Lookup("version")
+	if f == nil {
+		t.Fatal("--version flag is not registered in flag.CommandLine")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("--version default = %q, want \"false\"", f.DefValue)
 	}
 }
 

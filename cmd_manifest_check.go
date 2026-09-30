@@ -97,6 +97,40 @@ func readPodSpecManifest(path string) (podSpecManifest, error) {
 	return doc, nil
 }
 
+// sidecarImages returns every image reference of a sidecar container across
+// manifests/*.yaml, walking the same manifest set (and tolerating the same
+// non-Pod-spec documents) as sidecarFlagUsages. Used by the release-image
+// regression tests in main_test.go.
+func sidecarImages(dir string) (images []string, sidecars int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var readErr error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		doc, err := readPodSpecManifest(path)
+		if err != nil {
+			readErr = fmt.Errorf("parse manifest: %w", err)
+			continue
+		}
+		for _, c := range doc.Spec.Template.Spec.Containers {
+			if strings.Contains(c.Image, sidecarImage) {
+				sidecars++
+				images = append(images, c.Image)
+			}
+		}
+	}
+	return images, sidecars, readErr
+}
+
 // sidecarFlagUsages walks manifests/*.yaml and returns one entry per --flag
 // used by a sidecar container, formatted "manifest/container:flag", plus a
 // count of sidecar containers seen so the caller can detect a manifest set
