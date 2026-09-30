@@ -47,3 +47,20 @@ spec:
         - --label-key=redis-role
         - --label-value=master
         - --check-interval=10s
+        # Same as deployment-example.yaml: the labeler needs no privileges
+        # (it only reads Redis and calls the Kubernetes API with its mounted
+        # credentials), so it runs as the image's non-root uid, cannot write
+        # its root filesystem, cannot gain privileges and drops every
+        # capability. This is what namespaces enforcing the restricted Pod
+        # Security Standard require.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
