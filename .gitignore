@@ -1,0 +1,14 @@
+# Build artifacts
+redis-master-label
+*.exe
+*.exe~
+
+# Test binaries and coverage output
+*.test
+*.out
+coverage*.txt
+*.prof
+
+# Go workspace files (never commit local overrides)
+go.work
+go.work.sum
