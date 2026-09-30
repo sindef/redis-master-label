@@ -32,6 +32,13 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        # Same as deployment-example.yaml: the password arrives through the
+        # REDIS_PASSWORD env var from a Secret, never through args.
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
         command:
         - /app/redis-master-label
         - --redis-addr=localhost:6379

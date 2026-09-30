@@ -395,6 +395,30 @@ func TestRoleFromResponse_KeepsOriginalErrorText(t *testing.T) {
 	}
 }
 
+// resolveRedisPassword must prefer the explicit --redis-password flag and fall
+// back to the REDIS_PASSWORD environment variable when the flag is empty, so
+// the credential can be injected through a Secret env var instead of the
+// command line (argv lands in the pod spec and /proc/<pid>/cmdline).
+func TestResolveRedisPassword(t *testing.T) {
+	orig := *redisPassword
+	defer func() { *redisPassword = orig }()
+
+	t.Setenv("REDIS_PASSWORD", "")
+	if got := resolveRedisPassword(); got != "" {
+		t.Fatalf("resolveRedisPassword with empty flag and empty env = %q, want \"\"", got)
+	}
+
+	t.Setenv("REDIS_PASSWORD", "env-secret")
+	if got := resolveRedisPassword(); got != "env-secret" {
+		t.Fatalf("resolveRedisPassword with empty flag = %q, want the env value", got)
+	}
+
+	*redisPassword = "flag-secret"
+	if got := resolveRedisPassword(); got != "flag-secret" {
+		t.Fatalf("resolveRedisPassword with flag set = %q, want the flag value (flag must override env)", got)
+	}
+}
+
 func TestHealthHandler_HealthyReturns200(t *testing.T) {
 	setHealthStatus(0, true)
 	defer setHealthStatus(0, false)
