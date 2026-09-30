@@ -70,7 +70,7 @@ func main() {
 
 	redisOptions := &redis.Options{
 		Addr:     *redisAddr,
-		Password: *redisPassword,
+		Password: resolveRedisPassword(),
 	}
 
 	if *redisTLS {
@@ -118,6 +118,19 @@ func main() {
 		}
 		time.Sleep(*checkInterval)
 	}
+}
+
+// resolveRedisPassword returns the credential for the Redis connection. The
+// explicit --redis-password flag wins; when it is empty, the REDIS_PASSWORD
+// environment variable is used. Environment is the preferred way to supply
+// the credential in Kubernetes (valueFrom.secretKeyRef on the env var):
+// a password passed on the command line lands in the pod spec and in
+// /proc/<pid>/cmdline, both readable by anyone who can inspect the pod.
+func resolveRedisPassword() string {
+	if *redisPassword != "" {
+		return *redisPassword
+	}
+	return os.Getenv("REDIS_PASSWORD")
 }
 
 // roleQuerier answers context-bound Redis commands (ROLE) without requiring a

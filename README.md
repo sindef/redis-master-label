@@ -22,7 +22,7 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 ## Configuration
 Flags (all have sensible defaults):
 - `--redis-addr` (default `localhost:6379`)
-- `--redis-password` (default empty)
+- `--redis-password` (default empty; falls back to the `REDIS_PASSWORD` env var when not set)
 - `--redis-tls` (default `false`)
 - `--redis-tls-skip-verify` (default `false`)
 - `--label-key` (default `redis-role`)
@@ -35,6 +35,7 @@ Flags (all have sensible defaults):
 Environment defaults:
 - `HOSTNAME` used when `--pod-name` not provided.
 - `POD_NAMESPACE` used when `--pod-namespace` not provided.
+- `REDIS_PASSWORD` used when `--redis-password` not provided. This is the preferred way to supply the Redis credential: an explicit `--redis-password` argument ends up in the container's argv, which Kubernetes records in the pod spec (visible to anyone with pod read access and echoed by `kubectl describe pod`) and in `/proc/<pid>/cmdline` inside the pod, readable by every container sharing the pod.
 
 ## Building locally
 ```bash
@@ -54,7 +55,7 @@ docker build -t redis-master-label:latest .
 ## Kubernetes deployment
 Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.
 
-Apply them (edit image and args as needed):
+Apply them (edit image and args as needed). The labeler sidecar reads its Redis password from a `redis-secret` Secret, so create it first if your Redis requires authentication (see "Example usage in a pod"):
 ```bash
 kubectl apply -f manifests/serviceaccount.yaml
 kubectl apply -f manifests/role.yaml
@@ -69,27 +70,36 @@ kubectl apply -f manifests/deployment-example.yaml
 If you prefer to run Redis replication against your own Redis leader, apply `serviceaccount.yaml`, `role.yaml`, `rolebinding.yaml`, and `deployment-example.yaml`, change `--replicaof` in `deployment-example.yaml` to point at your leader's Service DNS name, and provide that Service (or a headless Service with a stable DNS name for a Redis master, e.g. a StatefulSet headless Service) yourself — the example deployment expects a `redis-leader` Service (or your own equivalent) to exist.
 
 Key points for the deployment:
-- Mount/inject Redis connection info (address/password/TLS) as env/args.
+- Inject Redis connection info via args (address, TLS) and the credential via the `REDIS_PASSWORD` env var from a Secret (see "Example usage in a pod").
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
 
 ## Example usage in a pod
-In your pod spec (sidecar pattern), set args or env:
+In your pod spec (sidecar pattern), pass connection settings as args and the credential as an env var backed by a Secret:
 ```yaml
 args:
   - "--redis-addr=$(REDIS_ADDR)"
-  - "--redis-password=$(REDIS_PASSWORD)"
   - "--label-key=redis-role"
   - "--label-value=master"
 env:
   - name: REDIS_ADDR
     value: "localhost:6379"
+  # Never put the password in args (see Configuration above): inject it as
+  # REDIS_PASSWORD through valueFrom.secretKeyRef. The binary reads it from
+  # that env var when --redis-password is not set.
   - name: REDIS_PASSWORD
     valueFrom:
       secretKeyRef:
         name: redis-secret
         key: password
 ```
+
+Create the Secret referenced by the examples before applying them:
+```bash
+kubectl create secret generic redis-secret --from-literal=password=<your-redis-password>
+```
+
+If your Redis has no password, create the Secret with an empty value (`--from-literal=password=''`) or remove the `REDIS_PASSWORD` env entry from the manifests; the sidecar then connects unauthenticated.
 
 ## RBAC requirements
 - Needs `get` and `update` on the Pod resource in its namespace.
