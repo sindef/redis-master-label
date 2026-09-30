@@ -28,7 +28,12 @@ var (
 	podNamespace       = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
 	checkInterval      = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
 	healthPort         = flag.String("health-port", "8080", "Port for health check HTTP server")
+	showVersion        = flag.Bool("version", false, "Print version and exit")
 )
+
+// version is stamped at build time by the release workflow:
+// go build -ldflags "-X main.version=vX.Y.Z". Development builds keep "dev".
+var version = "dev"
 
 var (
 	healthStatus struct {
@@ -40,6 +45,13 @@ var (
 
 func main() {
 	flag.Parse()
+
+	// --version prints the build version and exits before any cluster or
+	// Redis access, so `docker run <image> --version` works outside a cluster.
+	if *showVersion {
+		fmt.Printf("redis-master-label %s\n", version)
+		return
+	}
 
 	if *podName == "" {
 		*podName = os.Getenv("HOSTNAME")

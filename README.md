@@ -45,11 +45,37 @@ Note: running the binary outside a cluster is not supported. It builds its Kuber
 
 ## Container build
 ```bash
-# Build image using the provided Dockerfile
-podman build -t redis-master-label:latest .
+# Build a local test image with a version stamp (the release workflow passes
+# the pushed vX.Y.Z tag the same way)
+podman build --build-arg VERSION=v0.0.0-local -t redis-master-label:v0.0.0-local .
 # or
-docker build -t redis-master-label:latest .
+docker build --build-arg VERSION=v0.0.0-local -t redis-master-label:v0.0.0-local .
+# The binary reports its build version and needs no cluster for this:
+docker run --rm redis-master-label:v0.0.0-local --version
 ```
+
+## Releases
+Published images are built by `.github/workflows/release.yml`. Pushing a
+`vX.Y.Z` tag runs `go vet`/`go test`, builds the image with the tag stamped
+into the binary (`--version` prints it) and into the `org.opencontainers.image.version`
+label, and pushes it to GitHub Container Registry:
+
+```
+ghcr.io/<owner>/redis-master-label:vX.Y.Z
+```
+
+Only the pushed tag is published; no floating `:latest` tag exists, so a bad
+release can be rolled back by pointing the manifests at the previous tag again.
+The tag carries provenance and SBOM attestations.
+
+To cut a release:
+1. Bump the `image:` reference in `manifests/deployment-example.yaml` and
+   `manifests/redis-leader.yaml` to the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z` tag.
+2. Commit, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+If your repository lives under a different GitHub owner, change the
+`ghcr.io/<owner>/redis-master-label` prefix in both manifests accordingly; the
+release workflow derives the same prefix from `GITHUB_REPOSITORY`.
 
 ## Kubernetes deployment
 Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.
@@ -72,6 +98,14 @@ Key points for the deployment:
 - Mount/inject Redis connection info (address/password/TLS) as env/args.
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
+
+The example manifests pin the sidecar image to the registry-qualified,
+versioned tag published by the release workflow
+(`ghcr.io/redis-master-label/redis-master-label:v0.1.0`). An unqualified
+`redis-master-label:latest` reference resolves against docker.io and cannot be
+pulled by a cluster; if you build your own image instead of using a published
+release, point the manifests at the image you pushed, for example a
+registry you control.
 
 ## Example usage in a pod
 In your pod spec (sidecar pattern), set args or env:
