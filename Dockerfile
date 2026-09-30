@@ -9,7 +9,7 @@ COPY main.go .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o redis-master-label main.go
 
-FROM alpine:latest
+FROM alpine:3.20
 
 RUN apk --no-cache add ca-certificates
 
