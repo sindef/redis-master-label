@@ -17,6 +17,11 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=<release
+// tag>"; the release workflow passes the tag to the Docker build through
+// --build-arg VERSION. Unstamped (local or CI test) builds report "dev".
+var version = "dev"
+
 var (
 	redisAddr          = flag.String("redis-addr", "localhost:6379", "Redis server address")
 	redisPassword      = flag.String("redis-password", "", "Redis password")
@@ -28,6 +33,7 @@ var (
 	podNamespace       = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
 	checkInterval      = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
 	healthPort         = flag.String("health-port", "8080", "Port for health check HTTP server")
+	showVersion        = flag.Bool("version", false, "Print the build version and exit")
 )
 
 var (
@@ -40,6 +46,11 @@ var (
 
 func main() {
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("redis-master-label %s\n", version)
+		return
+	}
 
 	if *podName == "" {
 		*podName = os.Getenv("HOSTNAME")

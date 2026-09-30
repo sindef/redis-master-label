@@ -22,7 +22,9 @@ spec:
         command:
         - redis-server
       - name: redis-master-label
-        image: redis-master-label:latest
+        # Same as deployment-example.yaml: pinned versioned release image,
+        # never a floating :latest reference.
+        image: ghcr.io/redis-master-label/redis-master-label:v0.1.0
         env:
         - name: HOSTNAME
           valueFrom:

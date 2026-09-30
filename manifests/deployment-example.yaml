@@ -25,7 +25,12 @@ spec:
         - "redis-leader.default.svc.cluster.local"
         - "6379"
       - name: redis-master-label
-        image: redis-master-label:latest
+        # Pinned to a registry-qualified versioned release, never :latest:
+        # a floating tag makes every deployment's image depend on the newest
+        # published build instead of the tested one, and `latest` pulled once
+        # as an empty registry reference caused the original ImagePullBackOff.
+        # Roll back by redeploying the previous tag.
+        image: ghcr.io/redis-master-label/redis-master-label:v0.1.0
         env:
         - name: HOSTNAME
           valueFrom:

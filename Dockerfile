@@ -11,7 +11,18 @@ RUN go mod download
 # (`go build -o redis-master-label .`) compile.
 COPY *.go ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o redis-master-label .
+# VERSION carries the release tag (the release workflow passes it with
+# --build-arg VERSION=vX.Y.Z) and is stamped into the binary's `--version`
+# output; `RUN`/`CMD` `--build-arg` defaults keep local builds working, they
+# just report "dev". OCI labels record what the image is and where it came
+# from, so `docker inspect` can identify a running image without the registry.
+ARG VERSION=""
+LABEL org.opencontainers.image.title="redis-master-label" \
+      org.opencontainers.image.description="Kubernetes sidecar that labels the pod hosting the current Redis master" \
+      org.opencontainers.image.source="https://github.com/redis-master-label/redis-master-label" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
 
 FROM alpine:3.20
 

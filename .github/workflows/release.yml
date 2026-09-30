@@ -1,0 +1,77 @@
+name: Release
+
+# Publishing path for release_hygiene: a vX.Y.Z tag is the single trigger. The
+# workflow runs the same tests as CI, builds one image stamped with the tag
+# version, and pushes exactly one immutable reference:
+# <registry>/<image>:<tag>. Nothing floating like :latest is ever pushed, so
+# an image reference stays point-in-time: an old release can be rolled back to
+# by redeploying its tag, and a manifest that pins <tag> keeps working when
+# newer releases appear.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-publish:
+    name: Build and publish release image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Compute lowercase image name
+        id: image
+        shell: bash
+        run: |
+          lowercase=$(echo "${{ env.IMAGE }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${lowercase}" >> "$GITHUB_OUTPUT"
+
+      # The tag checkout is a detached HEAD; the build-arg feeds both the
+      # binary's --version output and the image's OCI version label.
+      - name: Build image
+        run: |
+          version="${GITHUB_REF_NAME}"
+          docker build --build-arg VERSION="$version" -t "${{ steps.image.outputs.image }}:$version" .
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image with provenance and SBOM attestations
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: VERSION=${{ github.ref_name }}
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ steps.image.outputs.image }}:${{ github.ref_name }}
+
+      - name: Report digest in step summary
+        run: |
+          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
