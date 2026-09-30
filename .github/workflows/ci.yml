@@ -54,8 +54,25 @@ jobs:
       # pull request instead of being found when the image is built by hand.
       - name: Build container image
         run: |
-          build_file=Containerfile
-          [ -f "$build_file" ] || build_file=Dockerfile
+          build_file=Dockerfile
+          [ -f "$build_file" ] || build_file=Containerfile
+          # The build file must compile the same source set as CI
+          # (`go build ./...`) and the README (`go build -o redis-master-label .`).
+          # Naming .go files on the COPY or `go build` line excludes every other
+          # file in package main, so the image would ship a different program.
+          if ! grep -Eqi '^[[:space:]]*copy[[:space:]]+(\*\.go|\.)[[:space:]]+[./]' "$build_file"; then
+            echo "$build_file: builder stage must copy the package sources (COPY *.go ./ or COPY . .)" >&2
+            exit 1
+          fi
+          build_cmd=$(grep -Ei '^[[:space:]]*run.*go build' "$build_file" || true)
+          case "$build_cmd" in
+            *' .')
+              ;;
+            *)
+              echo "$build_file: go build must target the package ('.'), not named files: ${build_cmd:-<no go build step found>}" >&2
+              exit 1
+              ;;
+          esac
           docker build -t ci-check:test -f "$build_file" .
 
   # Keeps the `update-go_modules-graph` status check reporting on every push and
