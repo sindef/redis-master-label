@@ -13,16 +13,20 @@ COPY *.go ./
 
 # VERSION carries the release tag (the release workflow passes it with
 # --build-arg VERSION=vX.Y.Z) and is stamped into the binary's `--version`
-# output; `RUN`/`CMD` `--build-arg` defaults keep local builds working, they
-# just report "dev". OCI labels record what the image is and where it came
-# from, so `docker inspect` can identify a running image without the registry.
-ARG VERSION=""
+# output. It must never expand to the empty string: an empty linker stamp
+# overrides main.go's `var version = "dev"`, so an unstamped `docker build .`
+# would print an empty version instead of the "dev" this file and the README
+# document. Hence the default below plus the shell fallback in the build step,
+# which also covers an explicit empty `--build-arg VERSION=`. OCI labels record
+# what the image is and where it came from, so `docker inspect` can identify a
+# running image without the registry.
+ARG VERSION=dev
 LABEL org.opencontainers.image.title="redis-master-label" \
       org.opencontainers.image.description="Kubernetes sidecar that labels the pod hosting the current Redis master" \
       org.opencontainers.image.source="https://github.com/redis-master-label/redis-master-label" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}"
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
+RUN VERSION="${VERSION:-dev}" && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
 
 FROM alpine:3.24
 
