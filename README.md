@@ -22,7 +22,7 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 ## Configuration
 Flags (all have sensible defaults):
 - `--redis-addr` (default `localhost:6379`)
-- `--redis-password` (default empty)
+- `--redis-password` (default empty; overrides the `REDIS_PASSWORD` env var)
 - `--redis-tls` (default `false`)
 - `--redis-tls-skip-verify` (default `false`)
 - `--label-key` (default `redis-role`)
@@ -35,6 +35,7 @@ Flags (all have sensible defaults):
 Environment defaults:
 - `HOSTNAME` used when `--pod-name` not provided.
 - `POD_NAMESPACE` used when `--pod-namespace` not provided.
+- `REDIS_PASSWORD` used as the Redis password when `--redis-password` not provided. Prefer `REDIS_PASSWORD` and inject it with `valueFrom.secretKeyRef`: passing the password as a command-line argument puts the plaintext credential into the pod spec and into `/proc/<pid>/cmdline`, readable by every container sharing the pod. The flag remains for explicit overrides.
 
 ## Building locally
 ```bash
@@ -56,6 +57,10 @@ Manifests in `manifests/` provide an example service account, role, rolebinding,
 
 Apply them (edit image and args as needed):
 ```bash
+# Create the Redis password Secret first: both example deployments read it via
+# valueFrom.secretKeyRef, and the redis-server containers authenticate with it.
+kubectl create secret generic redis-secret --from-literal=password=<your-redis-password>
+
 kubectl apply -f manifests/serviceaccount.yaml
 kubectl apply -f manifests/role.yaml
 kubectl apply -f manifests/rolebinding.yaml
@@ -66,19 +71,21 @@ kubectl apply -f manifests/deployment-example.yaml
 
 `manifests/redis-leader.yaml` and `manifests/redis-leader-service.yaml` run a single Redis master (one replica, no `--replicaof`) and expose it in the `default` namespace as a Service named `redis-leader`, so the DNS name used by the replicas resolves inside the example itself. That leader pod also runs the labeler sidecar, so you can see `redis-role=master` get applied and stay on the master; the replica deployment points its Redis containers at `redis-leader.default.svc.cluster.local:6379`, so all three replicas replicate from it, and their labeler sidecars remove the `redis-role` label if a pod is ever demoted or promoted back to a replica.
 
+If your Redis runs without authentication, remove the `REDIS_PASSWORD` env entries and the `--requirepass`/`--masterauth` arguments from the two example deployments, and skip creating the secret. The labeler then needs no credential at all (its `--redis-password` default is empty).
+
 If you prefer to run Redis replication against your own Redis leader, apply `serviceaccount.yaml`, `role.yaml`, `rolebinding.yaml`, and `deployment-example.yaml`, change `--replicaof` in `deployment-example.yaml` to point at your leader's Service DNS name, and provide that Service (or a headless Service with a stable DNS name for a Redis master, e.g. a StatefulSet headless Service) yourself — the example deployment expects a `redis-leader` Service (or your own equivalent) to exist.
 
 Key points for the deployment:
-- Mount/inject Redis connection info (address/password/TLS) as env/args.
+- Mount/inject Redis connection info (address/password/TLS) as env or args, except the password: inject it as the `REDIS_PASSWORD` env var from a Secret (`valueFrom.secretKeyRef`), never as a command-line argument.
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
 
 ## Example usage in a pod
-In your pod spec (sidecar pattern), set args or env:
+In your pod spec (sidecar pattern), pass non-secret options as args and inject the Redis password through the environment:
+
 ```yaml
 args:
   - "--redis-addr=$(REDIS_ADDR)"
-  - "--redis-password=$(REDIS_PASSWORD)"
   - "--label-key=redis-role"
   - "--label-value=master"
 env:
@@ -90,6 +97,8 @@ env:
         name: redis-secret
         key: password
 ```
+
+Keep the credential out of `args`: Kubernetes expands `$(VAR)` references in `args` at pod creation, so `--redis-password=$(REDIS_PASSWORD)` would put the plaintext password into the pod spec (visible via `kubectl describe pod`) and into `/proc/<pid>/cmdline` inside the pod, readable by every container that shares the pod. The binary reads it from `REDIS_PASSWORD` instead; `--redis-password` remains as an explicit override for cases where an env var is not an option.
 
 ## RBAC requirements
 - Needs `get` and `update` on the Pod resource in its namespace.

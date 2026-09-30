@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,77 @@ func newPodClientset(pods ...runtime.Object) *k8sfake.Clientset {
 func testPod(name string, labels map[string]string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
+	}
+}
+
+// testFlagPassed parses the given arguments on a fresh FlagSet holding the
+// production-shaped redis-password flag and reports whether that marks the
+// flag explicitly set. It mirrors flagPassed on flag.CommandLine (main.go)
+// without mutating the test process's own flag parser state.
+func testFlagPassed(using []string) bool {
+	fs := flag.NewFlagSet("redis-password", flag.ContinueOnError)
+	fs.String("redis-password", "", "Redis password (defaults to the REDIS_PASSWORD env var)")
+	fs.Bool("redis-tls", false, "Enable TLS for Redis connection")
+	if err := fs.Parse(using); err != nil {
+		return false
+	}
+
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "redis-password" {
+			set = true
+		}
+	})
+	return set
+}
+
+// TestFlagPassed_RecognizesExplicitFlagAndSpelling covers the explicit-flag
+// detection main() relies on, for every accepted spelling — including the
+// empty value, which is an explicit "no password" override rather than a
+// request for the env fallback.
+func TestFlagPassed_RecognizesExplicitFlagAndSpelling(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"--redis-password=secret", []string{"--redis-password=secret"}, true},
+		{"--redis-password secret", []string{"--redis-password", "secret"}, true},
+		{"-redis-password secret", []string{"-redis-password", "secret"}, true},
+		{"--redis-password= is explicit", []string{"--redis-password="}, true},
+		{"unset flag", nil, false},
+		{"other flag set", []string{"--redis-tls"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := testFlagPassed(tt.args); got != tt.want {
+				t.Fatalf("explicitly-set detection for %v = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyRedisPasswordEnv pins the credential-source contract: an explicitly
+// passed --redis-password wins (the empty value is an explicit "no password"
+// override), and with the flag unset the REDIS_PASSWORD environment variable
+// supplies the credential.
+func TestApplyRedisPasswordEnv(t *testing.T) {
+	orig := *redisPassword
+	defer func() { *redisPassword = orig }()
+
+	// Flag unset: the environment supplies the credential.
+	*redisPassword = "should-be-replaced"
+	applyRedisPasswordEnv(false, "from-env")
+	if *redisPassword != "from-env" {
+		t.Fatalf("flag unset: --redis-password = %q, want the REDIS_PASSWORD value", *redisPassword)
+	}
+
+	// Explicitly passed flag (even empty) overrides the env value.
+	*redisPassword = "should-stay"
+	applyRedisPasswordEnv(true, "from-env")
+	if *redisPassword != "should-stay" {
+		t.Fatalf("explicit flag replaced: --redis-password = %q, want the flag value", *redisPassword)
 	}
 }
 
@@ -394,11 +466,6 @@ func TestApplyLabel_MasterRoleWithWrongValueRewritesLabel(t *testing.T) {
 	}
 }
 
-// TestApplyLabel_SlaveRoleWithForeignValueKeepsLabelNoUpdate was removed:
-// since the label-removal fix the key is deleted for every non-master role
-// whatever value it holds, so this obsolete test contradicted
-// TestCheckAndLabel_NonMasterRemovesLabelWithForeignValue.
-
 func TestCheckAndLabel_MasterReplyAppliesLabel(t *testing.T) {
 	defer configureTestFlags()()
 	cs := newPodClientset(testPod("test-pod", nil))
@@ -415,10 +482,6 @@ func TestCheckAndLabel_MasterReplyAppliesLabel(t *testing.T) {
 		t.Fatalf("label %s = %q, want %q", testKey, pod.Labels[testKey], testValue)
 	}
 }
-
-// TestCheckAndLabel_SlaveReplyRemovesLabel was removed: obsolete duplicate of
-// TestCheckAndLabel_SlaveReplyRemovesForeignValueLabel above (its canned
-// replica reply repeated the same stubRedis/masterReply fixtures).
 
 func TestStartHealthServer_BindFailureReturnsError(t *testing.T) {
 	_, err := startHealthServer("999999999")

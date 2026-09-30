@@ -19,7 +19,7 @@ import (
 
 var (
 	redisAddr          = flag.String("redis-addr", "localhost:6379", "Redis server address")
-	redisPassword      = flag.String("redis-password", "", "Redis password")
+	redisPassword      = flag.String("redis-password", "", "Redis password (defaults to the REDIS_PASSWORD env var)")
 	redisTLS           = flag.Bool("redis-tls", false, "Enable TLS for Redis connection")
 	redisTLSSkipVerify = flag.Bool("redis-tls-skip-verify", false, "Skip TLS certificate verification for Redis connection")
 	labelKey           = flag.String("label-key", "redis-role", "Kubernetes label key to set")
@@ -38,6 +38,29 @@ var (
 	}
 )
 
+// flagPassed reports whether the named flag was set on the command line, in
+// any supported spelling (--name value, --name=value, -name value).
+func flagPassed(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// applyRedisPasswordEnv resolves the Redis credential: with --redis-password
+// explicitly passed its value wins (empty means "no password on purpose"),
+// otherwise the REDIS_PASSWORD environment variable supplies it. Call it once
+// after flag.Parse.
+func applyRedisPasswordEnv(explicit bool, envValue string) {
+	if explicit {
+		return
+	}
+	*redisPassword = envValue
+}
+
 func main() {
 	flag.Parse()
 
@@ -55,6 +78,14 @@ func main() {
 			*podNamespace = "default"
 		}
 	}
+
+	// Keep the Redis credential out of the container argv: arguments are part
+	// of the pod spec (kubectl describe pod shows them) and land in
+	// /proc/<pid>/cmdline, readable by every container sharing the pod. The
+	// password therefore comes from the REDIS_PASSWORD environment variable
+	// (injected with valueFrom.secretKeyRef); --redis-password stays for
+	// explicit overrides, an empty one meaning "no password on purpose".
+	applyRedisPasswordEnv(flagPassed("redis-password"), os.Getenv("REDIS_PASSWORD"))
 
 	config, err := rest.InClusterConfig()
 	if err != nil {

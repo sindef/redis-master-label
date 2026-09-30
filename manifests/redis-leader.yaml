@@ -21,6 +21,14 @@ spec:
         - containerPort: 6379
         command:
         - redis-server
+        - --requirepass
+        - $(REDIS_PASSWORD)
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
       - name: redis-master-label
         image: redis-master-label:latest
         env:
@@ -32,6 +40,11 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
         command:
         - /app/redis-master-label
         - --redis-addr=localhost:6379
