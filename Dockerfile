@@ -5,7 +5,7 @@
 # seen. TestDockerfileBuilderToolchainMatchesGoMod and CI's "Check builder
 # toolchain matches go.mod" step fail when the two disagree, so bump this tag and
 # go.mod's directive in the same change.
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /build
 
