@@ -1087,6 +1087,158 @@ func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
 	}
 }
 
+// The reviewed infra_drift: the build file's builder stage read
+// `FROM golang:1.27-alpine` while go.mod declared go 1.26.0. CI's gofmt, vet,
+// build and test run on the version setup-go installs from go.mod, so the
+// release image was compiled and published by a compiler no step had audited,
+// and nothing compared the two files: CI's build-file step inspects the COPY and
+// `go build` lines only, Dependabot bumps the golang tag on its own schedule,
+// and a `go` directive bump touches the build file not at all. The builder base
+// image must therefore carry the same Go MAJOR.MINOR as go.mod's directive.
+func TestDockerfileBuilderToolchainMatchesGoMod(t *testing.T) {
+	declared, err := goModGoDirective(goToolchainFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buildFile, err := locateBuildFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tag, err := dockerfileBuilderGoTag(buildFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := builderToolchainProblem(tag, declared); err != nil {
+		t.Fatalf("%s: %v", buildFile, err)
+	}
+}
+
+// The drift and the shapes that must not pass as agreement: the reviewed
+// `golang:1.27-alpine` beside `go 1.26.0` is reported in either direction, a tag
+// on the declared line passes whether it floats or pins a patch, and a tag that
+// names no Go version cannot count as matching.
+func TestBuilderToolchainProblem_RegressionFixtures(t *testing.T) {
+	tests := []struct {
+		name        string
+		imageTag    string
+		goDirective string
+		wantQuiet   bool
+		wantSubstr  string
+	}{
+		{
+			name:        "reviewed drift: 1.27 image beside go 1.26.0",
+			imageTag:    "1.27-alpine",
+			goDirective: "1.26.0",
+			wantSubstr:  "golang:1.27-alpine",
+		},
+		{
+			name:        "go directive ahead of the image",
+			imageTag:    "1.26-alpine",
+			goDirective: "1.27.0",
+			wantSubstr:  "golang:1.26-alpine",
+		},
+		{
+			name:        "floating tag on the declared minor",
+			imageTag:    "1.26-alpine",
+			goDirective: "1.26.0",
+			wantQuiet:   true,
+		},
+		{
+			name:        "pinned patch tag on the declared minor",
+			imageTag:    "1.26.0-alpine3.24",
+			goDirective: "1.26.0",
+			wantQuiet:   true,
+		},
+		{
+			name:        "directive patch newer than the image",
+			imageTag:    "1.26-alpine",
+			goDirective: "1.26.5",
+			wantQuiet:   true,
+		},
+		{
+			name:        "image tag naming no Go version",
+			imageTag:    "latest",
+			goDirective: "1.26.0",
+			wantSubstr:  "golang:latest",
+		},
+		{
+			name:        "go directive naming no version",
+			imageTag:    "1.26-alpine",
+			goDirective: "toolchain",
+			wantSubstr:  goToolchainFile,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := builderToolchainProblem(tt.imageTag, tt.goDirective)
+			if tt.wantQuiet {
+				if err != nil {
+					t.Fatalf("builderToolchainProblem(%q, %q) = %v, want nil", tt.imageTag, tt.goDirective, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("builderToolchainProblem(%q, %q) = nil, want the drift reported", tt.imageTag, tt.goDirective)
+			}
+			if !strings.Contains(err.Error(), tt.wantSubstr) {
+				t.Fatalf("error = %q, want it to name %q", err, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+// The base-image reader must see what the build executes: the first golang stage
+// is the one that compiles the binary, a golang stage named only in a comment is
+// not part of the build, and a file without a golang stage or without any
+// content is an error rather than a silent pass.
+func TestDockerfileBuilderGoTag_RegressionFixtures(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Dockerfile")
+
+	declared := "FROM golang:1.26-alpine AS builder\nRUN go build .\n\nFROM alpine:3.24\n"
+	writeBuildFile(t, path, declared)
+	tag, err := dockerfileBuilderGoTag(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag != "1.26-alpine" {
+		t.Fatalf("tag = %q, want %q", tag, "1.26-alpine")
+	}
+
+	flagged := "FROM --platform=linux/amd64 golang:1.26.0-alpine AS builder\nRUN go build .\n"
+	writeBuildFile(t, path, flagged)
+	if tag, err = dockerfileBuilderGoTag(path); err != nil || tag != "1.26.0-alpine" {
+		t.Fatalf("tag = %q, err = %v, want %q for a flagged FROM line", tag, err, "1.26.0-alpine")
+	}
+
+	// The reviewed shape: a builder stage first, so the first golang stage is the
+	// compiler even when a later stage names another golang tag.
+	twoStages := "FROM golang:1.26-alpine AS builder\nRUN go build .\n\nFROM golang:1.27-alpine AS other\n"
+	writeBuildFile(t, path, twoStages)
+	if tag, err = dockerfileBuilderGoTag(path); err != nil || tag != "1.26-alpine" {
+		t.Fatalf("tag = %q, err = %v, want %q from the first golang stage", tag, err, "1.26-alpine")
+	}
+
+	commentedOut := "# FROM golang:1.27-alpine AS builder\nFROM alpine:3.24\n"
+	writeBuildFile(t, path, commentedOut)
+	if tag, err = dockerfileBuilderGoTag(path); err == nil {
+		t.Fatalf("tag = %q, err = nil, want an error: the only golang stage is commented out", tag)
+	}
+
+	writeBuildFile(t, path, "FROM alpine:3.24\n")
+	if tag, err = dockerfileBuilderGoTag(path); err == nil {
+		t.Fatalf("tag = %q, err = nil, want an error for a build file with no golang stage", tag)
+	}
+
+	if _, err := dockerfileBuilderGoTag(filepath.Join(dir, "missing.Dockerfile")); err == nil {
+		t.Error("missing build file accepted, want a read error")
+	}
+}
+
 func TestVersionDefaultsToDev(t *testing.T) {
 	if version != "dev" {
 		t.Fatalf("version = %q, want the unstamped default \"dev\"", version)

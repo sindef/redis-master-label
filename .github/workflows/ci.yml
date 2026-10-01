@@ -78,6 +78,32 @@ jobs:
           docker run --rm -v "$PWD":/workdir ghcr.io/yannh/kubeconform:v0.6.7 \
             -strict -summary /workdir/manifests
 
+      # The builder stage compiles the binary the published image runs, so its
+      # base image must carry the same Go MAJOR.MINOR as go.mod's `go` directive -
+      # the version setup-go installs above and the one gofmt, vet, build and
+      # test run on. The reviewed drift was `FROM golang:1.27-alpine` beside
+      # `go 1.26.0`: a green pull request tested on 1.26.0 while the release
+      # image was built by 1.27, and nothing compared the two files (Dependabot
+      # bumps the tag on its own schedule). Bumping either one alone fails here.
+      - name: Check builder toolchain matches go.mod
+        run: |
+          build_file=Dockerfile
+          [ -f "$build_file" ] || build_file=Containerfile
+
+          want=$(grep -E '^go [0-9]+\.[0-9]+' go.mod | head -n 1 | cut -d' ' -f2)
+          [ -n "$want" ] || { echo "go.mod declares no go directive" >&2; exit 1; }
+          want_minor=$(printf '%s' "$want" | cut -d. -f1,2)
+
+          line=$(grep -iE '^[[:space:]]*FROM([[:space:]]+--[^[:space:]]+)*[[:space:]]+golang:' "$build_file" | head -n 1)
+          [ -n "$line" ] || { echo "$build_file: no 'FROM golang:<tag>' builder stage found, so the toolchain compiling the binary cannot be read" >&2; exit 1; }
+          tag=$(printf '%s' "$line" | sed -E 's/^.*golang:([^[:space:]]+).*$/\1/')
+          got_minor=$(printf '%s' "$tag" | sed -E 's/^v?([0-9]+\.[0-9]+).*$/\1/')
+          echo "$build_file builds with golang:$tag (go.mod declares go $want)"
+          if [ "$got_minor" != "$want_minor" ]; then
+            echo "$build_file: builder base image golang:$tag compiles the release binary with Go ${got_minor}.x, but go.mod declares go $want: bump the tag and the directive in the same change" >&2
+            exit 1
+          fi
+
       # The image is deployable output: both example manifests run the binary
       # the build file produces, so a broken or stale build file must fail the
       # pull request instead of being found when the image is built by hand.

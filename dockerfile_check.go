@@ -21,6 +21,13 @@ import (
 // builder stage - the license label among it - never reaches the shipped image.
 // The tests in main_test.go use it to keep the advertised license and the
 // LICENSE file the repository actually grants in agreement.
+//
+// The builder base image is read here as well (dockerfileBuilderGoTag,
+// builderToolchainProblem): the binary the image runs is compiled by whatever
+// `FROM golang:<tag>` line the build file names, so that tag has to carry the
+// same Go MAJOR.MINOR as go.mod's `go` directive - the version CI installs and
+// runs gofmt, vet, build and test on. The reviewed drift was
+// `FROM golang:1.27-alpine` beside `go 1.26.0`.
 
 // versionShellDefaultRe matches the shell parameter-expansion default that the
 // go build step uses, for example ${VERSION:-dev}.
@@ -245,6 +252,72 @@ func imageLicenseProblem(labels map[string]string, granted string) error {
 	}
 	if declared != granted {
 		return fmt.Errorf("shipping image declares %s=%q, but %s grants %q", imageLicenseLabel, declared, licenseFile, granted)
+	}
+	return nil
+}
+
+// builderGoImageRe matches a `FROM golang:<tag>` stage declaration, ignoring
+// case and any `--flag` before the image reference, and captures the tag (for
+// example 1.26-alpine). The golang image is the one that compiles the binary,
+// so its tag is the container build's toolchain declaration.
+var builderGoImageRe = regexp.MustCompile(`(?i)^FROM(?:[ \t]+--[^ \t]+)*[ \t]+golang:([^ \t]+)`)
+
+// goVersionMinorRe matches the leading MAJOR.MINOR of a Go version or of a
+// golang image tag. The rest of the string may be a patch version and a base
+// image suffix, so 1.26.0, 1.26.5-alpine and 1.26-alpine all start the 1.26 line.
+var goVersionMinorRe = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)`)
+
+// dockerfileBuilderGoTag returns the tag of the build file's `FROM golang:<tag>`
+// base image: the toolchain that compiles the binary the shipped image runs.
+// Commented-out lines are skipped, because a `# FROM golang:...` never reaches
+// the build, so it cannot decide which compiler runs.
+func dockerfileBuilderGoTag(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if m := builderGoImageRe.FindStringSubmatch(trimmed); m != nil {
+			return m[1], nil
+		}
+	}
+	return "", fmt.Errorf("%s: no FROM golang:<tag> base image found, so the toolchain that compiles the binary cannot be read from the build file", path)
+}
+
+// toolchainMinor returns the MAJOR.MINOR of a Go version or golang image tag:
+// "1.26.0", "1.26.5-alpine" and "1.26-alpine" all give "1.26". The minor is the
+// granularity CI checks for the workflow toolchain and the level at which a base
+// image and a `go` directive can disagree while both look plausible in review.
+func toolchainMinor(version string) (string, error) {
+	m := goVersionMinorRe.FindStringSubmatch(strings.TrimSpace(version))
+	if m == nil {
+		return "", fmt.Errorf("%q does not start with a MAJOR.MINOR version", version)
+	}
+	return m[1] + "." + m[2], nil
+}
+
+// builderToolchainProblem returns why the container build would compile the
+// published binary with a toolchain other than the one go.mod declares - and
+// therefore other than the one CI tests with - or nil when the two agree. Both
+// directions matter: an image newer than the directive publishes a binary from
+// an unaudited compiler, an older one fails inside `go build` (or downloads the
+// declared toolchain, so the pinned base image is not what compiled the code).
+func builderToolchainProblem(imageTag, goDirective string) error {
+	want, err := toolchainMinor(goDirective)
+	if err != nil {
+		return fmt.Errorf("%s declares go %q: %v", goToolchainFile, goDirective, err)
+	}
+	got, err := toolchainMinor(imageTag)
+	if err != nil {
+		return fmt.Errorf("builder base image golang:%s: %v (pin a released golang tag on the %s.x line)", imageTag, err, want)
+	}
+	if got != want {
+		return fmt.Errorf("builder base image golang:%s compiles the release binary with Go %s.x, but %s declares go %s: bump the tag and the directive in the same change", imageTag, got, goToolchainFile, goDirective)
 	}
 	return nil
 }
