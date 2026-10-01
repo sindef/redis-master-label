@@ -107,3 +107,23 @@ jobs:
             echo "image built with --build-arg VERSION=$tag must report '$want', got '$got'" >&2
             exit 1
           fi
+
+      # An image that advertises a license grants nothing on its own, and the
+      # label is discarded when it sits in the builder stage (the release
+      # hygiene defect: the image claimed a license no file granted). So check
+      # both sides: the LICENSE file the repository ships is the real MIT text,
+      # the README links it, and the image built above carries the same license
+      # in its OCI metadata. Reusing ci-check:unstamped proves the claim reaches
+      # the image users pull, not just the build file.
+      - name: Verify image license metadata
+        run: |
+          grep -q "MIT License" LICENSE
+          grep -q "Permission is hereby granted, free of charge" LICENSE
+          grep -qF "[LICENSE](LICENSE)" README.md
+
+          got=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}' ci-check:unstamped)
+          want=MIT
+          if [ "$got" != "$want" ]; then
+            echo "the published image must advertise org.opencontainers.image.licenses=$want, got '$got'" >&2
+            exit 1
+          fi

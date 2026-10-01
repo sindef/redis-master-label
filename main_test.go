@@ -841,6 +841,127 @@ func writeBuildFile(t *testing.T, path, content string) {
 	}
 }
 
+// The repository must grant the license its image advertises. A heading alone
+// is not a grant, so the whole MIT text is required: the title, the permission
+// grant, the warranty disclaimer and a copyright line.
+func TestLicenseFileGrantsMIT(t *testing.T) {
+	data, err := os.ReadFile(licenseFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", licenseFile, err)
+	}
+	text := string(data)
+	for _, want := range []string{"MIT License", mitLicensePermission, "WITHOUT WARRANTY OF ANY KIND", "Copyright (c)"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s is missing %q: it must be the full MIT license text, not a pointer to one", licenseFile, want)
+		}
+	}
+
+	identifier, err := licenseIdentifier(licenseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identifier != "MIT" {
+		t.Errorf("licenseIdentifier(%s) = %q, want \"MIT\"", licenseFile, identifier)
+	}
+}
+
+// The image's OCI metadata is where a user learns the license of the image they
+// pulled, so the label the shipping stage sets must name the license the
+// repository grants. The label must be in the final stage as well: a label in
+// the builder stage is discarded with it, which is how an image advertises a
+// license that no file in the repository backed.
+func TestImageAdvertisesRepositoryLicense(t *testing.T) {
+	granted, err := licenseIdentifier(licenseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := dockerfileFinalStageLabels(dockerfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageLicenseProblem(labels, granted); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The README is where a user looks for licensing, and it must link the file the
+// repository actually ships rather than only naming a license.
+func TestReadmeDocumentsLicense(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{"## License", "[LICENSE](LICENSE)", imageLicenseLabel} {
+		if !strings.Contains(text, want) {
+			t.Errorf("README.md is missing %q", want)
+		}
+	}
+}
+
+// The reviewed failure modes of the license label: a label in a discarded
+// builder stage must not count, a quoted value continued over several lines
+// must be read whole, a value claiming a license the repository does not grant
+// must be reported, and a LICENSE file that is not the MIT grant must be
+// rejected instead of being reported as MIT.
+func TestDockerfileFinalStageLabels_RegressionFixtures(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	builderOnly := write("builder-only.Dockerfile", "FROM golang:1.27-alpine AS builder\nLABEL org.opencontainers.image.licenses=\"MIT\"\nRUN go build .\n\nFROM alpine:3.24\nRUN apk --no-cache add ca-certificates\n")
+	labels, err := dockerfileFinalStageLabels(builderOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != 0 {
+		t.Errorf("labels read from the builder stage = %v, want none: that stage is discarded", labels)
+	}
+	if err := imageLicenseProblem(labels, "MIT"); err == nil {
+		t.Error("imageLicenseProblem accepted an image with no license label, want the missing-label failure")
+	}
+
+	continued := write("continued.Dockerfile", "FROM alpine:3.24\nARG VERSION=dev\nLABEL org.opencontainers.image.title=\"redis-master-label\" \\\n      org.opencontainers.image.licenses=\"MIT\" \\\n      org.opencontainers.image.version=\"${VERSION}\"\nLABEL legacy-license MIT\n")
+	labels, err = dockerfileFinalStageLabels(continued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := labels[imageLicenseLabel]; got != "MIT" {
+		t.Errorf("continuation fixture: %s = %q, want \"MIT\"", imageLicenseLabel, got)
+	}
+	if got := labels["org.opencontainers.image.title"]; got != "redis-master-label" {
+		t.Errorf("continuation fixture: org.opencontainers.image.title = %q, want \"redis-master-label\"", got)
+	}
+	if got := labels["legacy-license"]; got != "MIT" {
+		t.Errorf("legacy `LABEL name value` form = %q, want \"MIT\"", got)
+	}
+	if err := imageLicenseProblem(labels, "MIT"); err != nil {
+		t.Errorf("imageLicenseProblem rejected an image advertising the granted license: %v", err)
+	}
+
+	mismatch := write("mismatch.Dockerfile", "FROM alpine:3.24\nLABEL org.opencontainers.image.licenses=\"Apache-2.0\"\n")
+	labels, err = dockerfileFinalStageLabels(mismatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageLicenseProblem(labels, "MIT"); err == nil {
+		t.Error("imageLicenseProblem accepted an image claiming Apache-2.0 while the repository grants MIT")
+	}
+
+	notMIT := write("LICENSE", "Apache License\nVersion 2.0, January 2004\n")
+	if identifier, err := licenseIdentifier(notMIT); err == nil {
+		t.Errorf("licenseIdentifier(%s) = %q, want an error: the file grants no MIT", notMIT, identifier)
+	}
+	if _, err := licenseIdentifier(filepath.Join(dir, "missing-LICENSE")); err == nil {
+		t.Error("licenseIdentifier with a missing LICENSE file returned no error")
+	}
+}
+
 func TestHealthHandler_HealthyReturns200(t *testing.T) {
 	setHealthStatus(0, true)
 	defer setHealthStatus(0, false)

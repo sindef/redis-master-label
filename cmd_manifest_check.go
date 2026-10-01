@@ -22,7 +22,10 @@ import (
 // The same file holds the readers for the other two things CI cannot see:
 // the sidecar containers' securityContext (main_test.go,
 // TestManifestSidecarsRunUnprivileged) and the USER the build file's final
-// stage selects (dockerfileFinalStageUser, TestDockerfileFinalStageRunsAsNonRootUser).
+// stage selects (dockerfileFinalStageUser, TestDockerfileFinalStageRunsAsNonRootUser,
+// which reuses finalStageStart from dockerfile_check.go). The OCI labels of that
+// same final stage - including the license the image advertises - are read in
+// dockerfile_check.go.
 
 // manifestDir is where the example manifests live relative to the repo root.
 const manifestDir = "manifests"
@@ -203,23 +206,12 @@ func sidecarContainers(dir string) ([]sidecarContainer, error) {
 // The final stage is found by taking the last FROM line, so a USER in an
 // earlier builder stage does not count.
 func dockerfileFinalStageUser(path string) (user string, createsUser bool, err error) {
-	data, err := os.ReadFile(path)
+	lines, start, err := finalStageStart(path)
 	if err != nil {
 		return "", false, err
 	}
 
-	lines := strings.Split(string(data), "\n")
-	finalStage := -1
-	for i, line := range lines {
-		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FROM ") {
-			finalStage = i
-		}
-	}
-	if finalStage < 0 {
-		return "", false, fmt.Errorf("%s: no FROM stage found", path)
-	}
-
-	for _, line := range lines[finalStage+1:] {
+	for _, line := range lines[start:] {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "#") {
 			continue

@@ -17,18 +17,27 @@ COPY *.go ./
 # overrides main.go's `var version = "dev"`, so an unstamped `docker build .`
 # would print an empty version instead of the "dev" this file and the README
 # document. Hence the default below plus the shell fallback in the build step,
-# which also covers an explicit empty `--build-arg VERSION=`. OCI labels record
-# what the image is and where it came from, so `docker inspect` can identify a
-# running image without the registry.
+# which also covers an explicit empty `--build-arg VERSION=`.
+ARG VERSION=dev
+RUN VERSION="${VERSION:-dev}" && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
+
+FROM alpine:3.24
+
+# OCI metadata records what the image is, where it came from and what license it
+# is under, so `docker inspect` and registry listings can identify a pulled
+# image without this repository. It belongs in this stage: a LABEL written in
+# the builder stage is discarded with that stage and never reaches the published
+# image (that is how the image ended up advertising a license nobody could
+# find). VERSION must be re-declared here because a build argument does not
+# cross stages, and the license label must name the same license the LICENSE
+# file in this repository grants: TestImageAdvertisesRepositoryLicense and CI's
+# "Verify image license metadata" step fail when the two drift apart.
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="redis-master-label" \
       org.opencontainers.image.description="Kubernetes sidecar that labels the pod hosting the current Redis master" \
       org.opencontainers.image.source="https://github.com/redis-master-label/redis-master-label" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}"
-RUN VERSION="${VERSION:-dev}" && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
-
-FROM alpine:3.24
 
 # ca-certificates for TLS-enabled Redis connections, plus the dedicated
 # unprivileged account the container runs as. The uid/gid are also pinned in
