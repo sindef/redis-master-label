@@ -422,6 +422,158 @@ func TestResolveRedisPassword(t *testing.T) {
 	}
 }
 
+// The reviewed test_gap: --redis-tls and --redis-tls-skip-verify had no
+// coverage. redisOptionsFromFlags is the sole place the Redis connection
+// options are built, so a table over the four flag combinations pins the
+// documented behaviour (README "Configuration" and "Operational notes"): no
+// TLS config at all while --redis-tls is off, also when --redis-tls-skip-verify
+// is set, and a TLS config whose InsecureSkipVerify follows
+// --redis-tls-skip-verify only when TLS is on.
+func TestRedisOptionsFromFlags_TLS(t *testing.T) {
+	origAddr, origPassword := *redisAddr, *redisPassword
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*redisAddr, *redisPassword = origAddr, origPassword
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*redisAddr = "redis.example.com:6380"
+	*redisPassword = "from-flag"
+
+	tests := []struct {
+		name          string
+		enableTLS     bool
+		skipVerify    bool
+		wantErr       bool
+		wantTLSConfig bool
+		wantInsecure  bool
+	}{
+		{
+			name:          "tls off, skip-verify off: no TLS config",
+			enableTLS:     false,
+			skipVerify:    false,
+			wantTLSConfig: false,
+		},
+		{
+			// Rejected as the invalid combination: the connection stays
+			// plaintext and no options are built at all.
+			name:       "tls off with skip-verify: rejected, no options",
+			enableTLS:  false,
+			skipVerify: true,
+			wantErr:    true,
+		},
+		{
+			name:          "tls on, verify enabled",
+			enableTLS:     true,
+			skipVerify:    false,
+			wantTLSConfig: true,
+			wantInsecure:  false,
+		},
+		{
+			name:          "tls on, skip verify",
+			enableTLS:     true,
+			skipVerify:    true,
+			wantTLSConfig: true,
+			wantInsecure:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*redisTLS = tt.enableTLS
+			*redisTLSSkipVerify = tt.skipVerify
+
+			opts, err := redisOptionsFromFlags()
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("redisOptionsFromFlags accepted --redis-tls-skip-verify without --redis-tls, want an error")
+				}
+				if opts != nil {
+					t.Errorf("options = %+v, want nil for the rejected combination", opts)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("redisOptionsFromFlags: %v", err)
+			}
+
+			if tt.wantTLSConfig {
+				if opts.TLSConfig == nil {
+					t.Fatal("TLSConfig not set, want a TLS config for the Redis connection")
+				}
+				if opts.TLSConfig.InsecureSkipVerify != tt.wantInsecure {
+					t.Fatalf("TLSConfig.InsecureSkipVerify = %v, want %v",
+						opts.TLSConfig.InsecureSkipVerify, tt.wantInsecure)
+				}
+			} else if opts.TLSConfig != nil {
+				t.Fatalf("TLSConfig = %+v, want nil: TLS must stay off unless --redis-tls is set", opts.TLSConfig)
+			}
+
+			if opts.Addr != *redisAddr {
+				t.Errorf("Addr = %q, want %q", opts.Addr, *redisAddr)
+			}
+			if opts.Password != *redisPassword {
+				t.Errorf("Password = %q, want %q", opts.Password, *redisPassword)
+			}
+		})
+	}
+}
+
+// Both TLS flags must be registered with their documented `false` default.
+// A default flipped to true would silently run TLS against plaintext servers
+// in every pod whose manifest args name no TLS flag at all.
+func TestRedisTLSFlagsRegistered(t *testing.T) {
+	for _, flagName := range []string{"redis-tls", "redis-tls-skip-verify"} {
+		f := flag.CommandLine.Lookup(flagName)
+		if f == nil {
+			t.Fatalf("--%s is not registered in flag.CommandLine", flagName)
+		}
+		if f.DefValue != "false" {
+			t.Errorf("--%s default = %q, want \"false\"", flagName, f.DefValue)
+		}
+	}
+}
+
+// --redis-tls-skip-verify only means something with --redis-tls: without TLS
+// the connection is plaintext and the skip-verify request silently does
+// nothing, while the operator believes it is applied. The decision taken here
+// is to reject such a startup with an error instead of a warning.
+func TestValidateRedisTLSFlags(t *testing.T) {
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	tests := []struct {
+		name       string
+		enableTLS  bool
+		skipVerify bool
+		wantErr    bool
+	}{
+		{"both off (defaults)", false, false, false},
+		{"tls on, skip-verify off", true, false, false},
+		{"tls on, skip-verify on", true, true, false},
+		{"skip-verify without tls", false, true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*redisTLS = tt.enableTLS
+			*redisTLSSkipVerify = tt.skipVerify
+
+			err := validateRedisTLSFlags()
+
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("validateRedisTLSFlags() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "--redis-tls") {
+				t.Errorf("error %q does not name --redis-tls", err)
+			}
+		})
+	}
+}
+
 // The released image: both example sidecars must run exactly this reference.
 const releaseImage = "ghcr.io/redis-master-label/redis-master-label:v0.1.0"
 

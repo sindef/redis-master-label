@@ -23,8 +23,8 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 Flags (all have sensible defaults):
 - `--redis-addr` (default `localhost:6379`)
 - `--redis-password` (default empty; falls back to the `REDIS_PASSWORD` env var when not set)
-- `--redis-tls` (default `false`)
-- `--redis-tls-skip-verify` (default `false`)
+- `--redis-tls` (default `false`; attaches a TLS config to the Redis connection)
+- `--redis-tls-skip-verify` (default `false`; sets `InsecureSkipVerify` on that TLS config, so only meaningful together with `--redis-tls`. Passing it without `--redis-tls` is an invalid combination, rejected at startup: without TLS the connection is plaintext and the request to skip verification would silently do nothing)
 - `--label-key` (default `redis-role`)
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
@@ -219,7 +219,7 @@ curl http://localhost:8080/healthz
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
-- If using TLS, set `--redis-tls` and `--redis-tls-skip-verify` if required.
+- If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
 - The health check endpoint can be used by Kubernetes liveness/readiness probes.
 
 ## License
