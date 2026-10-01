@@ -47,6 +47,12 @@ The Go toolchain version has a single source: the `go` directive at the top of
 `go.mod`. CI installs exactly that toolchain (`go-version-file: go.mod`) and the
 job prints `go version` next to the declared version, so the compiler running
 `gofmt`, `go vet`, `go build` and `go test` is the one the module file names.
+The container build is held to the same version: the build file's builder stage
+must be a `golang` base image on the same MAJOR.MINOR line
+(`FROM golang:1.26-alpine` for `go 1.26.0`), which
+`TestDockerfileBuilderToolchainMatchesGoMod` and CI's "Check builder toolchain
+matches go.mod" step enforce. Bump the `go` directive and that image tag in the
+same change.
 
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
@@ -63,6 +69,12 @@ docker build --build-arg VERSION=v0.1.0 -t redis-master-label:v0.1.0 .
 `dev` (with a shell fallback for an empty value), so a plain `docker build .`
 still succeeds and reports `redis-master-label dev`; a `vX.Y.Z` tag passed
 through `--build-arg` is reported exactly.
+
+The builder stage's `FROM golang:<tag>` line is the toolchain that compiles the
+published binary, so it must stay on the `go.mod` minor: CI's "Check builder
+toolchain matches go.mod" step fails the pull request when the tag and the `go`
+directive name different versions, and a Dependabot base-image bump therefore
+has to move `go.mod` (or be closed) rather than land alone.
 
 The five OCI labels (title, description, source, licenses and version) are
 declared in the shipping stage of the build file, so they land on the image that
