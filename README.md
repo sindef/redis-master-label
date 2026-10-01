@@ -76,8 +76,11 @@ Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
 the tag-push workflow runs `go vet` and the full test suite, then builds the
 image with `--build-arg VERSION=<tag>` and pushes exactly
 `ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
-name, `GITHUB_TOKEN` with `packages: write`). The image carries provenance and
-SBOM attestations, and the workflow's step summary reports the pushed digest.
+name, `GITHUB_TOKEN` with `packages: write`, plus the `id-token: write` and
+`attestations: write` permissions attestations need). The image carries provenance
+and SBOM attestations, and the workflow's step summary reports the pushed digest
+plus the `docker buildx imagetools inspect` output for it, so the attestation
+manifests are visible on every release run.
 Nothing floating (`:latest`) is ever published.
 
 ### Release checklist
