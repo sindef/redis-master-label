@@ -1162,3 +1162,25 @@ func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
 		t.Error("isHealthy stays false after one successful ROLE, want true")
 	}
 }
+
+// Non-positive --check-interval values must be rejected at startup:
+// time.Sleep returns immediately for them, so the poll loop busy-spins,
+// hammering the Redis server and the Kubernetes API server.
+func TestValidateCheckInterval(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	for _, interval := range []time.Duration{0, -5 * time.Second, -time.Nanosecond} {
+		*checkInterval = interval
+		if err := validateCheckInterval(); err == nil {
+			t.Errorf("--check-interval=%v accepted, want an error", interval)
+		} else if !strings.Contains(err.Error(), "--check-interval") {
+			t.Errorf("error %q does not name --check-interval", err)
+		}
+	}
+
+	*checkInterval = 10 * time.Second
+	if err := validateCheckInterval(); err != nil {
+		t.Errorf("positive --check-interval rejected: %v", err)
+	}
+}
