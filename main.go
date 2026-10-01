@@ -84,15 +84,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	redisOptions := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
-	}
-
-	if *redisTLS {
-		redisOptions.TLSConfig = &tls.Config{
-			InsecureSkipVerify: *redisTLSSkipVerify,
-		}
+	redisOptions, err := redisOptionsFromFlags()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
 	rdb := redis.NewClient(redisOptions)
@@ -142,6 +137,40 @@ func main() {
 func validateCheckInterval() error {
 	if *checkInterval <= 0 {
 		return fmt.Errorf("--check-interval must be positive, got %v", *checkInterval)
+	}
+	return nil
+}
+
+// redisOptionsFromFlags builds the Redis client options from the command-line
+// flags and the REDIS_PASSWORD environment variable. It is the single place a
+// Redis tls.Config is constructed: TLSConfig is set only when --redis-tls is
+// given, carrying InsecureSkipVerify from --redis-tls-skip-verify, and stays
+// nil otherwise so the connection is plaintext as before.
+func redisOptionsFromFlags() (*redis.Options, error) {
+	if err := validateRedisTLSFlags(); err != nil {
+		return nil, err
+	}
+
+	options := &redis.Options{
+		Addr:     *redisAddr,
+		Password: resolveRedisPassword(),
+	}
+
+	if *redisTLS {
+		options.TLSConfig = &tls.Config{
+			InsecureSkipVerify: *redisTLSSkipVerify,
+		}
+	}
+	return options, nil
+}
+
+// validateRedisTLSFlags rejects --redis-tls-skip-verify without --redis-tls.
+// Fail-fast beats warn-and-continue: on a plaintext connection the flag would
+// otherwise silently do nothing while the operator believes an TLS setting is
+// in force. Same style as validateCheckInterval.
+func validateRedisTLSFlags() error {
+	if *redisTLSSkipVerify && !*redisTLS {
+		return fmt.Errorf("--redis-tls-skip-verify requires --redis-tls")
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1568,5 +1570,134 @@ func TestValidateCheckInterval(t *testing.T) {
 	*checkInterval = 10 * time.Second
 	if err := validateCheckInterval(); err != nil {
 		t.Errorf("positive --check-interval rejected: %v", err)
+	}
+}
+
+// redisOptionsFromFlags is the single place a Redis tls.Config is built, so all
+// four flag combinations have defined behaviour: with --redis-tls off the
+// connection stays plaintext (nil TLSConfig), with both TLS flags set the
+// verification decision is carried through verbatim, and skip-verify without
+// --redis-tls is rejected at startup instead of silently doing nothing.
+func TestRedisOptionsFromFlags_TLS(t *testing.T) {
+	origAddr, origPassword := *redisAddr, *redisPassword
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*redisAddr, *redisPassword = origAddr, origPassword
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*redisAddr = "redis:6379"
+	*redisPassword = "secret"
+
+	tests := []struct {
+		name        string
+		redisTLS    bool
+		skipVerify  bool
+		wantErr     string
+		wantTLS     bool
+		wantOptions *redis.Options
+	}{
+		{
+			name:        "tls off keeps the connection plaintext",
+			redisTLS:    false,
+			skipVerify:  false,
+			wantOptions: &redis.Options{Addr: "redis:6379", Password: "secret"},
+		},
+		{
+			name:       "skip-verify without tls is rejected",
+			skipVerify: true,
+			wantErr:    "--redis-tls-skip-verify requires --redis-tls",
+		},
+		{
+			name:       "tls on verifies the certificate",
+			redisTLS:   true,
+			skipVerify: false,
+			wantOptions: &redis.Options{
+				Addr:     "redis:6379",
+				Password: "secret",
+				TLSConfig: &tls.Config{
+					InsecureSkipVerify: false,
+				},
+			},
+		},
+		{
+			name:       "tls on with skip-verify disables verification",
+			redisTLS:   true,
+			skipVerify: true,
+			wantOptions: &redis.Options{
+				Addr:     "redis:6379",
+				Password: "secret",
+				TLSConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*redisTLS = tt.redisTLS
+			*redisTLSSkipVerify = tt.skipVerify
+
+			options, err := redisOptionsFromFlags()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("redisOptionsFromFlags accepted the flag combination, want %q", tt.wantErr)
+				}
+				if err.Error() != tt.wantErr {
+					t.Fatalf("error = %q, want %q", err.Error(), tt.wantErr)
+				}
+				if options != nil {
+					t.Fatalf("options = %+v, want nil on error", options)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("redisOptionsFromFlags: %v", err)
+			}
+			if !reflect.DeepEqual(options, tt.wantOptions) {
+				t.Fatalf("options = %+v, want %+v", options, tt.wantOptions)
+			}
+		})
+	}
+}
+
+// The TLS flags must keep their defaults: a silent TLS-by-default flip in the
+// binary would make every manifest without a --redis-tls flag start failing to
+// reach Redis, and --redis-tls-skip-verify must default to verifying.
+func TestRedisTLSFlagsRegistered(t *testing.T) {
+	for _, name := range []string{"redis-tls", "redis-tls-skip-verify"} {
+		f := flag.CommandLine.Lookup(name)
+		if f == nil {
+			t.Fatalf("--%s is not registered in flag.CommandLine", name)
+		}
+		if f.DefValue != "false" {
+			t.Fatalf("--%s default = %q, want \"false\"", name, f.DefValue)
+		}
+	}
+}
+
+func TestValidateRedisTLSFlags(t *testing.T) {
+	tests := []struct {
+		name       string
+		redisTLS   bool
+		skipVerify bool
+		wantErr    bool
+	}{
+		{"tls off, skip-verify off", false, false, false},
+		{"tls off, skip-verify on", false, true, true},
+		{"tls on, skip-verify off", true, false, false},
+		{"tls on, skip-verify on", true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*redisTLS = tt.redisTLS
+			*redisTLSSkipVerify = tt.skipVerify
+
+			err := validateRedisTLSFlags()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateRedisTLSFlags(tls=%v, skipVerify=%v) error = %v, wantErr %v", tt.redisTLS, tt.skipVerify, err, tt.wantErr)
+			}
+		})
 	}
 }

@@ -38,6 +38,14 @@ Environment defaults:
 - `POD_NAMESPACE` used when `--pod-namespace` not provided.
 - `REDIS_PASSWORD` used when `--redis-password` not provided. This is the preferred way to supply the Redis credential: an explicit `--redis-password` argument ends up in the container's argv, which Kubernetes records in the pod spec (visible to anyone with pod read access and echoed by `kubectl describe pod`) and in `/proc/<pid>/cmdline` inside the pod, readable by every container sharing the pod.
 
+TLS: the Redis connection's `tls.Config` is built in one place from the flags
+(`redisOptionsFromFlags`). `--redis-tls` switches the connection to TLS;
+without it the connection stays plaintext whatever else is passed.
+`--redis-tls-skip-verify` only means something together with `--redis-tls`:
+when it is set while `--redis-tls` is not, the binary exits at startup with
+`--redis-tls-skip-verify requires --redis-tls` instead of silently running the
+flag as a no-op while the operator believes an TLS setting is in force.
+
 ## Building locally
 ```bash
 go build -o redis-master-label .
@@ -231,7 +239,7 @@ curl http://localhost:8080/healthz
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
-- If using TLS, set `--redis-tls` and `--redis-tls-skip-verify` if required.
+- If using TLS, set `--redis-tls`; the TLS connection then carries `InsecureSkipVerify` from `--redis-tls-skip-verify`. `--redis-tls-skip-verify` alone makes startup fail (`--redis-tls-skip-verify requires --redis-tls`) instead of silently doing nothing.
 - The health check endpoint can be used by Kubernetes liveness/readiness probes.
 
 ## License
