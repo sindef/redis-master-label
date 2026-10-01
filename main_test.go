@@ -838,6 +838,137 @@ func TestDockerfileFinalStageLabels_RejectsBuilderStageLabels(t *testing.T) {
 	}
 }
 
+// The published image must carry the full OCI metadata, and it must carry it in
+// the final stage: a LABEL block left in the builder stage reads exactly the
+// same in the build file yet is discarded with that stage, so the image users
+// pull has no title, source, license or version. Build args do not cross stage
+// boundaries either, so the final stage must declare ARG VERSION itself or its
+// version label expands to nothing.
+func TestDockerfileFinalStageCarriesOCILabels(t *testing.T) {
+	buildFile, err := locateBuildFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := dockerfileFinalStageLabels(buildFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociLabelsProblem(labels); err != nil {
+		t.Errorf("%s: %v", buildFile, err)
+	}
+	if err := ociVersionLabelProblem(labels); err != nil {
+		t.Errorf("%s: %v", buildFile, err)
+	}
+
+	declared, err := dockerfileFinalStageDeclaresArg(buildFile, "VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !declared {
+		t.Errorf("%s: the final stage declares no ARG VERSION, so its ${VERSION} resolves to nothing", buildFile)
+	}
+}
+
+// The failure modes at build-file level: labels in a discarded builder stage, a
+// final stage missing part of the metadata, a hard-coded version label, and an
+// ARG VERSION that was left behind in the builder stage.
+func TestDockerfileFinalStageCarriesOCILabels_RegressionFixtures(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Dockerfile")
+
+	builderStageLabels := "FROM golang:1.27-alpine AS builder\n" +
+		"LABEL org.opencontainers.image.title=\"redis-master-label\" \\\n" +
+		"      org.opencontainers.image.version=\"${VERSION}\"\n" +
+		"RUN go build .\n\n" +
+		"FROM alpine:3.24\nARG VERSION=dev\nUSER 10001:10001\n"
+	writeBuildFile(t, path, builderStageLabels)
+	labels, err := dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociLabelsProblem(labels); err == nil {
+		t.Error("labels in the discarded builder stage passed as the shipping image's metadata")
+	}
+
+	finalStageMissing := "FROM golang:1.27-alpine AS builder\nRUN go build .\n\n" +
+		"FROM alpine:3.24\nARG VERSION=dev\n" +
+		"LABEL org.opencontainers.image.title=\"redis-master-label\" \\\n" +
+		"      org.opencontainers.image.version=\"${VERSION}\"\n"
+	writeBuildFile(t, path, finalStageMissing)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ociLabelsProblem(labels)
+	if err == nil {
+		t.Fatal("a final stage without description, source and licenses was accepted")
+	}
+	for _, missing := range []string{"org.opencontainers.image.description", "org.opencontainers.image.source", "org.opencontainers.image.licenses"} {
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("error %q does not name the missing %s label", err, missing)
+		}
+	}
+	if err := ociVersionLabelProblem(labels); err != nil {
+		t.Errorf("version label of the final stage rejected: %v", err)
+	}
+
+	complete := "FROM golang:1.27-alpine AS builder\nARG VERSION=dev\nRUN go build .\n\n" +
+		"FROM alpine:3.24\nARG VERSION=dev\n" +
+		"LABEL org.opencontainers.image.title=\"redis-master-label\" \\\n" +
+		"      org.opencontainers.image.description=\"labels the pod hosting the Redis master\" \\\n" +
+		"      org.opencontainers.image.source=https://example.com/repo \\\n" +
+		"      org.opencontainers.image.licenses=\"MIT\" \\\n" +
+		"      org.opencontainers.image.version=\"${VERSION}\"\n" +
+		"USER 10001:10001\n"
+	writeBuildFile(t, path, complete)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociLabelsProblem(labels); err != nil {
+		t.Fatalf("complete final-stage label block rejected: %v", err)
+	}
+	if err := ociVersionLabelProblem(labels); err != nil {
+		t.Fatalf("version label stamped from ${VERSION} rejected: %v", err)
+	}
+	declared, err := dockerfileFinalStageDeclaresArg(path, "VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !declared {
+		t.Error("ARG VERSION declared in the final stage was not seen")
+	}
+
+	literalVersion := strings.Replace(complete, `org.opencontainers.image.version="${VERSION}"`, `org.opencontainers.image.version="v0.1.0"`, 1)
+	writeBuildFile(t, path, literalVersion)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociVersionLabelProblem(labels); err == nil {
+		t.Error("a hard-coded version label was accepted; it goes stale at the next release")
+	}
+
+	argInBuilderOnly := strings.Replace(complete, "FROM alpine:3.24\nARG VERSION=dev\n", "FROM alpine:3.24\n", 1)
+	writeBuildFile(t, path, argInBuilderOnly)
+	declared, err = dockerfileFinalStageDeclaresArg(path, "VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if declared {
+		t.Error("ARG VERSION declared only in the builder stage counted for the final stage: its version label would expand to nothing")
+	}
+
+	if _, err := dockerfileFinalStageDeclaresArg(filepath.Join(dir, "missing.Dockerfile"), "VERSION"); err == nil {
+		t.Error("missing build file accepted, want a read error")
+	}
+	noFrom := filepath.Join(dir, "no-from.Dockerfile")
+	writeBuildFile(t, noFrom, "RUN true\n")
+	if _, err := dockerfileFinalStageDeclaresArg(noFrom, "VERSION"); err == nil {
+		t.Error("build file without FROM accepted, want an error")
+	}
+}
+
 // The README must state the license too, so the grant is discoverable without
 // digging into image metadata.
 func TestREADMEStatesLicense(t *testing.T) {
@@ -1182,5 +1313,86 @@ func TestValidateCheckInterval(t *testing.T) {
 	*checkInterval = 10 * time.Second
 	if err := validateCheckInterval(); err != nil {
 		t.Errorf("positive --check-interval rejected: %v", err)
+	}
+}
+
+// The reviewed ci_gap defect: a workflow set both `go-version: "1.23"` and
+// `go-version-file: go.mod`. actions/setup-go honours one version source, warns
+// that the file is ignored and installs the pin, so the job's toolchain drifts
+// from go.mod's go directive - and under GOTOOLCHAIN=auto the build then
+// downloads the toolchain go.mod asks for, so the pinned version is not the one
+// compiling the code. The guard must report every shape of that conflict,
+// including a setup-go step with no version source at all, while leaving a
+// commented-out pin alone.
+func TestWorkflowGoToolchainProblem_RegressionFixtures(t *testing.T) {
+	valid := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n"
+	bothInputs := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version: \"1.23\"\n          go-version-file: go.mod\n"
+	pinnedOnly := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version: \"1.23\"\n"
+	foreignVersionFile := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: .go-version\n"
+	noVersionSource := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          cache: true\n"
+	namedStep := "jobs:\n  go:\n    steps:\n      - name: Set up Go\n        uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n"
+	commentedPin := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          # go-version: \"1.23\"\n          go-version-file: go.mod\n"
+	commentedSource := "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          # go-version-file: go.mod\n          cache: true\n"
+
+	for _, tt := range []struct {
+		name    string
+		text    string
+		wantErr bool
+	}{
+		{"single source in go.mod", valid, false},
+		{"both inputs (pre-fix shape)", bothInputs, true},
+		{"go-version alone", pinnedOnly, true},
+		{"foreign go-version-file", foreignVersionFile, true},
+		{"no version source", noVersionSource, true},
+		{"named setup-go step", namedStep, false},
+		{"commented-out pin", commentedPin, false},
+		{"commented-out source is not a source", commentedSource, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := workflowGoToolchainProblem(tt.text)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("workflowGoToolchainProblem() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Every workflow must take its Go toolchain from go.mod alone, and ci.yml must
+// prove the installed toolchain is the one go.mod asks for: the explicit pin it
+// used to carry could drift from the go directive because setup-go ignores one
+// of two version sources, and `go version` alone cannot show the drift while
+// GOTOOLCHAIN=auto downloads the version go.mod declares.
+func TestWorkflowsTakeGoToolchainFromGoMod(t *testing.T) {
+	directive, err := goModGoDirective(goModFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := regexp.MatchString(`^[0-9]+\.[0-9]+$`, directive); err != nil || !ok {
+		t.Fatalf("go.mod's go directive = %q, want MAJOR.MINOR", directive)
+	}
+
+	workflows, err := filepath.Glob(filepath.Join(workflowDir, "*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workflows) == 0 {
+		t.Fatalf("no workflow found in %s: the toolchain check ran against nothing", workflowDir)
+	}
+	for _, workflow := range workflows {
+		data, err := os.ReadFile(workflow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := workflowGoToolchainProblem(string(data)); err != nil {
+			t.Errorf("%s: %v", workflow, err)
+		}
+	}
+
+	ci, err := os.ReadFile(filepath.Join(workflowDir, "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ci), "GOTOOLCHAIN=local go version") {
+		t.Error("ci.yml has no step inspecting the toolchain the job installed (GOTOOLCHAIN=local go version), so a toolchain that drifts from go.mod's go directive would pass CI")
 	}
 }

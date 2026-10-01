@@ -15,10 +15,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # One version source only: actions/setup-go warns and ignores
+      # go-version-file when a go-version pin is also set, so a pin here would
+      # silently decide the job's toolchain and drift from go.mod (which the
+      # module's own `go` directive, and the release workflow, follow).
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
           go-version-file: go.mod
+
+      # actions/setup-go installs what go-version-file asks for, but that is
+      # only observable if the toolchain is not silently replaced at build time:
+      # under GOTOOLCHAIN=auto `go` downloads another toolchain when the
+      # installed one is older than go.mod's `go` directive. GOTOOLCHAIN=local
+      # inspects the toolchain this job installed, and the MAJOR.MINOR from
+      # go.mod's directive must match it.
+      - name: Check Go toolchain
+        run: |
+          want=
+          while read -r directive version rest; do
+            if [ "$directive" = "go" ]; then
+              want="${version%.*}"
+              break
+            fi
+          done < go.mod
+          if [ -z "$want" ]; then
+            echo "go.mod declares no go directive" >&2
+            exit 1
+          fi
+
+          # GOTOOLCHAIN=local inspects the toolchain this job installed rather
+          # than letting GOTOOLCHAIN=auto download the version go.mod asks for.
+          installed=$(GOTOOLCHAIN=local go version)
+          got=$(GOTOOLCHAIN=local go env GOVERSION)
+          got="${got#go}"
+          got="${got%.*}"
+          echo "go.mod: go $want; installed toolchain: $installed"
+          if [ "$got" != "$want" ]; then
+            echo "toolchain mismatch: go.mod's go directive is $want, but the job installed go$got" >&2
+            exit 1
+          fi
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
@@ -108,6 +143,34 @@ jobs:
             exit 1
           fi
 
+      # The image metadata must survive into the image users pull. A LABEL block
+      # in the builder stage reads the same in the build file yet is discarded
+      # with that stage, and build args do not cross stage boundaries either, so
+      # a version label whose VERSION argument was left in the builder stage
+      # ships an image nobody can identify. Inspect the labels of an image built
+      # with a known VERSION: every expected label must be present and
+      # non-empty, and the version must be the build arg.
+      - name: Verify image OCI labels
+        run: |
+          build_file=Dockerfile
+          [ -f "$build_file" ] || build_file=Containerfile
+
+          tag=v3.2.1
+          docker build --build-arg VERSION="$tag" -t ci-check:labels -f "$build_file" .
+          labels=$(docker inspect --format '{{json .Config.Labels}}' ci-check:labels)
+          for key in title description source licenses version; do
+            if ! printf '%s' "$labels" | grep -q "\"org.opencontainers.image.$key\":\"[^\"]"; then
+              echo "shipping image declares no non-empty org.opencontainers.image.$key label (is the LABEL in the final stage?): $labels" >&2
+              exit 1
+            fi
+          done
+
+          got=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' ci-check:labels)
+          if [ "$got" != "$tag" ]; then
+            echo "org.opencontainers.image.version = '$got', want '$tag': --build-arg VERSION must reach the label, which needs ARG VERSION in the final stage" >&2
+            exit 1
+          fi
+
       # The published image must grant the license it advertises: the label
       # value comes from the served image rather than a grep of the build file,
       # because a LABEL in the discarded builder stage parses the same in the
@@ -119,7 +182,7 @@ jobs:
           grep -q 'Permission is hereby granted, free of charge' LICENSE || { echo "LICENSE does not contain the MIT permission text" >&2; exit 1; }
           grep -q 'LICENSE' README.md || { echo "README does not point at the LICENSE file" >&2; exit 1; }
 
-          # ci-check:unstamped is the image built by the previous step.
+          # ci-check:unstamped is the image built by "Verify image version output".
           got=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' ci-check:unstamped)
           want=MIT
           if [ "$got" != "$want" ]; then

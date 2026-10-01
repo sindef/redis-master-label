@@ -168,6 +168,74 @@ func dockerfileFinalStageLabels(path string) (map[string]string, error) {
 	return labels, nil
 }
 
+// ociLabelKeys are the OCI image metadata labels the published image must
+// carry. They belong to the build file's final stage: a LABEL written in a
+// discarded builder stage parses exactly the same in the file yet reaches no
+// image, which is how a shipped image can end up with no title, source, license
+// or version for anyone pulling it.
+var ociLabelKeys = []string{
+	"org.opencontainers.image.title",
+	"org.opencontainers.image.description",
+	"org.opencontainers.image.source",
+	"org.opencontainers.image.licenses",
+	"org.opencontainers.image.version",
+}
+
+// ociLabelsProblem returns why the shipping image's OCI metadata is incomplete,
+// or nil when every expected label carries a non-empty value.
+func ociLabelsProblem(labels map[string]string) error {
+	var missing []string
+	for _, key := range ociLabelKeys {
+		if strings.TrimSpace(labels[key]) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("shipping image declares no non-empty %s (a label in a discarded builder stage never reaches the image)", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// ociVersionLabelProblem returns why the version label would not report the
+// release tag, or nil when it is stamped from the VERSION build arg. A literal
+// tag in the label would go stale at the next release, and a VERSION that does
+// not reach the label ships an image nobody can identify.
+func ociVersionLabelProblem(labels map[string]string) error {
+	const key = "org.opencontainers.image.version"
+	if got := labels[key]; got != "${VERSION}" {
+		return fmt.Errorf("%s = %q, want ${VERSION} so --build-arg VERSION=<tag> stamps the label", key, got)
+	}
+	return nil
+}
+
+// dockerfileFinalStageDeclaresArg reports whether the build file's final stage
+// declares the named ARG. Build args do not cross stage boundaries, so an ARG
+// left in the builder stage leaves the final stage's ${VERSION} empty and the
+// version label blank.
+func dockerfileFinalStageDeclaresArg(path, name string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	start := finalStageStart(lines)
+	if start < 0 {
+		return false, fmt.Errorf("%s: no FROM stage found", path)
+	}
+
+	for _, raw := range lines[start+1:] {
+		fields := strings.Fields(raw)
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "ARG") {
+			continue
+		}
+		if fields[1] == name || strings.HasPrefix(fields[1], name+"=") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // imageLicenseProblem returns why the shipping image's declared license does not
 // match the license the repository grants, or nil when the two agree.
 func imageLicenseProblem(labels map[string]string, granted string) error {

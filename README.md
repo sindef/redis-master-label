@@ -45,6 +45,16 @@ go build -o redis-master-label .
 
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
+## Go toolchain
+The Go toolchain is declared once, by go.mod's `go` directive. Both workflows
+install it with `go-version-file: go.mod`; adding a `go-version:` pin beside it
+would backfire, because `actions/setup-go` honours one version source, warns that
+the file is ignored, and installs the pin — so the job's toolchain drifts from
+go.mod while `GOTOOLCHAIN=auto` downloads the version go.mod asks for anyway. CI's
+"Check Go toolchain" step reads the directive from go.mod, prints the toolchain
+the job installed (inspected with `GOTOOLCHAIN=local`, so a downloaded toolchain
+cannot hide a mismatch) and fails when the two MAJOR.MINOR versions differ.
+
 ## Container build
 ```bash
 # Build image using the provided Dockerfile
@@ -58,6 +68,13 @@ docker build --build-arg VERSION=v0.1.0 -t redis-master-label:v0.1.0 .
 `dev` (with a shell fallback for an empty value), so a plain `docker build .`
 still succeeds and reports `redis-master-label dev`; a `vX.Y.Z` tag passed
 through `--build-arg` is reported exactly.
+
+The five OCI labels (title, description, source, licenses and version) are
+declared in the shipping stage of the build file, so they land on the image that
+is pulled rather than being discarded with the builder stage. Verify them with
+`docker inspect --format '{{json .Config.Labels}}' redis-master-label:v0.1.0`;
+CI fails the pull request when one of them is missing, empty, or when the
+version label disagrees with `--build-arg VERSION`.
 
 ## Releases
 Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
