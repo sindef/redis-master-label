@@ -15,6 +15,12 @@ import (
 // overrides main.go's `var version = "dev"` with an empty string. Reading the
 // build file here makes that regression fail offline; CI's "Verify image
 // version output" step runs the real image and asserts the same output.
+//
+// The same reader also reports the LABELs of the build file's final stage
+// (dockerfileFinalStageLabels), because image metadata written in a discarded
+// builder stage - the license label among it - never reaches the shipped image.
+// The tests in main_test.go use it to keep the advertised license and the
+// LICENSE file the repository actually grants in agreement.
 
 // versionShellDefaultRe matches the shell parameter-expansion default that the
 // go build step uses, for example ${VERSION:-dev}.
@@ -84,4 +90,93 @@ func locateBuildFile() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no build file found (looked for Dockerfile, Containerfile)")
+}
+
+// licenseFile is the repo-root file granting the project's license. It is the
+// grant behind the image's org.opencontainers.image.licenses label: without it
+// the label claims a license the project never gives.
+const licenseFile = "LICENSE"
+
+// imageLicenseLabel is the OCI label (image annotation) that declares which
+// license the shipped image is under. Its value must name the license the
+// repository grants in licenseFile.
+const imageLicenseLabel = "org.opencontainers.image.licenses"
+
+// labelTokenRe matches one key="value", key='value' or key=value token of a
+// LABEL instruction.
+var labelTokenRe = regexp.MustCompile(`([A-Za-z0-9._-]+)=("[^"]*"|'[^']*'|\S+)`)
+
+// finalStageStart returns the index of the last FROM line in a build file, that
+// is the start of the stage whose filesystem becomes the shipping image, or -1
+// when the file declares no stage at all.
+func finalStageStart(lines []string) int {
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FROM ") {
+			start = i
+		}
+	}
+	return start
+}
+
+// dockerfileFinalStageLabels returns the LABEL key/value pairs declared by the
+// build file's final stage, keyed by lowercased label name. Only the last FROM
+// stage counts: a LABEL in an earlier (builder) stage is discarded with that
+// stage, so `docker inspect` on the pulled image shows neither the label nor
+// anything it claims - which is exactly how an image can advertise a license
+// nobody sees.
+func dockerfileFinalStageLabels(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	start := finalStageStart(lines)
+	if start < 0 {
+		return nil, fmt.Errorf("%s: no FROM stage found", path)
+	}
+
+	labels := make(map[string]string)
+	pending := ""
+	flush := func() {
+		for _, token := range labelTokenRe.FindAllStringSubmatch(pending, -1) {
+			labels[strings.ToLower(token[1])] = strings.Trim(token[2], `"'`)
+		}
+		pending = ""
+	}
+	for _, line := range lines[start+1:] {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if pending == "" && !strings.HasPrefix(strings.ToUpper(trimmed), "LABEL ") {
+			continue
+		}
+		// LABEL values may be split over several lines with a trailing
+		// backslash; join them before reading the key=value tokens.
+		continues := strings.HasSuffix(trimmed, "\\")
+		if continues {
+			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "\\"))
+		}
+		pending = strings.TrimSpace(pending + " " + trimmed)
+		if !continues {
+			flush()
+		}
+	}
+	flush()
+	return labels, nil
+}
+
+// imageLicenseProblem returns why the shipping image's declared license does not
+// match the license the repository grants, or nil when the two agree.
+func imageLicenseProblem(labels map[string]string, granted string) error {
+	declared, ok := labels[imageLicenseLabel]
+	if !ok {
+		return fmt.Errorf("shipping image declares no %s label, want %q", imageLicenseLabel, granted)
+	}
+	if declared != granted {
+		return fmt.Errorf("shipping image declares %s=%q, but %s grants %q", imageLicenseLabel, declared, licenseFile, granted)
+	}
+	return nil
 }

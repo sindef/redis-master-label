@@ -107,3 +107,22 @@ jobs:
             echo "image built with --build-arg VERSION=$tag must report '$want', got '$got'" >&2
             exit 1
           fi
+
+      # The published image must grant the license it advertises: the label
+      # value comes from the served image rather than a grep of the build file,
+      # because a LABEL in the discarded builder stage parses the same in the
+      # file yet never reaches the image (the reviewed defect: the label claimed
+      # MIT while the repository shipped no LICENSE file at all).
+      - name: Verify image license metadata
+        run: |
+          test -f LICENSE || { echo "LICENSE missing: the image advertises a license the repository does not grant" >&2; exit 1; }
+          grep -q 'Permission is hereby granted, free of charge' LICENSE || { echo "LICENSE does not contain the MIT permission text" >&2; exit 1; }
+          grep -q 'LICENSE' README.md || { echo "README does not point at the LICENSE file" >&2; exit 1; }
+
+          # ci-check:unstamped is the image built by the previous step.
+          got=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' ci-check:unstamped)
+          want=MIT
+          if [ "$got" != "$want" ]; then
+            echo "org.opencontainers.image.licenses = '$got' on the shipping image, want '$want' (is the LABEL in the final stage?)" >&2
+            exit 1
+          fi

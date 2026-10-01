@@ -209,12 +209,7 @@ func dockerfileFinalStageUser(path string) (user string, createsUser bool, err e
 	}
 
 	lines := strings.Split(string(data), "\n")
-	finalStage := -1
-	for i, line := range lines {
-		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FROM ") {
-			finalStage = i
-		}
-	}
+	finalStage := finalStageStart(lines)
 	if finalStage < 0 {
 		return "", false, fmt.Errorf("%s: no FROM stage found", path)
 	}

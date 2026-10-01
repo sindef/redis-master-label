@@ -17,18 +17,25 @@ COPY *.go ./
 # overrides main.go's `var version = "dev"`, so an unstamped `docker build .`
 # would print an empty version instead of the "dev" this file and the README
 # document. Hence the default below plus the shell fallback in the build step,
-# which also covers an explicit empty `--build-arg VERSION=`. OCI labels record
-# what the image is and where it came from, so `docker inspect` can identify a
-# running image without the registry.
+# which also covers an explicit empty `--build-arg VERSION=`.
+ARG VERSION=dev
+RUN VERSION="${VERSION:-dev}" && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
+
+FROM alpine:3.24
+
+# The image metadata belongs to the shipping stage: a LABEL written in the
+# builder stage above is discarded with that stage, so `docker inspect` on the
+# pulled image would show no title, source, version or license - and the
+# license the label claims (org.opencontainers.image.licenses, next to the
+# LICENSE file at the repo root) would never reach the image that is deployed.
+# Build args do not cross stage boundaries either, so VERSION is declared again
+# here with the same default the builder stamps into the binary.
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="redis-master-label" \
       org.opencontainers.image.description="Kubernetes sidecar that labels the pod hosting the current Redis master" \
       org.opencontainers.image.source="https://github.com/redis-master-label/redis-master-label" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}"
-RUN VERSION="${VERSION:-dev}" && CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.version=${VERSION}" -o redis-master-label .
-
-FROM alpine:3.24
 
 # ca-certificates for TLS-enabled Redis connections, plus the dedicated
 # unprivileged account the container runs as. The uid/gid are also pinned in
