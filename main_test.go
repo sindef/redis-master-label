@@ -838,6 +838,137 @@ func TestDockerfileFinalStageLabels_RejectsBuilderStageLabels(t *testing.T) {
 	}
 }
 
+// The published image must carry the full OCI metadata, and it must carry it in
+// the final stage: a LABEL block left in the builder stage reads exactly the
+// same in the build file yet is discarded with that stage, so the image users
+// pull has no title, source, license or version. Build args do not cross stage
+// boundaries either, so the final stage must declare ARG VERSION itself or its
+// version label expands to nothing.
+func TestDockerfileFinalStageCarriesOCILabels(t *testing.T) {
+	buildFile, err := locateBuildFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := dockerfileFinalStageLabels(buildFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociLabelsProblem(labels); err != nil {
+		t.Errorf("%s: %v", buildFile, err)
+	}
+	if err := ociVersionLabelProblem(labels); err != nil {
+		t.Errorf("%s: %v", buildFile, err)
+	}
+
+	declared, err := dockerfileFinalStageDeclaresArg(buildFile, "VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !declared {
+		t.Errorf("%s: the final stage declares no ARG VERSION, so its ${VERSION} resolves to nothing", buildFile)
+	}
+}
+
+// The failure modes at build-file level: labels in a discarded builder stage, a
+// final stage missing part of the metadata, a hard-coded version label, and an
+// ARG VERSION that was left behind in the builder stage.
+func TestDockerfileFinalStageCarriesOCILabels_RegressionFixtures(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Dockerfile")
+
+	builderStageLabels := "FROM golang:1.27-alpine AS builder\n" +
+		"LABEL org.opencontainers.image.title=\"redis-master-label\" \\\n" +
+		"      org.opencontainers.image.version=\"${VERSION}\"\n" +
+		"RUN go build .\n\n" +
+		"FROM alpine:3.24\nARG VERSION=dev\nUSER 10001:10001\n"
+	writeBuildFile(t, path, builderStageLabels)
+	labels, err := dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociLabelsProblem(labels); err == nil {
+		t.Error("labels in the discarded builder stage passed as the shipping image's metadata")
+	}
+
+	finalStageMissing := "FROM golang:1.27-alpine AS builder\nRUN go build .\n\n" +
+		"FROM alpine:3.24\nARG VERSION=dev\n" +
+		"LABEL org.opencontainers.image.title=\"redis-master-label\" \\\n" +
+		"      org.opencontainers.image.version=\"${VERSION}\"\n"
+	writeBuildFile(t, path, finalStageMissing)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ociLabelsProblem(labels)
+	if err == nil {
+		t.Fatal("a final stage without description, source and licenses was accepted")
+	}
+	for _, missing := range []string{"org.opencontainers.image.description", "org.opencontainers.image.source", "org.opencontainers.image.licenses"} {
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("error %q does not name the missing %s label", err, missing)
+		}
+	}
+	if err := ociVersionLabelProblem(labels); err != nil {
+		t.Errorf("version label of the final stage rejected: %v", err)
+	}
+
+	complete := "FROM golang:1.27-alpine AS builder\nARG VERSION=dev\nRUN go build .\n\n" +
+		"FROM alpine:3.24\nARG VERSION=dev\n" +
+		"LABEL org.opencontainers.image.title=\"redis-master-label\" \\\n" +
+		"      org.opencontainers.image.description=\"labels the pod hosting the Redis master\" \\\n" +
+		"      org.opencontainers.image.source=https://example.com/repo \\\n" +
+		"      org.opencontainers.image.licenses=\"MIT\" \\\n" +
+		"      org.opencontainers.image.version=\"${VERSION}\"\n" +
+		"USER 10001:10001\n"
+	writeBuildFile(t, path, complete)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociLabelsProblem(labels); err != nil {
+		t.Fatalf("complete final-stage label block rejected: %v", err)
+	}
+	if err := ociVersionLabelProblem(labels); err != nil {
+		t.Fatalf("version label stamped from ${VERSION} rejected: %v", err)
+	}
+	declared, err := dockerfileFinalStageDeclaresArg(path, "VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !declared {
+		t.Error("ARG VERSION declared in the final stage was not seen")
+	}
+
+	literalVersion := strings.Replace(complete, `org.opencontainers.image.version="${VERSION}"`, `org.opencontainers.image.version="v0.1.0"`, 1)
+	writeBuildFile(t, path, literalVersion)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ociVersionLabelProblem(labels); err == nil {
+		t.Error("a hard-coded version label was accepted; it goes stale at the next release")
+	}
+
+	argInBuilderOnly := strings.Replace(complete, "FROM alpine:3.24\nARG VERSION=dev\n", "FROM alpine:3.24\n", 1)
+	writeBuildFile(t, path, argInBuilderOnly)
+	declared, err = dockerfileFinalStageDeclaresArg(path, "VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if declared {
+		t.Error("ARG VERSION declared only in the builder stage counted for the final stage: its version label would expand to nothing")
+	}
+
+	if _, err := dockerfileFinalStageDeclaresArg(filepath.Join(dir, "missing.Dockerfile"), "VERSION"); err == nil {
+		t.Error("missing build file accepted, want a read error")
+	}
+	noFrom := filepath.Join(dir, "no-from.Dockerfile")
+	writeBuildFile(t, noFrom, "RUN true\n")
+	if _, err := dockerfileFinalStageDeclaresArg(noFrom, "VERSION"); err == nil {
+		t.Error("build file without FROM accepted, want an error")
+	}
+}
+
 // The README must state the license too, so the grant is discoverable without
 // digging into image metadata.
 func TestREADMEStatesLicense(t *testing.T) {

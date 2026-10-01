@@ -64,6 +64,13 @@ docker build --build-arg VERSION=v0.1.0 -t redis-master-label:v0.1.0 .
 still succeeds and reports `redis-master-label dev`; a `vX.Y.Z` tag passed
 through `--build-arg` is reported exactly.
 
+The five OCI labels (title, description, source, licenses and version) are
+declared in the shipping stage of the build file, so they land on the image that
+is pulled rather than being discarded with the builder stage. Verify them with
+`docker inspect --format '{{json .Config.Labels}}' redis-master-label:v0.1.0`;
+CI's "Verify image OCI labels" step fails the pull request when one of them is
+missing, empty, or when the version label disagrees with `--build-arg VERSION`.
+
 ## Releases
 Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
 the tag-push workflow runs `go vet` and the full test suite, then builds the
