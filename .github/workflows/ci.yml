@@ -22,7 +22,7 @@ jobs:
       # second toolchain for the build. Reading go.mod keeps this job and
       # release.yml (go-version-file only) on the same version.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
