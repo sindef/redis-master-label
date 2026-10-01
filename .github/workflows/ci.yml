@@ -15,10 +15,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # setup-go honours one version source: with both `go-version` and
+      # `go-version-file` set it warns the file is ignored, so the pin — not
+      # go.mod's `go` directive — decided the job's toolchain. go.mod is the
+      # single declaration here.
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
           go-version-file: go.mod
+
+      # Fail when the toolchain the job actually compiled with (GOTOOLCHAIN=local
+      # reads it instead of a downloaded one) drifts from go.mod's directive.
+      - name: Check Go toolchain
+        run: |
+          want=$(grep -m1 '^go ' go.mod | cut -d' ' -f2)
+          want_mm=$(echo "$want" | cut -d. -f1,2)
+          got=$(GOTOOLCHAIN=local go version)
+          got_mm=${got#go version go}
+          got_mm=$(echo "$got_mm" | cut -d. -f1,2)
+          echo "go.mod wants $want (MAJOR.MINOR $want_mm); installed toolchain: $got ($got_mm)"
+          if [ "$got_mm" != "$want_mm" ]; then
+            echo "installed Go toolchain MAJOR.MINOR ($got_mm) differs from go.mod ($want_mm)" >&2
+            exit 1
+          fi
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)"

@@ -1166,6 +1166,89 @@ func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
 // Non-positive --check-interval values must be rejected at startup:
 // time.Sleep returns immediately for them, so the poll loop busy-spins,
 // hammering the Redis server and the Kubernetes API server.
+// workflowFixture writes a workflow with the given setup-go `with:` lines.
+func workflowFixture(t *testing.T, withLines ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	var b strings.Builder
+	b.WriteString("name: fixture\n\njobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n")
+	for _, line := range withLines {
+		b.WriteString("          " + line + "\n")
+	}
+	b.WriteString("\n      - name: Vet\n        run: go vet ./...\n")
+	path := filepath.Join(dir, "ci.yml")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestWorkflowSingleGoVersionSource pins go.mod as the only toolchain
+// declaration: both a `go-version` pin beside `go-version-file` (the pre-fix
+// shape that setup-go resolves by ignoring the file) and a foreign
+// go-version-file must be rejected; the fixed shape must be accepted.
+func TestWorkflowSingleGoVersionSource(t *testing.T) {
+	if problems := workflowToolchainProblems(); len(problems) != 0 {
+		t.Fatalf("repository workflows rejected: %v", problems)
+	}
+}
+
+// TestWorkflowToolchainCheck_RejectsBothVersionSources reproduces the
+// conflicting-pin shape the failing CI job had: go-version "1.23" beside
+// go-version-file must fail the guard.
+func TestWorkflowToolchainCheck_RejectsBothVersionSources(t *testing.T) {
+	dir := workflowFixture(t, `go-version: "1.23"`, "go-version-file: go.mod")
+	problems := workflowDirToolchainProblems(dir, "go.mod")
+	if len(problems) == 0 {
+		t.Fatal("setup-go with both go-version and go-version-file must be rejected")
+	}
+}
+
+func TestWorkflowToolchainCheck_RejectsGoVersionOnly(t *testing.T) {
+	dir := workflowFixture(t, `go-version: "1.23.4"`)
+	if problems := workflowDirToolchainProblems(dir, "go.mod"); len(problems) == 0 {
+		t.Fatal("setup-go with only go-version must be rejected")
+	}
+}
+
+func TestWorkflowToolchainCheck_RejectsForeignVersionFile(t *testing.T) {
+	dir := workflowFixture(t, "go-version-file: tool/go.mod")
+	if problems := workflowDirToolchainProblems(dir, "go.mod"); len(problems) == 0 {
+		t.Fatal(`go-version-file other than "go.mod" must be rejected`)
+	}
+}
+
+func TestWorkflowToolchainCheck_RejectsNoVersionSource(t *testing.T) {
+	dir := workflowFixture(t, "cache: true")
+	if problems := workflowDirToolchainProblems(dir, "go.mod"); len(problems) == 0 {
+		t.Fatal("setup-go with no version source must be rejected")
+	}
+}
+
+func TestWorkflowToolchainCheck_AcceptsFixedShape(t *testing.T) {
+	dir := workflowFixture(t, "go-version-file: go.mod")
+	if problems := workflowDirToolchainProblems(dir, "go.mod"); len(problems) != 0 {
+		t.Fatalf("go-version-file: go.mod alone must be accepted, got %v", problems)
+	}
+}
+
+func TestWorkflowToolchainCheck_CommentedPinIsNotAPin(t *testing.T) {
+	dir := workflowFixture(t, `# go-version: "1.23"`, "go-version-file: go.mod")
+	if problems := workflowDirToolchainProblems(dir, "go.mod"); len(problems) != 0 {
+		t.Fatalf("a commented-out go-version must not count as a pin: %v", problems)
+	}
+}
+
+// TestGoModGoDirective pins the go.mod directive the CI toolchain step
+// compares against.
+func TestGoModGoDirective(t *testing.T) {
+	if got, want := goModGoDirective("go.mod"), "1.26.0"; got != want {
+		t.Fatalf("goModGoDirective(go.mod) = %q, want %q", got, want)
+	}
+}
+
+// TestValidateCheckInterval keeps reject non-positive --check-interval values
+// and accepts positive ones.
 func TestValidateCheckInterval(t *testing.T) {
 	orig := *checkInterval
 	defer func() { *checkInterval = orig }()

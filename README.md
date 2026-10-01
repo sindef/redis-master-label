@@ -45,6 +45,18 @@ go build -o redis-master-label .
 
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
+## Go toolchain
+
+go.mod's `go` directive (currently `1.26.0`) is the single Go toolchain
+declaration. CI (`ci.yml`) and the release workflow (`release.yml`) configure
+`actions/setup-go` with `go-version-file: go.mod` only — never an additional
+`go-version` pin — because setup-go honours one version source and would
+otherwise warn that the file is ignored while the pin decides the job's
+toolchain. A `Check Go toolchain` step in `ci.yml` fails when the installed
+toolchain's MAJOR.MINOR differs from the directive. `workflow_check.go`'s
+tests guard the shape: any `go-version` pin, any `go-version-file` other than
+`go.mod`, or a setup-go step without a version source fails the Go test suite.
+
 ## Container build
 ```bash
 # Build image using the provided Dockerfile
