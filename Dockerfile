@@ -1,4 +1,11 @@
-FROM golang:1.27-alpine AS builder
+# The builder base image must carry the same Go MAJOR.MINOR as the `go`
+# directive at the top of go.mod: CI runs gofmt, vet, build and test on that
+# version (`go-version-file: go.mod`), so a base image on another line compiles
+# - and the release workflow publishes - the binary with a compiler no check has
+# seen. TestDockerfileBuilderToolchainMatchesGoMod and CI's "Check builder
+# toolchain matches go.mod" step fail when the two disagree, so bump this tag and
+# go.mod's directive in the same change.
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /build
 
