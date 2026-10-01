@@ -853,6 +853,109 @@ func TestREADMEStatesLicense(t *testing.T) {
 	}
 }
 
+// The reviewed ci_gap: the CI workflow pinned `go-version: "1.23"` on the same
+// setup-go step as `go-version-file: go.mod` while go.mod declared go 1.26.0.
+// setup-go honours one input only (with both set it ignores the file), so the
+// job's toolchain was decided by a line go.mod disagreed with and the version
+// that compiled the code could not be read from the files. Every workflow must
+// therefore declare exactly one source, and it must be go.mod.
+func TestWorkflowsDeclareSingleGoToolchainSource(t *testing.T) {
+	problems, setupGoSteps, err := workflowGoToolchainProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps == 0 {
+		t.Fatal("no setup-go step found in the workflows: the toolchain check ran against nothing")
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The single source must be a real one: go-version-file resolves the module
+// file's `go` directive, so that directive has to name a version.
+func TestGoModDeclaresToolchainVersion(t *testing.T) {
+	declared, err := goModGoDirective(goToolchainFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := regexp.MatchString(`^[0-9]+\.[0-9]+(\.[0-9]+)?$`, declared); err != nil || !ok {
+		t.Fatalf("%s declares go %q, want a MAJOR.MINOR[.PATCH] version", goToolchainFile, declared)
+	}
+}
+
+// The failure modes at workflow level: the pre-fix state (both inputs on one
+// step) and every other shape that hides which toolchain the job installs must
+// be reported, while the single go-version-file source must pass.
+func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
+	tests := []struct {
+		name       string
+		workflow   string
+		wantQuiet  bool
+		wantSubstr string
+	}{
+		{
+			name:       "reviewed pre-fix state: go-version beside go-version-file",
+			workflow:   "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version: \"1.23\"\n          go-version-file: go.mod\n",
+			wantSubstr: "go-version: 1.23",
+		},
+		{
+			name:       "go-version alone",
+			workflow:   "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version: \"1.23\"\n",
+			wantSubstr: "go-version: 1.23",
+		},
+		{
+			name:       "go-version-file pointing elsewhere",
+			workflow:   "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: .go-version\n",
+			wantSubstr: "go-version-file: .go-version",
+		},
+		{
+			name:       "setup-go without any version input",
+			workflow:   "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          cache: true\n",
+			wantSubstr: "declares no go-version-file",
+		},
+		{
+			name:      "go-version-file: go.mod alone",
+			workflow:  "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n",
+			wantQuiet: true,
+		},
+		{
+			name:      "the extra pin only in a comment",
+			workflow:  "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          # go-version: \"1.23\"\n          go-version-file: go.mod\n",
+			wantQuiet: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if setupGoSteps != 1 {
+				t.Fatalf("setup-go steps = %d, want 1", setupGoSteps)
+			}
+			if tt.wantQuiet {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("workflow declaring a second toolchain source accepted, want a problem reported")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantSubstr) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantSubstr)
+			}
+		})
+	}
+}
+
 func TestVersionDefaultsToDev(t *testing.T) {
 	if version != "dev" {
 		t.Fatalf("version = %q, want the unstamped default \"dev\"", version)

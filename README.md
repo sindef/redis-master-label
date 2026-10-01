@@ -43,6 +43,11 @@ Environment defaults:
 go build -o redis-master-label .
 ```
 
+The Go toolchain version has a single source: the `go` directive at the top of
+`go.mod`. CI installs exactly that toolchain (`go-version-file: go.mod`) and the
+job prints `go version` next to the declared version, so the compiler running
+`gofmt`, `go vet`, `go build` and `go test` is the one the module file names.
+
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
 ## Container build
