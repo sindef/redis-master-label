@@ -84,15 +84,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	redisOptions := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
-	}
-
-	if *redisTLS {
-		redisOptions.TLSConfig = &tls.Config{
-			InsecureSkipVerify: *redisTLSSkipVerify,
-		}
+	redisOptions, err := redisOptionsFromFlags()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 
 	rdb := redis.NewClient(redisOptions)
@@ -134,6 +129,50 @@ func main() {
 		}
 		time.Sleep(*checkInterval)
 	}
+}
+
+// validateRedisTLSFlags rejects a nonsensical TLS flag combination:
+// --redis-tls-skip-verify without --redis-tls. Without TLS the connection is
+// plaintext, so the requested certificate-skip never applies and would leave
+// the operator believing a setting is in force that does nothing.
+func validateRedisTLSFlags() error {
+	if *redisTLSSkipVerify && !*redisTLS {
+		return fmt.Errorf("--redis-tls-skip-verify requires --redis-tls: without --redis-tls the connection is plaintext and the flag has no effect")
+	}
+	return nil
+}
+
+// redisOptionsFromFlags builds the redis.Options for the client from the
+// --redis-* flags (and the REDIS_PASSWORD environment fallback). It is the
+// single place a TLS config is attached: a TLS config with
+// InsecureSkipVerify matching --redis-tls-skip-verify only when --redis-tls
+// is set, never otherwise (README "Configuration"):
+//
+//	--redis-tls=false: TLSConfig stays nil even with
+//	                   --redis-tls-skip-verify set, because the connection is
+//	                   plaintext.
+//	--redis-tls=true:  TLSConfig carries InsecureSkipVerify from
+//	                   --redis-tls-skip-verify.
+//
+// Startup config invalid in combination (--redis-tls-skip-verify without
+// --redis-tls) is rejected instead of applied silently.
+func redisOptionsFromFlags() (*redis.Options, error) {
+	if err := validateRedisTLSFlags(); err != nil {
+		return nil, err
+	}
+
+	options := &redis.Options{
+		Addr:     *redisAddr,
+		Password: resolveRedisPassword(),
+	}
+
+	if *redisTLS {
+		options.TLSConfig = &tls.Config{
+			InsecureSkipVerify: *redisTLSSkipVerify,
+		}
+	}
+
+	return options, nil
 }
 
 // validateCheckInterval rejects a non-positive --check-interval. time.Sleep
