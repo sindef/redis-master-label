@@ -15,10 +15,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      # One toolchain declaration only, and it is go.mod's. setup-go honours a
+      # single version source: with both go-version and go-version-file set it
+      # warns that it ignores the file, so an explicit pin here silently decides
+      # the toolchain, drifts from go.mod, and lets GOTOOLCHAIN=auto download a
+      # second toolchain for the build. Reading go.mod keeps this job and
+      # release.yml (go-version-file only) on the same version.
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
           go-version-file: go.mod
+
+      # The toolchain that runs gofmt, vet, build and test must be the one
+      # go.mod declares. GOTOOLCHAIN=local reads the toolchain the job actually
+      # installed instead of a downloaded one: under the default `auto` an older
+      # installed Go would fetch the go.mod toolchain and this check would pass
+      # while the version printed in the log is a version no installed Go has.
+      - name: Check Go toolchain
+        run: |
+          want=$(grep -E '^go [0-9]+\.[0-9]+' go.mod | head -n 1 | cut -d' ' -f2)
+          [ -n "$want" ] || { echo "go.mod declares no go directive" >&2; exit 1; }
+          got=$(GOTOOLCHAIN=local go version)
+          echo "$got (go.mod declares go $want)"
+          want_minor=$(printf '%s' "$want" | cut -d. -f1,2)
+          got_minor=$(printf '%s' "$got" | sed -E 's/^go version go([0-9]+\.[0-9]+).*$/\1/')
+          if [ "$got_minor" != "$want_minor" ]; then
+            echo "installed toolchain is not the go.mod toolchain: $got, want go${want_minor}.x (setup-go must read go-version-file: go.mod)" >&2
+            exit 1
+          fi
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
