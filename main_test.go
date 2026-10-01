@@ -1022,6 +1022,7 @@ func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
 	tests := []struct {
 		name       string
 		workflow   string
+		wantSteps  int
 		wantQuiet  bool
 		wantSubstr string
 	}{
@@ -1055,6 +1056,26 @@ func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
 			workflow:  "jobs:\n  go:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          # go-version: \"1.23\"\n          go-version-file: go.mod\n",
 			wantQuiet: true,
 		},
+		{
+			name: "two setup-go steps, the second declaring only cache",
+			workflow: "jobs:\n  build:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n" +
+				"  test:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          cache: true\n",
+			wantSteps:  2,
+			wantSubstr: "declares no go-version-file",
+		},
+		{
+			name: "two setup-go steps, both reading go.mod",
+			workflow: "jobs:\n  build:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n" +
+				"  test:\n    steps:\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n",
+			wantSteps: 2,
+			wantQuiet: true,
+		},
+		{
+			name: "go-version-file on a step that is not setup-go",
+			workflow: "jobs:\n  go:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          go-version-file: go.mod\n" +
+				"      - uses: actions/setup-go@v5\n        with:\n          cache: true\n",
+			wantSubstr: "declares no go-version-file",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1064,12 +1085,16 @@ func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			wantSteps := tt.wantSteps
+			if wantSteps == 0 {
+				wantSteps = 1
+			}
 			problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if setupGoSteps != 1 {
-				t.Fatalf("setup-go steps = %d, want 1", setupGoSteps)
+			if setupGoSteps != wantSteps {
+				t.Fatalf("setup-go steps = %d, want %d", setupGoSteps, wantSteps)
 			}
 			if tt.wantQuiet {
 				if len(problems) != 0 {
@@ -1084,6 +1109,63 @@ func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
 				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantSubstr)
 			}
 		})
+	}
+}
+
+// The reviewed counting defect: the missing-source problem was appended per
+// file, so any `go-version-file:` line anywhere in the workflow satisfied every
+// setup-go step in it. A build job reading go.mod therefore hid a second job
+// whose setup-go step declared only `cache: true`, and that step installed
+// whatever Go the runner defaulted to. Each step must be reported on its own
+// inputs, and only once.
+func TestWorkflowGoToolchainProblems_UnpinnedSetupGoStepIsReported(t *testing.T) {
+	workflow := "jobs:\n" +
+		"  build:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n" +
+		"  test:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          cache: true\n"
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ci.yml")
+	if err := os.WriteFile(path, []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 2 {
+		t.Fatalf("setup-go steps = %d, want 2", setupGoSteps)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want exactly one for the unpinned second step", problems)
+	}
+	if !strings.Contains(problems[0], "ci.yml:9") || !strings.Contains(problems[0], "declares no go-version-file") {
+		t.Fatalf("problem = %q, want it to name the second setup-go step (ci.yml:9) and its missing go-version-file", problems[0])
+	}
+
+	// The same workflow with the second step pinned must stay quiet, so the
+	// check reports the missing source rather than every setup-go step.
+	pinned := strings.Replace(workflow, "          cache: true", "          go-version-file: go.mod", 1)
+	if err := os.WriteFile(path, []byte(pinned), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	problems, setupGoSteps, err = workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 2 {
+		t.Fatalf("setup-go steps = %d, want 2", setupGoSteps)
+	}
+	if len(problems) != 0 {
+		t.Fatalf("problems = %v, want none when both steps read go.mod's toolchain", problems)
 	}
 }
 

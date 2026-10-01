@@ -8,9 +8,10 @@ import (
 	"strings"
 )
 
-// Go toolchain pin check: CI must state exactly one Go version source, and it
-// must be go.mod's `go` directive. actions/setup-go accepts both go-version and
-// go-version-file but honours only one of them - with both inputs given it warns
+// Go toolchain pin check: every setup-go step must state exactly one Go version
+// source, and it must be go.mod's `go` directive. actions/setup-go accepts both
+// go-version and go-version-file but honours only one of them - with both inputs
+// given it warns
 // that it ignores the file input - so a stray `go-version:` line silently
 // decides which toolchain the job installs while the workflow text claims
 // otherwise. The reviewed defect was exactly that: `go-version: "1.23"` on the
@@ -39,7 +40,8 @@ const (
 
 // workflowGoToolchainProblems returns one message per Go toolchain declaration
 // in the workflows under dir that is not "install the version go.mod declares",
-// plus one per setup-go step that declares no version source at all. The second
+// plus one per setup-go step that declares no version source of its own (a
+// source another step or another file declares never covers it). The second
 // result counts the setup-go steps seen, so a caller can tell "no problems"
 // apart from "no workflow declared a toolchain, so nothing was checked".
 func workflowGoToolchainProblems(dir string) ([]string, int, error) {
@@ -72,10 +74,29 @@ func workflowGoToolchainProblems(dir string) ([]string, int, error) {
 }
 
 // workflowGoToolchainProblemsIn scans one workflow's text for toolchain pins.
+// Each setup-go step is judged on its own inputs: two setup-go steps in one
+// workflow are two installs, so a version source declared by one of them says
+// nothing about the other. Counting the sources per file let the reviewed shape
+// pass - a build job with `go-version-file: go.mod` plus a second job whose step
+// declared only `cache: true` produced no problem at all, and that step silently
+// installed whatever Go the runner defaulted to, which is exactly the drift this
+// check exists to catch.
 func workflowGoToolchainProblemsIn(path, text string) ([]string, int) {
 	var problems []string
-	setupGoSteps := 0
-	versionFiles := 0
+
+	// One record per YAML step item, so the version sources a step declares can
+	// be attributed to that step. A step item opens at the workflow's step list
+	// indentation; a list indented deeper is nested inside the step it belongs
+	// to (a step's `args:` list) and does not open a new one.
+	type setupGoStep struct {
+		line           int
+		setupGo        bool
+		versionSources int
+	}
+	var steps []*setupGoStep
+	var current *setupGoStep
+	stepIndent := -1
+
 	for i, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
 		// A commented-out input is not a pin: the reviewed workflow only ever
@@ -83,11 +104,22 @@ func workflowGoToolchainProblemsIn(path, text string) ([]string, int) {
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if strings.Contains(trimmed, "actions/setup-go") {
-			setupGoSteps++
+		if indent, isItem := workflowStepItemIndent(line); isItem && (stepIndent < 0 || indent <= stepIndent) {
+			stepIndent = indent
+			current = &setupGoStep{line: i + 1}
+			steps = append(steps, current)
 		}
-		key, value, ok := workflowInput(trimmed)
+
+		key, value, ok := workflowInput(workflowItemText(trimmed))
 		if !ok {
+			continue
+		}
+		if key == "uses" && strings.Contains(value, "actions/setup-go") {
+			if current == nil {
+				current = &setupGoStep{line: i + 1}
+				steps = append(steps, current)
+			}
+			current.setupGo = true
 			continue
 		}
 		switch key {
@@ -96,20 +128,52 @@ func workflowGoToolchainProblemsIn(path, text string) ([]string, int) {
 				"%s:%d: declares an explicit toolchain (go-version: %s); setup-go then ignores %s, so the job installs a Go version go.mod does not declare and the CI toolchain cannot be read from the files",
 				path, i+1, value, goVersionFileInput))
 		case goVersionFileInput:
-			versionFiles++
 			if value != goToolchainFile {
 				problems = append(problems, fmt.Sprintf(
 					"%s:%d: %s: %s, want %s (the file declaring the toolchain version)",
 					path, i+1, goVersionFileInput, value, goToolchainFile))
 			}
+			// A source outside any step cannot cover a setup-go step either, so
+			// the count is only read back for the step that declared it.
+			if current != nil {
+				current.versionSources++
+			}
 		}
 	}
-	if setupGoSteps > 0 && versionFiles == 0 {
-		problems = append(problems, fmt.Sprintf(
-			"%s: the setup-go step declares no %s, so the job installs an unpinned Go toolchain",
-			path, goVersionFileInput))
+
+	setupGoSteps := 0
+	for _, step := range steps {
+		if !step.setupGo {
+			continue
+		}
+		setupGoSteps++
+		if step.versionSources == 0 {
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: the setup-go step declares no %s, so that step installs an unpinned Go toolchain",
+				path, step.line, goVersionFileInput))
+		}
 	}
 	return problems, setupGoSteps
+}
+
+// workflowStepItemIndent reports the indentation of a YAML sequence item, so a
+// workflow step can be told apart from a deeper list nested inside a step.
+func workflowStepItemIndent(line string) (int, bool) {
+	indent := len(line) - len(strings.TrimLeft(line, " "))
+	if !strings.HasPrefix(line[indent:], "- ") {
+		return 0, false
+	}
+	return indent, true
+}
+
+// workflowItemText drops the "- " opening a sequence item, so a step's first
+// line (`- uses: actions/setup-go@v7`) parses like any other mapping entry.
+func workflowItemText(trimmed string) string {
+	rest, ok := strings.CutPrefix(trimmed, "- ")
+	if !ok {
+		return trimmed
+	}
+	return strings.TrimSpace(rest)
 }
 
 // goModGoDirective returns the version of the module file's `go` directive, for
@@ -134,7 +198,7 @@ func goModGoDirective(path string) (string, error) {
 
 // workflowInput splits a `key: value` YAML mapping line, dropping a trailing
 // comment and the quotes around the value. It reports ok=false for any line that
-// is not such a mapping entry, so step names, list items and `uses:` lines are
+// is not such a mapping entry, so step names and other non-mapping lines are
 // not mistaken for toolchain inputs.
 func workflowInput(line string) (key, value string, ok bool) {
 	key, value, ok = strings.Cut(line, ":")
