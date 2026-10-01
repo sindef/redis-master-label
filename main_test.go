@@ -759,6 +759,100 @@ func TestDockerfileFinalStageUser_RegressionFixtures(t *testing.T) {
 	}
 }
 
+// licenseID is the SPDX identifier the project grants in LICENSE and the value
+// the shipping image's org.opencontainers.image.licenses label must carry.
+const licenseID = "MIT"
+
+// The reviewed release_hygiene defect: the image advertised
+// org.opencontainers.image.licenses="MIT" while the repository shipped no
+// LICENSE file, so the label claimed a license nobody had granted. The file at
+// the repo root is the grant, and it must hold the MIT text.
+func TestLicenseFileGrantsMITLicense(t *testing.T) {
+	data, err := os.ReadFile(licenseFile)
+	if err != nil {
+		t.Fatalf("read %s: %v (the image advertises %q, so the repository must grant it)", licenseFile, err, licenseID)
+	}
+
+	text := string(data)
+	for _, want := range []string{
+		"MIT License",
+		"Copyright (c)",
+		"Permission is hereby granted, free of charge",
+		"WITHOUT WARRANTY OF ANY KIND",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s is missing %q: it is not the MIT license text", licenseFile, want)
+		}
+	}
+}
+
+// The label and the grant must agree, and the label must be in the shipping
+// (final) build stage: a LABEL in the discarded builder stage reaches no image,
+// so the claim would be invisible to anyone pulling it.
+func TestImageLicenseLabelMatchesGrantedLicense(t *testing.T) {
+	buildFile, err := locateBuildFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := dockerfileFinalStageLabels(buildFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageLicenseProblem(labels, licenseID); err != nil {
+		t.Errorf("%s: %v", buildFile, err)
+	}
+}
+
+// The failure mode at build-file level: a license label that lives only in the
+// builder stage must not be read back as the shipping image's metadata, a label
+// in the final stage must be, and a label naming a license the repository does
+// not grant must be rejected.
+func TestDockerfileFinalStageLabels_RejectsBuilderStageLabels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Dockerfile")
+
+	builderStageOnly := "FROM golang:1.27-alpine AS builder\nLABEL org.opencontainers.image.licenses=\"MIT\"\nRUN go build .\n\nFROM alpine:3.24\nUSER 10001:10001\n"
+	writeBuildFile(t, path, builderStageOnly)
+	labels, err := dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageLicenseProblem(labels, licenseID); err == nil {
+		t.Error("license label in the discarded builder stage accepted as the shipping image's license")
+	}
+
+	finalStage := "FROM golang:1.27-alpine AS builder\nRUN go build .\n\nFROM alpine:3.24\nLABEL org.opencontainers.image.licenses=\"MIT\" \\\n      org.opencontainers.image.source=https://example.com/repo\nUSER 10001:10001\n"
+	writeBuildFile(t, path, finalStage)
+	labels, err = dockerfileFinalStageLabels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageLicenseProblem(labels, licenseID); err != nil {
+		t.Fatalf("license label in the final stage not read back: %v", err)
+	}
+	if got := labels["org.opencontainers.image.source"]; got != "https://example.com/repo" {
+		t.Errorf("label on a continuation line = %q, want the unquoted URL", got)
+	}
+	if err := imageLicenseProblem(labels, "Apache-2.0"); err == nil {
+		t.Error("label disagreeing with the granted license was accepted")
+	}
+}
+
+// The README must state the license too, so the grant is discoverable without
+// digging into image metadata.
+func TestREADMEStatesLicense(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(data)
+	for _, want := range []string{"## License", licenseID, licenseFile} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README.md does not mention %q; it must state the project license", want)
+		}
+	}
+}
+
 func TestVersionDefaultsToDev(t *testing.T) {
 	if version != "dev" {
 		t.Fatalf("version = %q, want the unstamped default \"dev\"", version)

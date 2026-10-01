@@ -208,4 +208,10 @@ curl http://localhost:8080/healthz
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
 - If using TLS, set `--redis-tls` and `--redis-tls-skip-verify` if required.
-- The health check endpoint can be used by Kubernetes liveness/readiness probes. 
+- The health check endpoint can be used by Kubernetes liveness/readiness probes.
+
+## License
+Released under the [MIT License](LICENSE). The container image advertises the
+same license through its `org.opencontainers.image.licenses` label (check it
+with `docker inspect`), so the published image metadata and the `LICENSE` file
+that grants the license agree.
