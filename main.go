@@ -52,6 +52,11 @@ func main() {
 		return
 	}
 
+	if err := validateCheckInterval(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	if *podName == "" {
 		*podName = os.Getenv("HOSTNAME")
 		if *podName == "" {
@@ -129,6 +134,16 @@ func main() {
 		}
 		time.Sleep(*checkInterval)
 	}
+}
+
+// validateCheckInterval rejects a non-positive --check-interval. time.Sleep
+// returns immediately for such values, so the poll loop would busy-spin,
+// hammering the Redis server and the Kubernetes API server.
+func validateCheckInterval() error {
+	if *checkInterval <= 0 {
+		return fmt.Errorf("--check-interval must be positive, got %v", *checkInterval)
+	}
+	return nil
 }
 
 // resolveRedisPassword returns the credential for the Redis connection. The
