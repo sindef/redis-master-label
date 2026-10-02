@@ -39,7 +39,9 @@ const (
 
 // workflowGoToolchainProblems returns one message per Go toolchain declaration
 // in the workflows under dir that is not "install the version go.mod declares",
-// plus one per setup-go step that declares no version source at all. The second
+// plus one message per setup-go step that declares no version source at all:
+// version sources count per setup-go step, not per workflow file, so each step
+// that uses actions/setup-go must carry its own. The second
 // result counts the setup-go steps seen, so a caller can tell "no problems"
 // apart from "no workflow declared a toolchain, so nothing was checked".
 func workflowGoToolchainProblems(dir string) ([]string, int, error) {
@@ -72,21 +74,59 @@ func workflowGoToolchainProblems(dir string) ([]string, int, error) {
 }
 
 // workflowGoToolchainProblemsIn scans one workflow's text for toolchain pins.
+// Version sources are tracked per setup-go step, not per file: setup-go
+// installs a toolchain for the step that uses it, so a `go-version-file:` in
+// some other step never pins this one and a second setup-go step is not
+// covered by the first step's declaration. Every step that uses
+// actions/setup-go must carry its own version source; a step without one is
+// reported once, at the line of its `uses:`.
 func workflowGoToolchainProblemsIn(path, text string) ([]string, int) {
 	var problems []string
 	setupGoSteps := 0
-	versionFiles := 0
+	// Step state: which setup-go step is the current `uses:` in, where that
+	// `uses:` line stands, and which version sources its own `with:` block has
+	// declared so far.
+	setupWithOpen := false
+	stepIndent := 0
+	setupStartLine := 0
+	sources := 0
+	finishSetupStep := func(line int) {
+		if setupWithOpen {
+			if sources == 0 {
+				problems = append(problems, fmt.Sprintf(
+					"%s:%d: a setup-go step declares no %s, so the job installs an unpinned Go toolchain",
+					path, line, goVersionFileInput))
+			}
+			setupWithOpen = false
+		}
+	}
 	for i, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
 		// A commented-out input is not a pin: the reviewed workflow only ever
 		// had live keys, and CI does not read comments.
-		if strings.HasPrefix(trimmed, "#") {
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if strings.Contains(trimmed, "actions/setup-go") {
-			setupGoSteps++
-		}
+		indent := len(rawLineIndent(line))
+		onSetupGo := strings.Contains(trimmed, "actions/setup-go")
 		key, value, ok := workflowInput(trimmed)
+		// A later `uses:`, a step item like `- name:` at the step's own
+		// indentation, or any mapping key the step does not own ends the
+		// setup-go step: its `with:` block is closed by now.
+		nextStep := setupWithOpen && (onSetupGo ||
+			(ok && indent <= stepIndent) ||
+			(strings.HasPrefix(trimmed, "- ") && indent <= stepIndent))
+		if nextStep {
+			finishSetupStep(setupStartLine)
+		}
+		if onSetupGo {
+			setupGoSteps++
+			stepIndent = indent
+			setupStartLine = i + 1
+			sources = 0
+			setupWithOpen = true
+			continue
+		}
 		if !ok {
 			continue
 		}
@@ -95,8 +135,22 @@ func workflowGoToolchainProblemsIn(path, text string) ([]string, int) {
 			problems = append(problems, fmt.Sprintf(
 				"%s:%d: declares an explicit toolchain (go-version: %s); setup-go then ignores %s, so the job installs a Go version go.mod does not declare and the CI toolchain cannot be read from the files",
 				path, i+1, value, goVersionFileInput))
+			// A go-version still is a version source for its own step: the
+			// problem above already rejects the pin, so the source tally must
+			// not add a second message for the same step.
+			if setupWithOpen {
+				sources++
+			}
 		case goVersionFileInput:
-			versionFiles++
+			// Only the setup-go step's own `with:` block can host its version
+			// source; a `go-version-file:` line in any other step, job or
+			// top-level mapping satisfies no setup-go step. A source naming a
+			// file other than go.mod is still the step's own source, so the
+			// per-step problem quota is filled, but the wrong file keeps its
+			// own message below.
+			if setupWithOpen {
+				sources++
+			}
 			if value != goToolchainFile {
 				problems = append(problems, fmt.Sprintf(
 					"%s:%d: %s: %s, want %s (the file declaring the toolchain version)",
@@ -104,12 +158,14 @@ func workflowGoToolchainProblemsIn(path, text string) ([]string, int) {
 			}
 		}
 	}
-	if setupGoSteps > 0 && versionFiles == 0 {
-		problems = append(problems, fmt.Sprintf(
-			"%s: the setup-go step declares no %s, so the job installs an unpinned Go toolchain",
-			path, goVersionFileInput))
-	}
+	finishSetupStep(setupStartLine)
 	return problems, setupGoSteps
+}
+
+// rawLineIndent returns the leading whitespace run of one line, which is the
+// only signal a YAML file gives for where a mapping belongs.
+func rawLineIndent(line string) string {
+	return line[:len(line)-len(strings.TrimLeft(line, " \t"))]
 }
 
 // goModGoDirective returns the version of the module file's `go` directive, for

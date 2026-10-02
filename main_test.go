@@ -1723,6 +1723,114 @@ func TestValidateCheckInterval(t *testing.T) {
 	}
 }
 
+// Version sources are counted per setup-go step, not per file. The reviewed
+// defect shape: two setup-go steps where only the first declares
+// `go-version-file: go.mod` - the whole-file count of `go-version-file:` lines
+// saw one line and stayed quiet, while the second step (only `cache: true`)
+// silently installed the runner's default toolchain. The unpinned step must be
+// reported, at the line of its own `uses:`.
+func TestWorkflowGoToolchainProblems_SecondSetupGoStepWithoutSource(t *testing.T) {
+	dir := t.TempDir()
+	workflow := "jobs:\n" +
+		"  build:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n" +
+		"  second:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          cache: true\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 2 {
+		t.Fatalf("setup-go steps = %d, want 2", setupGoSteps)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want exactly one, for the unpinned step", problems)
+	}
+	if !strings.Contains(problems[0], "declares no go-version-file") {
+		t.Fatalf("problem %q does not name the missing version source", problems[0])
+	}
+	// Line 9 is the second step's `uses: actions/setup-go@v5` line.
+	if !strings.Contains(problems[0], "ci.yml:9") {
+		t.Fatalf("problem %q does not point at the unpinned step's uses line", problems[0])
+	}
+}
+
+// The counting must not be satisfied by anything but the setup-go step itself:
+// a `go-version-file:` line in a step that runs another action tells setup-go
+// nothing, so the setup-go step stays unpinned and must be reported.
+func TestWorkflowGoToolchainProblems_StraySourceInAnotherStep(t *testing.T) {
+	dir := t.TempDir()
+	workflow := "jobs:\n" +
+		"  build:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          cache: true\n" +
+		"      - uses: actions/cache@v4\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 1 {
+		t.Fatalf("setup-go steps = %d, want 1", setupGoSteps)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want exactly one, for the unpinned setup-go step", problems)
+	}
+	if !strings.Contains(problems[0], "declares no go-version-file") {
+		t.Fatalf("problem %q does not name the missing version source", problems[0])
+	}
+}
+
+// A pinned setup-go step next to an unpinned one must not drag the pinned step
+// into the report, and the file-level count of problems equals the number of
+// unpinned steps, not one.
+func TestWorkflowGoToolchainProblems_PinnedAndUnpinnedSteps(t *testing.T) {
+	dir := t.TempDir()
+	workflow := "jobs:\n" +
+		"  one:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n" +
+		"  two:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version: \"1.23\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 2 {
+		t.Fatalf("setup-go steps = %d, want 2", setupGoSteps)
+	}
+	joined := strings.Join(problems, "\n")
+	if len(problems) != 1 || !strings.Contains(joined, "go-version: 1.23") {
+		t.Fatalf("problems = %v, want exactly one, naming the explicit go-version pin", problems)
+	}
+}
+
 // A workflow that pushes images with provenance/SBOM attestations needs the
 // permissions docker/build-push-action documents for that push: id-token: write
 // (keyless signing via the workflow's OIDC identity) and attestations: write
