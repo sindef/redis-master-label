@@ -55,6 +55,32 @@ spec:
         - --label-key=redis-role
         - --label-value=master
         - --check-interval=10s
+        # The documented health endpoint (README "Health Check Endpoint"): the
+        # binary binds --health-port 8080 and serves /healthz, answering 503
+        # after 3 consecutive Redis failures. Declaring the port is not enough -
+        # the kubelet polls only what a probe names - so without these probes a
+        # sidecar whose Redis became unreachable (or whose health listener died)
+        # keeps reporting Running and keeps the stale redis-role label.
+        # TestManifestSidecarsDeclareHealthProbes fails when the health port is
+        # declared without a probe polling /healthz on it. Move the containerPort
+        # and both probe ports with --health-port if you change it.
+        ports:
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
         # The labeler needs no privileges - it only reads Redis and calls the
         # Kubernetes API with its mounted credentials - and works fine with a
         # read-only root filesystem. Without this block the container ran as
