@@ -1988,3 +1988,344 @@ func TestModuleGraphJobProblems_RegressionFixtures(t *testing.T) {
 		})
 	}
 }
+
+// The reviewed test_gap: main() resolved the pod name, the pod namespace and
+// --version inline, so no test exercised the documented startup behaviour
+// (README "Configuration" and "How it works"): --pod-name falls back to
+// HOSTNAME and startup stops when both are empty, --pod-namespace falls back to
+// POD_NAMESPACE and then to "default", and --version prints the build version
+// and exits before any cluster, Redis or listener work. resolvePodIdentity and
+// printVersion are those decisions, extracted so a table can pin them. Without
+// that, dropping the "default" fallback, inverting the pod-name check or exiting
+// after binding the health listener would leave the suite green while the
+// sidecars in manifests/*.yaml (which pass neither flag and rely on the
+// Downward API env wiring) misbehave.
+func TestResolvePodIdentity(t *testing.T) {
+	tests := []struct {
+		name     string
+		nameFlag string
+		nsFlag   string
+		envName  string
+		envNS    string
+		wantName string
+		wantNS   string
+		wantErr  bool
+	}{
+		{
+			name:     "flag and env set: the flags win",
+			nameFlag: "flag-pod",
+			nsFlag:   "flag-ns",
+			envName:  "env-pod",
+			envNS:    "env-ns",
+			wantName: "flag-pod",
+			wantNS:   "flag-ns",
+		},
+		{
+			name:     "env only: both resolved from the environment",
+			envName:  "env-pod",
+			envNS:    "env-ns",
+			wantName: "env-pod",
+			wantNS:   "env-ns",
+		},
+		{
+			name:     "name flag with namespace env",
+			nameFlag: "flag-pod",
+			envName:  "env-pod",
+			envNS:    "env-ns",
+			wantName: "flag-pod",
+			wantNS:   "env-ns",
+		},
+		{
+			name:     "namespace flag with name env",
+			nsFlag:   "flag-ns",
+			envName:  "env-pod",
+			envNS:    "env-ns",
+			wantName: "env-pod",
+			wantNS:   "flag-ns",
+		},
+		{
+			name:     "neither namespace source: documented default",
+			nameFlag: "flag-pod",
+			envName:  "env-pod",
+			wantName: "flag-pod",
+			wantNS:   "default",
+		},
+		{
+			name:    "neither source at all: empty pod name is fatal",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envPodName, tt.envName)
+			t.Setenv(envPodNamespace, tt.envNS)
+
+			name, namespace, err := resolvePodIdentity(tt.nameFlag, tt.nsFlag)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolvePodIdentity(%q, %q) with no %s and no %s = %q/%q, want the fatal error",
+						tt.nameFlag, tt.nsFlag, envPodName, envPodNamespace, name, namespace)
+				}
+				if name != "" {
+					t.Errorf("name = %q, want empty: startup must stop instead of labelling a pod with an empty name", name)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolvePodIdentity(%q, %q): %v", tt.nameFlag, tt.nsFlag, err)
+			}
+			if name != tt.wantName {
+				t.Errorf("name = %q, want %q", name, tt.wantName)
+			}
+			if namespace != tt.wantNS {
+				t.Errorf("namespace = %q, want %q", namespace, tt.wantNS)
+			}
+		})
+	}
+}
+
+// The fatal branch carries the operator-visible message, because a sidecar that
+// refuses to start is diagnosed from it. The namespace is not resolved once the
+// name is missing: the original main exited before it looked at the namespace.
+func TestResolvePodIdentity_EmptyPodNameIsFatal(t *testing.T) {
+	t.Setenv(envPodName, "")
+	t.Setenv(envPodNamespace, "kube-system")
+
+	name, _, err := resolvePodIdentity("", "")
+	if err == nil {
+		t.Fatalf("resolvePodIdentity with no --%s and no %s was accepted, want the fatal error", podNameFlag, envPodName)
+	}
+	want := fmt.Sprintf("pod-name must be set or %s env var must be available", envPodName)
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+	if name != "" {
+		t.Errorf("name = %q, want empty", name)
+	}
+}
+
+// An empty pod name stays fatal even when the namespace would resolve, so the
+// namespace default cannot mask it.
+func TestResolvePodIdentity_DefaultNamespaceDoesNotMaskEmptyPodName(t *testing.T) {
+	t.Setenv(envPodName, "")
+	t.Setenv(envPodNamespace, "")
+
+	if _, namespace, err := resolvePodIdentity("", ""); err == nil {
+		t.Fatalf("resolvePodIdentity with an empty pod name returned namespace %q instead of a fatal error", namespace)
+	}
+}
+
+// The pod-identity flags must default to empty and the namespace default must
+// be the literal the README documents: a non-empty flag default would hide the
+// env fallback (and with it the HOSTNAME/POD_NAMESPACE wiring the example
+// manifests use), and another default would name a namespace nothing deploys
+// into.
+func TestPodIdentityFlagsRegistered(t *testing.T) {
+	for _, flagName := range []string{podNameFlag, podNamespaceFlag} {
+		f := flag.CommandLine.Lookup(flagName)
+		if f == nil {
+			t.Fatalf("--%s is not registered in flag.CommandLine", flagName)
+		}
+		if f.DefValue != "" {
+			t.Errorf("--%s default = %q, want \"\": the environment must decide when the flag is unset", flagName, f.DefValue)
+		}
+	}
+
+	if defaultPodNamespace != "default" {
+		t.Errorf("defaultPodNamespace = %q, want the documented %q", defaultPodNamespace, "default")
+	}
+}
+
+// --version must print the build version and stop: CI's "Verify image version
+// output" step compares this exact line against "redis-master-label <tag>", and
+// anything started around it (health listener, cluster client) would change
+// what a `--version` invocation does.
+func TestPrintVersion(t *testing.T) {
+	orig := version
+	defer func() { version = orig }()
+
+	var out strings.Builder
+	if stopped := printVersion(false, &out); stopped {
+		t.Error("printVersion(false) = true, want startup to continue")
+	}
+	if out.Len() != 0 {
+		t.Errorf("printVersion(false) wrote %q, want nothing", out.String())
+	}
+
+	version = "v9.9.9"
+	out.Reset()
+	if stopped := printVersion(true, &out); !stopped {
+		t.Error("printVersion(true) = false, want the early exit")
+	}
+	if want := "redis-master-label v9.9.9\n"; out.String() != want {
+		t.Errorf("printVersion(true) wrote %q, want %q", out.String(), want)
+	}
+
+	version = "dev"
+	if want := "redis-master-label dev"; versionLine() != want {
+		t.Errorf("versionLine() = %q, want %q for an unstamped build", versionLine(), want)
+	}
+}
+
+// The documented startup order is what makes the resolution observable: the
+// flags are parsed, --version exits before anything else, the pod identity is
+// resolved before the labeler needs it, and the health listener is bound before
+// the poll loop starts, so a bind failure (port taken, invalid --health-port)
+// aborts startup instead of silently running without /healthz. main() loops
+// forever, so the order is read from its source instead of run.
+func TestMainStartupOrder(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := mainFunctionBody(t, string(src))
+	order := []string{"flag.Parse()", "printVersion(", "resolvePodIdentity(", "startHealthServer(", "for {"}
+	previous := ""
+	at := -1
+	for _, marker := range order {
+		i := strings.Index(body, marker)
+		if i < 0 {
+			t.Fatalf("main() does not call %s: the documented startup step is gone", marker)
+		}
+		if i < at {
+			t.Fatalf("main() calls %s before %s: the documented startup order is broken", marker, previous)
+		}
+		previous, at = marker, i
+	}
+}
+
+// mainFunctionBody returns the source of main() from src, so the startup-order
+// guard reads the function's own statements instead of a helper that happens to
+// call the same functions elsewhere in the file.
+func mainFunctionBody(t *testing.T, src string) string {
+	t.Helper()
+	start := strings.Index(src, "func main() {")
+	if start < 0 {
+		t.Fatal("main.go declares no func main() {")
+	}
+	body := src[start:]
+	if end := strings.Index(body, "\n}\n"); end >= 0 {
+		return body[:end]
+	}
+	t.Fatal("main() body is not closed by a top-level brace")
+	return ""
+}
+
+// The example sidecars pass neither --pod-name nor --pod-namespace, so the
+// env-only path of resolvePodIdentity is the one that runs in production: both
+// manifests must project the pod identity from the Downward API fields naming
+// the pod the sidecar runs in. Without HOSTNAME the labeler cannot start (the
+// empty pod name is fatal); without POD_NAMESPACE it labels the pod in
+// "default" whatever namespace it was deployed into.
+func TestManifestLabelerSidecarsWirePodIdentityEnv(t *testing.T) {
+	problems, sidecars, err := sidecarPodIdentityProblems(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sidecars != 2 {
+		t.Fatalf("labeler containers = %d, want the two example deployments", sidecars)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The failure modes at manifest level: a missing env var, a literal value
+// instead of a Downward API fieldRef, a fieldRef on the wrong field, and a
+// sidecar that decides its identity through a flag instead of the env wiring.
+func TestSidecarPodIdentityProblems_RegressionFixtures(t *testing.T) {
+	const head = "apiVersion: apps/v1\n" +
+		"kind: Deployment\n" +
+		"spec:\n" +
+		"  template:\n" +
+		"    spec:\n" +
+		"      containers:\n" +
+		"      - name: redis-master-label\n" +
+		"        image: ghcr.io/redis-master-label/redis-master-label:v0.1.0\n" +
+		"        command:\n" +
+		"        - /app/redis-master-label\n"
+	const wiredEnv = "        env:\n" +
+		"        - name: HOSTNAME\n" +
+		"          valueFrom:\n" +
+		"            fieldRef:\n" +
+		"              fieldPath: metadata.name\n" +
+		"        - name: POD_NAMESPACE\n" +
+		"          valueFrom:\n" +
+		"            fieldRef:\n" +
+		"              fieldPath: metadata.namespace\n"
+
+	tests := []struct {
+		name          string
+		command       string
+		env           string
+		wantProblem   bool
+		wantSubstring string
+	}{
+		{
+			name:    "both variables projected from the pod's own fields",
+			command: "        - --redis-addr=localhost:6379\n",
+			env:     wiredEnv,
+		},
+		{
+			name:          "missing HOSTNAME variable",
+			command:       "        - --redis-addr=localhost:6379\n",
+			env:           "        env:\n        - name: POD_NAMESPACE\n          valueFrom:\n            fieldRef:\n              fieldPath: metadata.namespace\n",
+			wantProblem:   true,
+			wantSubstring: envPodName,
+		},
+		{
+			name:          "HOSTNAME from a literal value",
+			command:       "        - --redis-addr=localhost:6379\n",
+			env:           "        env:\n        - name: HOSTNAME\n          value: some-other-pod\n        - name: POD_NAMESPACE\n          valueFrom:\n            fieldRef:\n              fieldPath: metadata.namespace\n",
+			wantProblem:   true,
+			wantSubstring: "literal value",
+		},
+		{
+			name:          "namespace projected from the wrong field",
+			command:       "        - --redis-addr=localhost:6379\n",
+			env:           "        env:\n        - name: HOSTNAME\n          valueFrom:\n            fieldRef:\n              fieldPath: metadata.name\n        - name: POD_NAMESPACE\n          valueFrom:\n            fieldRef:\n              fieldPath: metadata.labels\n",
+			wantProblem:   true,
+			wantSubstring: podNamespaceFieldPath,
+		},
+		{
+			name:          "identity passed as a flag instead of the env wiring",
+			command:       "        - --pod-name=$(HOSTNAME)\n",
+			env:           wiredEnv,
+			wantProblem:   true,
+			wantSubstring: podNameFlag,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			manifest := head + tt.command + tt.env
+			if err := os.WriteFile(filepath.Join(dir, "deployment-fixture.yaml"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, sidecars, err := sidecarPodIdentityProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sidecars != 1 {
+				t.Fatalf("labeler containers = %d, want 1", sidecars)
+			}
+			if !tt.wantProblem {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none for the documented wiring", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("pod-identity env wiring that cannot name the pod was accepted")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantSubstring) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantSubstring)
+			}
+		})
+	}
+}

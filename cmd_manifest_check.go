@@ -47,9 +47,28 @@ type containerSecurityContext struct {
 	} `json:"capabilities"`
 }
 
-// podSpecManifest holds just the container command/args and securityContext.
-// Only fields present in the example manifests are decoded; manifests without
-// a Pod spec (like Services) simply have no containers.
+// containerEnvVar holds one env entry of a labeler container: the variable name
+// and, when the value comes from the Downward API, the field it is projected
+// from (metadata.name, metadata.namespace).
+type containerEnvVar struct {
+	Name      string `json:"name"`
+	ValueFrom struct {
+		FieldRef struct {
+			FieldPath string `json:"fieldPath"`
+		} `json:"fieldRef"`
+	} `json:"valueFrom"`
+}
+
+// The Downward API fields the pod-identity env vars must be projected from: the
+// name and namespace of the pod the labeler runs in.
+const (
+	podNameFieldPath      = "metadata.name"
+	podNamespaceFieldPath = "metadata.namespace"
+)
+
+// podSpecManifest holds just the container command/args, env and
+// securityContext. Only fields present in the example manifests are decoded;
+// manifests without a Pod spec (like Services) simply have no containers.
 type podSpecManifest struct {
 	Spec struct {
 		Template struct {
@@ -59,6 +78,7 @@ type podSpecManifest struct {
 					Image           string
 					Command         []string
 					Args            []string
+					Env             []containerEnvVar
 					SecurityContext *containerSecurityContext `json:"securityContext"`
 				}
 			}
@@ -150,6 +170,101 @@ func sidecarImages(dir string) (images []string, sidecars int, err error) {
 		}
 	}
 	return images, sidecars, readErr
+}
+
+// sidecarPodIdentityProblems returns one message per labeler container whose
+// env wiring would not let resolvePodIdentity find the pod at startup, plus the
+// number of labeler containers seen so a caller can tell "no problems" from
+// "nothing was checked". The example sidecars pass neither --pod-name nor
+// --pod-namespace, so the env-only path of resolvePodIdentity is the one that
+// runs in production: HOSTNAME has to be projected from metadata.name and
+// POD_NAMESPACE from metadata.namespace, the fields that name the pod the
+// sidecar runs in. Without them the labeler exits at startup (empty pod name)
+// or labels a pod in "default" whatever namespace it was deployed into.
+func sidecarPodIdentityProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", dir, err)
+	}
+
+	var problems []string
+	sidecars := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		doc, err := readPodSpecManifest(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, 0, fmt.Errorf("parse manifest: %w", err)
+		}
+		for _, c := range doc.Spec.Template.Spec.Containers {
+			if !strings.Contains(c.Image, sidecarImage) {
+				continue
+			}
+			sidecars++
+			problems = append(problems, labelerPodIdentityProblems(entry.Name(), c.Name, c.Command, c.Args, c.Env)...)
+		}
+	}
+	return problems, sidecars, nil
+}
+
+// labelerPodIdentityProblems reports the pod-identity wiring of one labeler
+// container: it must not decide the pod through the flags (the manifests rely
+// on the env wiring, and a flag would let the two disagree), and it must
+// project both documented env variables from the field that names its own pod.
+func labelerPodIdentityProblems(manifest, container string, command, args []string, env []containerEnvVar) []string {
+	prefix := fmt.Sprintf("%s/%s", manifest, container)
+
+	var problems []string
+	for _, flagName := range containerFlagNames(sidecarImage, command, args) {
+		if flagName != podNameFlag && flagName != podNamespaceFlag {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf(
+			"%s: passes --%s, so the flag decides the pod identity while the %s/%s env wiring the manifests document can disagree with it",
+			prefix, flagName, envPodName, envPodNamespace))
+	}
+
+	for _, want := range []struct{ name, fieldPath, consequence string }{
+		{envPodName, podNameFieldPath, "an empty pod name is a fatal startup error"},
+		{envPodNamespace, podNamespaceFieldPath, fmt.Sprintf("the namespace silently falls back to %q whatever namespace the pod runs in", defaultPodNamespace)},
+	} {
+		path, found, projected := envFieldPath(env, want.name)
+		switch {
+		case !found:
+			problems = append(problems, fmt.Sprintf(
+				"%s: declares no %s env var, so the documented fallback finds nothing (%s)",
+				prefix, want.name, want.consequence))
+		case !projected:
+			problems = append(problems, fmt.Sprintf(
+				"%s: %s carries a literal value rather than a Downward API fieldRef, so it does not name this pod (%s)",
+				prefix, want.name, want.consequence))
+		case path != want.fieldPath:
+			problems = append(problems, fmt.Sprintf(
+				"%s: %s is projected from %q, want %q (the field naming this pod)",
+				prefix, want.name, path, want.fieldPath))
+		}
+	}
+	return problems
+}
+
+// envFieldPath returns the Downward API field path an env var is projected
+// from. found reports whether the variable is declared at all, and projected
+// whether it comes from a fieldRef rather than a literal value: a literal value
+// gives the binary some other pod's identity, so it is not the wiring that
+// resolvePodIdentity needs.
+func envFieldPath(env []containerEnvVar, name string) (path string, found, projected bool) {
+	for _, e := range env {
+		if e.Name != name {
+			continue
+		}
+		return e.ValueFrom.FieldRef.FieldPath, true, e.ValueFrom.FieldRef.FieldPath != ""
+	}
+	return "", false, false
 }
 
 // sidecarContainer is one labeler container found in a manifest, together with
