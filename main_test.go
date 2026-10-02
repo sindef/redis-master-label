@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -1828,6 +1829,33 @@ func TestWorkflowGoToolchainProblems_PinnedAndUnpinnedSteps(t *testing.T) {
 	joined := strings.Join(problems, "\n")
 	if len(problems) != 1 || !strings.Contains(joined, "go-version: 1.23") {
 		t.Fatalf("problems = %v, want exactly one, naming the explicit go-version pin", problems)
+	}
+}
+
+// ci_check_comments.py is the offline Python guard CI runs right after
+// gofmt/migrations. Its setup-go scan is indent-aware: a step's own `with:`
+// block ends at the first content line indented no deeper than the step's
+// `uses:` line, so a following step's `run:` text (for example a shell line
+// mentioning go-version) is never read as that step's second version source,
+// while a real `go-version:` input on the setup-go step itself still fails.
+// The workflow fixtures replaying those shapes live next to the checker
+// (harness.py, which CI runs right after it); a Go test can only rerun them
+// where a local python exists.
+func TestCiCheckCommentsSetupGoScanIsStepAware(t *testing.T) {
+	var python string
+	for _, candidate := range []string{"python3", "python"} {
+		if found, err := exec.LookPath(candidate); err == nil {
+			python = found
+			break
+		}
+	}
+	if python == "" {
+		t.Skip("no local python; native CI runs harness.py directly")
+	}
+
+	out, err := exec.Command(python, "harness.py").CombinedOutput()
+	if err != nil {
+		t.Fatalf("python harness.py: %v\n%s", err, out)
 	}
 }
 

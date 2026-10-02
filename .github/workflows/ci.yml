@@ -50,13 +50,17 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # The workflows are YAML the CI engine parses after this run; the only
-      # Python file in the repository exists to sanity-check them without a
-      # YAML library (setup-go version source, tabs, leftover gc tokens). An
+      # The workflows are YAML the CI engine parses after this run; the
+      # Python files here sanity-check them without a YAML library (setup-go
+      # version source, tabs, leftover gc tokens). An
       # orphaned checker with no FAIL exit path cannot guard anything, so CI
-      # runs it and propagates its exit status.
+      # runs it and propagates its exit status; harness.py replays the
+      # checker's workflow fixtures so its setup-go scan stays step-aware (a
+      # later step is never read as a second version source).
       - name: Verify TestYamlBlockIndents
-        run: python3 ci_check_comments.py
+        run: |
+          python3 ci_check_comments.py
+          python3 harness.py
 
       - name: Build
         run: go build ./...
