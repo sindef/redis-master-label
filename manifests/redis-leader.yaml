@@ -47,6 +47,29 @@ spec:
         - --label-key=redis-role
         - --label-value=master
         - --check-interval=10s
+        # Same as deployment-example.yaml: the documented /healthz endpoint
+        # (main.go binds --health-port 8080) is polled by a liveness and a
+        # readiness probe, so a labeler whose Redis became unreachable is
+        # restarted instead of staying Running with a stale redis-role label.
+        # TestManifestSidecarsDeclareHealthProbes fails when the health port is
+        # declared without a probe polling /healthz on it.
+        ports:
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
         # Same as deployment-example.yaml: the labeler needs no privileges
         # (it only reads Redis and calls the Kubernetes API with its mounted
         # credentials), so it runs as the image's non-root uid, cannot write

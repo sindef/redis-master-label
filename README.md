@@ -155,6 +155,7 @@ Key points for the deployment:
 - Inject Redis connection info via args (address, TLS) and the credential via the `REDIS_PASSWORD` env var from a Secret (see "Example usage in a pod").
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
+- Expose the health port the labeler is told to listen on and poll `/healthz` from a liveness and a readiness probe (see "Health Check Endpoint"); both example deployments do.
 - Run the labeler unprivileged (see "Running unprivileged" below).
 
 ### Running unprivileged
@@ -241,11 +242,45 @@ Example:
 curl http://localhost:8080/healthz
 ```
 
+Both example deployments wire that endpoint into the kubelet. The
+`redis-master-label` container in `manifests/deployment-example.yaml` and
+`manifests/redis-leader.yaml` declares `containerPort: 8080` (named `health`)
+and polls it with a `livenessProbe` and a `readinessProbe`:
+
+```yaml
+ports:
+- name: health
+  containerPort: 8080
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  periodSeconds: 10
+```
+
+The liveness probe restarts the labeler after three failing polls, so a sidecar
+whose Redis became unreachable — or whose health listener died — is restarted
+instead of sitting `Running` with a stale `redis-role` label; the readiness
+probe takes the pod out of Service endpoints while the endpoint answers 503.
+Declaring the port alone changes nothing: only a probe makes the kubelet poll
+the endpoint, so `TestManifestSidecarsDeclareHealthProbes` fails the build when
+a labeler container serves `/healthz` on `--health-port` without a probe
+targeting that path and port (or without the matching `containerPort` entry).
+kubeconform only validates the manifest schema and never asks whether anything
+polls the port, which is how the wiring went missing. If you change
+`--health-port`, move the `containerPort` entry and both probe ports with it.
+
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
 - If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
-- The health check endpoint can be used by Kubernetes liveness/readiness probes.
+- The health check endpoint is what the example deployments' probes poll, so the kubelet restarts the sidecar when it turns unhealthy (see "Health Check Endpoint").
 
 ## License
 Released under the [MIT License](LICENSE). The container image advertises the

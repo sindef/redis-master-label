@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -834,6 +835,209 @@ func TestManifestRunAsUserMatchesImageUser(t *testing.T) {
 		if *c.SecurityContext.RunAsUser != uid {
 			t.Errorf("%s/%s: runAsUser = %d, want the image uid %d", c.Manifest, c.Name, *c.SecurityContext.RunAsUser, uid)
 		}
+	}
+}
+
+// Both example deployments must wire the documented /healthz endpoint into a
+// kubelet probe. The binary serves it on --health-port (README "Health Check
+// Endpoint") and answers 503 after three consecutive Redis failures, but
+// kubeconform only validates the manifest schema and the flag test only reads
+// container args, so nothing else notices a sidecar that serves the endpoint
+// with no probe polling it: such a pod keeps reporting Running when its Redis
+// became unreachable, and nothing restarts or de-registers it.
+func TestManifestSidecarsDeclareHealthProbes(t *testing.T) {
+	wiring, err := sidecarHealthWiring(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wiring) == 0 {
+		t.Fatal("no sidecar container found in manifests: the health probe check ran against nothing")
+	}
+	if len(wiring) != 2 {
+		t.Fatalf("sidecar containers = %d, want the two example deployments", len(wiring))
+	}
+
+	for _, h := range wiring {
+		if h.LivenessProbe == nil || h.ReadinessProbe == nil {
+			t.Errorf("%s/%s: want both a livenessProbe and a readinessProbe on %s (port %s)", h.Manifest, h.Name, healthPath, h.HealthPort)
+		}
+		if err := healthProbeProblem(h); err != nil {
+			t.Errorf("%s/%s: %v", h.Manifest, h.Name, err)
+		}
+	}
+}
+
+// httpGetProbe builds an httpGet probe targeting one path and port, so the
+// fixtures below spell out only the field under test.
+func httpGetProbe(path string, port intstr.IntOrString) *containerProbe {
+	return &containerProbe{HTTPGet: &httpGetAction{Path: path, Port: port}}
+}
+
+// The wiring has to be read from the manifest, not assumed: the port comes from
+// --health-port, whose default is the one main.go registers. Setting the flag
+// in a manifest without moving the probes with it must be visible here.
+func TestHealthPortFromArgs(t *testing.T) {
+	command := []string{"/app/redis-master-label"}
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no flag uses the binary default", nil, healthPortDefault},
+		{"equals form", []string{"--health-port=9090"}, "9090"},
+		{"separate value form", []string{"--health-port", "9091"}, "9091"},
+		{"single dash", []string{"-health-port=9092"}, "9092"},
+		{"unrelated flags keep the default", []string{"--redis-addr=localhost:6379", "--check-interval=10s"}, healthPortDefault},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := healthPortFromArgs(command, tt.args); got != tt.want {
+				t.Fatalf("healthPortFromArgs(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+// The pre-fix shapes: a labeler that serves the health endpoint but declares no
+// port entry and/or no probe must be reported, and the wired shape must pass.
+func TestHealthProbeProblem_RegressionFixtures(t *testing.T) {
+	healthPort := []containerPort{{Name: "health", ContainerPort: 8080}}
+
+	tests := []struct {
+		name        string
+		health      sidecarHealth
+		wantErr     bool
+		wantInError string
+	}{
+		{
+			// The shape both example deployments had: /healthz served, no port
+			// entry, no probe.
+			name:        "no port entry and no probe",
+			health:      sidecarHealth{Name: "redis-master-label"},
+			wantErr:     true,
+			wantInError: "no livenessProbe or readinessProbe",
+		},
+		{
+			name:        "port declared without a probe",
+			health:      sidecarHealth{Name: "redis-master-label", Ports: healthPort},
+			wantErr:     true,
+			wantInError: "no livenessProbe or readinessProbe",
+		},
+		{
+			name:        "probe polls another path",
+			health:      sidecarHealth{Ports: healthPort, LivenessProbe: httpGetProbe("/health", intstr.FromInt(8080))},
+			wantErr:     true,
+			wantInError: "want \"/healthz\"",
+		},
+		{
+			name:        "probe polls another port",
+			health:      sidecarHealth{Ports: healthPort, LivenessProbe: httpGetProbe(healthPath, intstr.FromInt(9090))},
+			wantErr:     true,
+			wantInError: "want 8080",
+		},
+		{
+			name:        "probe names an undeclared port",
+			health:      sidecarHealth{Ports: healthPort, LivenessProbe: httpGetProbe(healthPath, intstr.FromString("metrics"))},
+			wantErr:     true,
+			wantInError: "want 8080",
+		},
+		{
+			name:        "probe on a port no entry declares",
+			health:      sidecarHealth{Ports: []containerPort{{Name: "metrics", ContainerPort: 9090}}, LivenessProbe: httpGetProbe(healthPath, intstr.FromInt(9090))},
+			wantErr:     true,
+			wantInError: "no containerPort 8080",
+		},
+		{
+			name:        "probe with no httpGet",
+			health:      sidecarHealth{Ports: healthPort, LivenessProbe: &containerProbe{}},
+			wantErr:     true,
+			wantInError: "not an httpGet probe",
+		},
+		{
+			name:        "startup probe polls another path",
+			health:      sidecarHealth{Ports: healthPort, LivenessProbe: httpGetProbe(healthPath, intstr.FromInt(8080)), StartupProbe: httpGetProbe("/health", intstr.FromInt(8080))},
+			wantErr:     true,
+			wantInError: "startupProbe",
+		},
+		{
+			name:        "non-numeric --health-port",
+			health:      sidecarHealth{HealthPort: "http", Ports: healthPort, LivenessProbe: httpGetProbe(healthPath, intstr.FromInt(8080))},
+			wantErr:     true,
+			wantInError: "not a port number",
+		},
+		{
+			name:   "liveness probe naming the declared port",
+			health: sidecarHealth{Ports: healthPort, LivenessProbe: httpGetProbe(healthPath, intstr.FromString("health"))},
+		},
+		{
+			name:   "readiness probe alone",
+			health: sidecarHealth{Ports: healthPort, ReadinessProbe: httpGetProbe(healthPath, intstr.FromInt(8080))},
+		},
+		{
+			name:   "both probes, port as a string",
+			health: sidecarHealth{Ports: healthPort, LivenessProbe: httpGetProbe(healthPath, intstr.FromString("8080")), ReadinessProbe: httpGetProbe(healthPath, intstr.FromString("health"))},
+		},
+		{
+			name:   "custom --health-port probed on that port",
+			health: sidecarHealth{HealthPort: "9090", Ports: []containerPort{{Name: "health", ContainerPort: 9090}}, LivenessProbe: httpGetProbe(healthPath, intstr.FromInt(9090))},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.health.HealthPort == "" {
+				tt.health.HealthPort = healthPortDefault
+			}
+			err := healthProbeProblem(tt.health)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("healthProbeProblem(%+v) error = %v, wantErr %v", tt.health, err, tt.wantErr)
+			}
+			if tt.wantInError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantInError)) {
+				t.Fatalf("healthProbeProblem(%+v) error = %v, want it to mention %q", tt.health, err, tt.wantInError)
+			}
+		})
+	}
+}
+
+// The same failure mode read through the manifest parser: a labeler container
+// that declares the health port without a probe must be reported, and adding
+// the probe must clear it. This is the check that would have failed before the
+// fix.
+func TestManifestSidecarsDeclareHealthProbes_MissingProbeFails(t *testing.T) {
+	dir := t.TempDir()
+	withoutProbe := "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: redis\n        image: redis:7-alpine\n      - name: redis-master-label\n        image: ghcr.io/redis-master-label/redis-master-label:v0.1.0\n        command:\n        - /app/redis-master-label\n        ports:\n        - name: health\n          containerPort: 8080\n"
+	if err := os.WriteFile(filepath.Join(dir, "deployment-noprobe.yaml"), []byte(withoutProbe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wiring, err := sidecarHealthWiring(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wiring) != 1 {
+		t.Fatalf("sidecar containers = %d, want 1", len(wiring))
+	}
+	if err := healthProbeProblem(wiring[0]); err == nil {
+		t.Error("labeler declaring the health port without a probe accepted, want the missing-probe failure")
+	}
+
+	withProbe := withoutProbe + "        livenessProbe:\n          httpGet:\n            path: /healthz\n            port: health\n"
+	if err := os.WriteFile(filepath.Join(dir, "deployment-withprobe.yaml"), []byte(withProbe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "deployment-noprobe.yaml")); err != nil {
+		t.Fatal(err)
+	}
+
+	wiring, err = sidecarHealthWiring(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wiring) != 1 {
+		t.Fatalf("sidecar containers = %d, want 1", len(wiring))
+	}
+	if err := healthProbeProblem(wiring[0]); err != nil {
+		t.Errorf("probe in the manifest was not read back: %v", err)
 	}
 }
 

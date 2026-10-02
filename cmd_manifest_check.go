@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -19,10 +21,12 @@ import (
 // 2 and the pod CrashLoops. The test lives in main_test.go
 // (TestManifestFlagsDefined); this file holds the shared parsing helpers.
 //
-// The same file holds the readers for the other two things CI cannot see:
+// The same file holds the readers for the other things CI cannot see:
 // the sidecar containers' securityContext (main_test.go,
-// TestManifestSidecarsRunUnprivileged) and the USER the build file's final
-// stage selects (dockerfileFinalStageUser, TestDockerfileFinalStageRunsAsNonRootUser).
+// TestManifestSidecarsRunUnprivileged), the health endpoint wiring of those
+// containers (main_test.go, TestManifestSidecarsDeclareHealthProbes) and the
+// USER the build file's final stage selects (dockerfileFinalStageUser,
+// TestDockerfileFinalStageRunsAsNonRootUser).
 
 // manifestDir is where the example manifests live relative to the repo root.
 const manifestDir = "manifests"
@@ -47,9 +51,29 @@ type containerSecurityContext struct {
 	} `json:"capabilities"`
 }
 
-// podSpecManifest holds just the container command/args and securityContext.
-// Only fields present in the example manifests are decoded; manifests without
-// a Pod spec (like Services) simply have no containers.
+// containerPort is one entry of a container's ports list. The name is optional
+// in Kubernetes; probes may target either the number or the name.
+type containerPort struct {
+	Name          string `json:"name"`
+	ContainerPort int64  `json:"containerPort"`
+}
+
+// httpGetAction is the httpGet half of a probe. Port is an IntOrString because
+// a probe may name a containerPort entry ("health") or give the number.
+type httpGetAction struct {
+	Path string             `json:"path"`
+	Port intstr.IntOrString `json:"port"`
+}
+
+// containerProbe is one probe of a container, as far as the endpoint it polls
+// is concerned.
+type containerProbe struct {
+	HTTPGet *httpGetAction `json:"httpGet"`
+}
+
+// podSpecManifest holds just the container command/args, ports, probes and
+// securityContext. Only fields present in the example manifests are decoded;
+// manifests without a Pod spec (like Services) simply have no containers.
 type podSpecManifest struct {
 	Spec struct {
 		Template struct {
@@ -59,6 +83,10 @@ type podSpecManifest struct {
 					Image           string
 					Command         []string
 					Args            []string
+					Ports           []containerPort           `json:"ports"`
+					LivenessProbe   *containerProbe           `json:"livenessProbe"`
+					ReadinessProbe  *containerProbe           `json:"readinessProbe"`
+					StartupProbe    *containerProbe           `json:"startupProbe"`
 					SecurityContext *containerSecurityContext `json:"securityContext"`
 				}
 			}
@@ -243,6 +271,162 @@ func createsAccount(line string) bool {
 		}
 	}
 	return false
+}
+
+// healthPortDefault and healthPath mirror the binary's health endpoint:
+// main.go binds --health-port (default 8080) and serves /healthz there,
+// answering 503 after three consecutive Redis failures. A probe in an example
+// manifest has to poll exactly that endpoint, otherwise the probe answers
+// independently of the labeler's own health state.
+const (
+	healthPortDefault = "8080"
+	healthPath        = "/healthz"
+)
+
+// sidecarHealth is the health wiring of one labeler container: the port the
+// manifest tells the binary to listen on (--health-port, default 8080), the
+// containerPort entries it declares and its probes.
+type sidecarHealth struct {
+	Manifest       string
+	Name           string
+	HealthPort     string
+	Ports          []containerPort
+	LivenessProbe  *containerProbe
+	ReadinessProbe *containerProbe
+	StartupProbe   *containerProbe
+}
+
+// healthPortFromArgs returns the port the container tells the binary to listen
+// on. No --health-port argument means the flag default, which is the port the
+// manifest then has to probe. Both the `--health-port=8080` and the
+// `--health-port 8080` forms are read, because the flag package accepts both.
+func healthPortFromArgs(command, args []string) string {
+	all := append(append([]string{}, command...), args...)
+	port := healthPortDefault
+	for i, arg := range all {
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		if name == "health-port" && i+1 < len(all) {
+			port = all[i+1]
+			continue
+		}
+		if value, ok := strings.CutPrefix(name, "health-port="); ok {
+			port = value
+		}
+	}
+	return port
+}
+
+// healthProbeProblem returns why a labeler container is not wired to its own
+// health endpoint, or nil when it is. A container that serves /healthz but
+// declares no probe keeps reporting Running when its Redis became unreachable
+// (or when its health listener died), so the label on the pod goes stale and
+// nothing restarts or de-registers it. Declaring the port alone changes
+// nothing: only a probe makes the kubelet poll the endpoint, so both the
+// containerPort entry and a probe targeting it are required.
+func healthProbeProblem(h sidecarHealth) error {
+	port, err := strconv.Atoi(h.HealthPort)
+	if err != nil {
+		return fmt.Errorf("--health-port=%q is not a port number, so no probe can target the health endpoint", h.HealthPort)
+	}
+
+	if h.LivenessProbe == nil && h.ReadinessProbe == nil {
+		return fmt.Errorf("serves %s on port %s but declares no livenessProbe or readinessProbe: the kubelet never polls the endpoint, so a sidecar whose Redis became unreachable keeps reporting Running with a stale label", healthPath, h.HealthPort)
+	}
+
+	portName := ""
+	declared := false
+	for _, p := range h.Ports {
+		if p.ContainerPort == int64(port) {
+			declared = true
+			portName = p.Name
+		}
+	}
+	if !declared {
+		return fmt.Errorf("no containerPort %d entry: declare the port the health endpoint listens on so the pod spec documents it", port)
+	}
+
+	for _, ref := range []struct {
+		name  string
+		probe *containerProbe
+	}{
+		{"livenessProbe", h.LivenessProbe},
+		{"readinessProbe", h.ReadinessProbe},
+		{"startupProbe", h.StartupProbe},
+	} {
+		if ref.probe == nil {
+			continue
+		}
+		if ref.probe.HTTPGet == nil {
+			return fmt.Errorf("%s is not an httpGet probe: only an HTTP GET proves the %s listener answers", ref.name, healthPath)
+		}
+		if ref.probe.HTTPGet.Path != healthPath {
+			return fmt.Errorf("%s polls path %q, want %q: the binary serves its health endpoint only there", ref.name, ref.probe.HTTPGet.Path, healthPath)
+		}
+		if !probePortMatches(ref.probe.HTTPGet.Port, port, portName) {
+			return fmt.Errorf("%s polls port %q, want %d or the declared port name %q", ref.name, ref.probe.HTTPGet.Port.String(), port, portName)
+		}
+	}
+
+	return nil
+}
+
+// probePortMatches reports whether a probe's port target selects the health
+// port: the number itself (as an int or a string), or the name of the
+// containerPort entry declaring that number.
+func probePortMatches(target intstr.IntOrString, port int, portName string) bool {
+	switch target.Type {
+	case intstr.Int:
+		return int(target.IntValue()) == port
+	case intstr.String:
+		if n, err := strconv.Atoi(target.StrVal); err == nil {
+			return n == port
+		}
+		return portName != "" && target.StrVal == portName
+	}
+	return false
+}
+
+// sidecarHealthWiring returns the health wiring of every labeler container
+// across manifests/*.yaml, walking the same manifest set (and tolerating the
+// same non-Pod-spec documents) as sidecarContainers. Used by the health probe
+// regression test in main_test.go.
+func sidecarHealthWiring(dir string) ([]sidecarHealth, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var wiring []sidecarHealth
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		doc, err := readPodSpecManifest(path)
+		if err != nil {
+			return nil, fmt.Errorf("parse manifest: %w", err)
+		}
+		for _, c := range doc.Spec.Template.Spec.Containers {
+			if strings.Contains(c.Image, sidecarImage) {
+				wiring = append(wiring, sidecarHealth{
+					Manifest:       entry.Name(),
+					Name:           c.Name,
+					HealthPort:     healthPortFromArgs(c.Command, c.Args),
+					Ports:          c.Ports,
+					LivenessProbe:  c.LivenessProbe,
+					ReadinessProbe: c.ReadinessProbe,
+					StartupProbe:   c.StartupProbe,
+				})
+			}
+		}
+	}
+	return wiring, nil
 }
 
 // sidecarFlagUsages walks manifests/*.yaml and returns one entry per --flag
