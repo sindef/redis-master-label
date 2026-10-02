@@ -290,6 +290,57 @@ func attestationPermissionsProblemsIn(path, text string) []string {
 	return problems
 }
 
+// Offline workflow sanity scan: ci_check_comments.py checks the two workflow
+// files for what no YAML library is installed to catch - tab characters, the
+// indentation of `run: |` block bodies, every setup-go step's version source and
+// leftover GC-inspection tokens - and exits 1 on any FAIL line. A script nothing
+// invokes guards nothing: the reviewed defect was exactly that, the script
+// sitting in the repository while no job ran it, and its setup-go scan matching
+// `actions/setup-go@v5` while the workflows had moved to @v7, so the scan
+// inspected no step at all and still printed "ok". The CI step that runs it is
+// therefore part of the gate. Guard in main_test.go:
+// TestWorkflowsInvokeCiCheckComments.
+
+// ciCheckCommentsScript is the offline workflow scan CI must run.
+const ciCheckCommentsScript = "ci_check_comments.py"
+
+// ciCheckCommentsProblems returns one message when no workflow under dir invokes
+// the offline workflow scan. A line inside a comment does not count: a
+// commented-out step reports nothing, and a note about the script is not a run
+// of it.
+func ciCheckCommentsProblems(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if strings.Contains(trimmed, ciCheckCommentsScript) {
+				return nil, nil
+			}
+		}
+	}
+
+	return []string{fmt.Sprintf(
+		"%s: no workflow runs %s, so the offline workflow sanity scan never runs and the file is an orphan script again",
+		dir, ciCheckCommentsScript)}, nil
+}
+
 // Module-graph status check: GitHub keys a required status check on the name of
 // the job that reported it, not on the steps that did the work. Branch
 // protection on this repository requires the `update-go_modules-graph` check, so

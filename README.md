@@ -64,6 +64,15 @@ reporting, and every pull request then waits on a check that can no longer
 arrive. `TestWorkflowsReportModuleGraphCheck` fails when the job is dropped,
 renamed, commented out, or left without its graph commands.
 
+The workflow files themselves are checked too, offline: CI's "Verify
+TestYamlBlockIndents" step runs `python3 ci_check_comments.py`, which fails the
+run (exit 1) on a tab character, a `run: |` body at the wrong depth, an
+`actions/setup-go` step whose version source is not `go-version-file: go.mod` or
+that adds a second `go-version` pin whatever major the action is pinned to, and
+on a leftover GC-inspection token. `TestWorkflowsInvokeCiCheckComments` fails
+the pull request when no workflow runs it, so the script cannot go back to being
+an orphan that inspects nothing and reports `ok`.
+
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
 ## Container build

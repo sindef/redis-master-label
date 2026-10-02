@@ -47,6 +47,18 @@ jobs:
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
 
+      # The workflow files are configuration this job depends on, so they get a
+      # check of their own. It is an offline script rather than a YAML library
+      # because no job installs one and these two files are small enough to scan
+      # with regexes; the script prints a FAIL line and exits 1 for a tab
+      # character, a block-scalar body at the wrong depth, a setup-go step
+      # without `go-version-file: go.mod` (or with a second `go-version` pin,
+      # whichever @vN the action carries) and a leftover GC-inspection token.
+      # TestWorkflowsInvokeCiCheckComments fails the pull request when this step
+      # is dropped, so the script cannot become an orphan again.
+      - name: Verify TestYamlBlockIndents
+        run: python3 ci_check_comments.py
+
       - name: Vet
         run: go vet ./...
 

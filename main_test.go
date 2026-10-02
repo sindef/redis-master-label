@@ -1988,3 +1988,76 @@ func TestModuleGraphJobProblems_RegressionFixtures(t *testing.T) {
 		})
 	}
 }
+
+// The offline workflow scan is a gate only while CI runs it: the reviewed defect
+// was ci_check_comments.py sitting in the repository as an orphan while its
+// setup-go regex matched `actions/setup-go@v5` and the workflows had moved to
+// @v7, so the scan inspected no step at all, printed "ok" and the run stayed
+// green. The real workflows must invoke it.
+func TestWorkflowsInvokeCiCheckComments(t *testing.T) {
+	problems, err := ciCheckCommentsProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatalf("ciCheckCommentsProblems: %v", err)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The workflow shapes that would silence the scan again: no step running it, a
+// mention in a comment, and a commented-out step must all be reported, while a
+// step that runs `python3 ci_check_comments.py` must pass.
+func TestCiCheckCommentsProblems_RegressionFixtures(t *testing.T) {
+	tests := []struct {
+		name     string
+		workflow string
+		want     bool
+	}{
+		{
+			name:     "no workflow runs the scan",
+			workflow: "jobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			want:     true,
+		},
+		{
+			name:     "scan named only in a comment",
+			workflow: "# the scan lives in ci_check_comments.py\njobs:\n  go:\n    runs-on: ubuntu-latest\n",
+			want:     true,
+		},
+		{
+			name:     "scan commented out as a step",
+			workflow: "jobs:\n  go:\n    steps:\n#      - run: python3 ci_check_comments.py\n      - uses: actions/checkout@v4\n",
+			want:     true,
+		},
+		{
+			name:     "step runs the scan",
+			workflow: "jobs:\n  go:\n    steps:\n      - name: Verify TestYamlBlockIndents\n        run: python3 ci_check_comments.py\n",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, err := ciCheckCommentsProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.want {
+				if len(problems) == 0 {
+					t.Fatal("workflow that would leave the offline scan unrun accepted, want a problem")
+				}
+				if !strings.Contains(strings.Join(problems, "\n"), ciCheckCommentsScript) {
+					t.Fatalf("problems = %v, want one naming %s", problems, ciCheckCommentsScript)
+				}
+				return
+			}
+			if len(problems) != 0 {
+				t.Fatalf("problems = %v, want none", problems)
+			}
+		})
+	}
+}
