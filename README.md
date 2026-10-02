@@ -49,7 +49,7 @@ job prints `go version` next to the declared version, so the compiler running
 `gofmt`, `go vet`, `go build` and `go test` is the one the module file names.
 The container build is held to the same version: the build file's builder stage
 must be a `golang` base image on the same MAJOR.MINOR line
-(`FROM golang:1.26-alpine` for `go 1.26.0`), which
+(`FROM golang:1.27-alpine` for `go 1.27.0`), which
 `TestDockerfileBuilderToolchainMatchesGoMod` and CI's "Check builder toolchain
 matches go.mod" step enforce. Bump the `go` directive and that image tag in the
 same change.
