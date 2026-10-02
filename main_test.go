@@ -422,6 +422,158 @@ func TestResolveRedisPassword(t *testing.T) {
 	}
 }
 
+// The reviewed test_gap: --redis-tls and --redis-tls-skip-verify had no
+// coverage. redisOptionsFromFlags is the sole place the Redis connection
+// options are built, so a table over the four flag combinations pins the
+// documented behaviour (README "Configuration" and "Operational notes"): no
+// TLS config at all while --redis-tls is off, also when --redis-tls-skip-verify
+// is set, and a TLS config whose InsecureSkipVerify follows
+// --redis-tls-skip-verify only when TLS is on.
+func TestRedisOptionsFromFlags_TLS(t *testing.T) {
+	origAddr, origPassword := *redisAddr, *redisPassword
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*redisAddr, *redisPassword = origAddr, origPassword
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*redisAddr = "redis.example.com:6380"
+	*redisPassword = "from-flag"
+
+	tests := []struct {
+		name          string
+		enableTLS     bool
+		skipVerify    bool
+		wantErr       bool
+		wantTLSConfig bool
+		wantInsecure  bool
+	}{
+		{
+			name:          "tls off, skip-verify off: no TLS config",
+			enableTLS:     false,
+			skipVerify:    false,
+			wantTLSConfig: false,
+		},
+		{
+			// Rejected as the invalid combination: the connection stays
+			// plaintext and no options are built at all.
+			name:       "tls off with skip-verify: rejected, no options",
+			enableTLS:  false,
+			skipVerify: true,
+			wantErr:    true,
+		},
+		{
+			name:          "tls on, verify enabled",
+			enableTLS:     true,
+			skipVerify:    false,
+			wantTLSConfig: true,
+			wantInsecure:  false,
+		},
+		{
+			name:          "tls on, skip verify",
+			enableTLS:     true,
+			skipVerify:    true,
+			wantTLSConfig: true,
+			wantInsecure:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*redisTLS = tt.enableTLS
+			*redisTLSSkipVerify = tt.skipVerify
+
+			opts, err := redisOptionsFromFlags()
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("redisOptionsFromFlags accepted --redis-tls-skip-verify without --redis-tls, want an error")
+				}
+				if opts != nil {
+					t.Errorf("options = %+v, want nil for the rejected combination", opts)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("redisOptionsFromFlags: %v", err)
+			}
+
+			if tt.wantTLSConfig {
+				if opts.TLSConfig == nil {
+					t.Fatal("TLSConfig not set, want a TLS config for the Redis connection")
+				}
+				if opts.TLSConfig.InsecureSkipVerify != tt.wantInsecure {
+					t.Fatalf("TLSConfig.InsecureSkipVerify = %v, want %v",
+						opts.TLSConfig.InsecureSkipVerify, tt.wantInsecure)
+				}
+			} else if opts.TLSConfig != nil {
+				t.Fatalf("TLSConfig = %+v, want nil: TLS must stay off unless --redis-tls is set", opts.TLSConfig)
+			}
+
+			if opts.Addr != *redisAddr {
+				t.Errorf("Addr = %q, want %q", opts.Addr, *redisAddr)
+			}
+			if opts.Password != *redisPassword {
+				t.Errorf("Password = %q, want %q", opts.Password, *redisPassword)
+			}
+		})
+	}
+}
+
+// Both TLS flags must be registered with their documented `false` default.
+// A default flipped to true would silently run TLS against plaintext servers
+// in every pod whose manifest args name no TLS flag at all.
+func TestRedisTLSFlagsRegistered(t *testing.T) {
+	for _, flagName := range []string{"redis-tls", "redis-tls-skip-verify"} {
+		f := flag.CommandLine.Lookup(flagName)
+		if f == nil {
+			t.Fatalf("--%s is not registered in flag.CommandLine", flagName)
+		}
+		if f.DefValue != "false" {
+			t.Errorf("--%s default = %q, want \"false\"", flagName, f.DefValue)
+		}
+	}
+}
+
+// --redis-tls-skip-verify only means something with --redis-tls: without TLS
+// the connection is plaintext and the skip-verify request silently does
+// nothing, while the operator believes it is applied. The decision taken here
+// is to reject such a startup with an error instead of a warning.
+func TestValidateRedisTLSFlags(t *testing.T) {
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	tests := []struct {
+		name       string
+		enableTLS  bool
+		skipVerify bool
+		wantErr    bool
+	}{
+		{"both off (defaults)", false, false, false},
+		{"tls on, skip-verify off", true, false, false},
+		{"tls on, skip-verify on", true, true, false},
+		{"skip-verify without tls", false, true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*redisTLS = tt.enableTLS
+			*redisTLSSkipVerify = tt.skipVerify
+
+			err := validateRedisTLSFlags()
+
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("validateRedisTLSFlags() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "--redis-tls") {
+				t.Errorf("error %q does not name --redis-tls", err)
+			}
+		})
+	}
+}
+
 // The released image: both example sidecars must run exactly this reference.
 const releaseImage = "ghcr.io/redis-master-label/redis-master-label:v0.1.0"
 
@@ -1568,5 +1720,271 @@ func TestValidateCheckInterval(t *testing.T) {
 	*checkInterval = 10 * time.Second
 	if err := validateCheckInterval(); err != nil {
 		t.Errorf("positive --check-interval rejected: %v", err)
+	}
+}
+
+// Version sources are counted per setup-go step, not per file. The reviewed
+// defect shape: two setup-go steps where only the first declares
+// `go-version-file: go.mod` - the whole-file count of `go-version-file:` lines
+// saw one line and stayed quiet, while the second step (only `cache: true`)
+// silently installed the runner's default toolchain. The unpinned step must be
+// reported, at the line of its own `uses:`.
+func TestWorkflowGoToolchainProblems_SecondSetupGoStepWithoutSource(t *testing.T) {
+	dir := t.TempDir()
+	workflow := "jobs:\n" +
+		"  build:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n" +
+		"  second:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          cache: true\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 2 {
+		t.Fatalf("setup-go steps = %d, want 2", setupGoSteps)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want exactly one, for the unpinned step", problems)
+	}
+	if !strings.Contains(problems[0], "declares no go-version-file") {
+		t.Fatalf("problem %q does not name the missing version source", problems[0])
+	}
+	// Line 9 is the second step's `uses: actions/setup-go@v5` line.
+	if !strings.Contains(problems[0], "ci.yml:9") {
+		t.Fatalf("problem %q does not point at the unpinned step's uses line", problems[0])
+	}
+}
+
+// The counting must not be satisfied by anything but the setup-go step itself:
+// a `go-version-file:` line in a step that runs another action tells setup-go
+// nothing, so the setup-go step stays unpinned and must be reported.
+func TestWorkflowGoToolchainProblems_StraySourceInAnotherStep(t *testing.T) {
+	dir := t.TempDir()
+	workflow := "jobs:\n" +
+		"  build:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          cache: true\n" +
+		"      - uses: actions/cache@v4\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 1 {
+		t.Fatalf("setup-go steps = %d, want 1", setupGoSteps)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want exactly one, for the unpinned setup-go step", problems)
+	}
+	if !strings.Contains(problems[0], "declares no go-version-file") {
+		t.Fatalf("problem %q does not name the missing version source", problems[0])
+	}
+}
+
+// A pinned setup-go step next to an unpinned one must not drag the pinned step
+// into the report, and the file-level count of problems equals the number of
+// unpinned steps, not one.
+func TestWorkflowGoToolchainProblems_PinnedAndUnpinnedSteps(t *testing.T) {
+	dir := t.TempDir()
+	workflow := "jobs:\n" +
+		"  one:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version-file: go.mod\n" +
+		"  two:\n" +
+		"    steps:\n" +
+		"      - uses: actions/setup-go@v5\n" +
+		"        with:\n" +
+		"          go-version: \"1.23\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, setupGoSteps, err := workflowGoToolchainProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupGoSteps != 2 {
+		t.Fatalf("setup-go steps = %d, want 2", setupGoSteps)
+	}
+	joined := strings.Join(problems, "\n")
+	if len(problems) != 1 || !strings.Contains(joined, "go-version: 1.23") {
+		t.Fatalf("problems = %v, want exactly one, naming the explicit go-version pin", problems)
+	}
+}
+
+// A workflow that pushes images with provenance/SBOM attestations needs the
+// permissions docker/build-push-action documents for that push: id-token: write
+// (keyless signing via the workflow's OIDC identity) and attestations: write
+// (upload through the GitHub attestations API). Without them the release job
+// fails or silently publishes unattested images, so the README's claim about
+// image attestations would be unprovable. The real workflows must pass, and a
+// workflow shaped like the pre-fix release.yml must be rejected.
+func TestWorkflowsDeclareAttestationPermissions(t *testing.T) {
+	problems, err := attestationPermissionsProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatalf("attestationPermissionsProblems: %v", err)
+	}
+	if len(problems) != 0 {
+		t.Fatalf("attestation permissions problems:\n%s", strings.Join(problems, "\n"))
+	}
+}
+
+func TestWorkflowsDeclareAttestationPermissions_MissingWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	preFix := `name: Release
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish image
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          provenance: mode=max
+          sbom: true
+`
+	path := filepath.Join(dir, "release.yml")
+	if err := os.WriteFile(path, []byte(preFix), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	problems, err := attestationPermissionsProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) == 0 {
+		t.Fatal("workflow with attestations but no id-token/attestations write accepted")
+	}
+}
+
+// GitHub keys a required status check on the name of the job that reported it,
+// not on the steps that did the work, and branch protection requires the
+// `update-go_modules-graph` check here. The module-graph gate must therefore
+// stay a job of its own: folding its commands into another job keeps running
+// them while the required context stops reporting, and every pull request then
+// waits on a check that can no longer arrive (the reviewed conflict: the job was
+// gone from .github/workflows/ci.yml while the check was still required).
+func TestWorkflowsReportModuleGraphCheck(t *testing.T) {
+	problems, jobs, err := moduleGraphJobProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Fatalf("%s: %d workflows declare the %s job, want exactly 1: the required status check must report once per commit", ciWorkflowDir, jobs, moduleGraphJobName)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The failure modes at workflow level: the missing job (the reviewed shape and
+// the current one, where the same commands live inside another job), a job that
+// no longer rebuilds the graph, a job without the non-empty assertion, a
+// commented-out job and a renamed job must all be reported, while the required
+// job with its two commands must pass.
+func TestModuleGraphJobProblems_RegressionFixtures(t *testing.T) {
+	graphSteps := "      - name: Update go_modules graph\n        run: |\n          go mod graph > go_modules_graph.txt\n          test -s go_modules_graph.txt\n"
+
+	tests := []struct {
+		name          string
+		workflow      string
+		wantJobs      int
+		wantProblem   bool
+		wantSubstring string
+	}{
+		{
+			name:          "reviewed pre-repair shape: no module-graph job",
+			workflow:      "jobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			wantProblem:   true,
+			wantSubstring: moduleGraphJobName,
+		},
+		{
+			name:          "graph commands folded into another job",
+			workflow:      "jobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n" + graphSteps,
+			wantProblem:   true,
+			wantSubstring: moduleGraphJobName,
+		},
+		{
+			name:          "job declared without rebuilding the graph",
+			workflow:      "jobs:\n  " + moduleGraphJobName + ":\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			wantJobs:      1,
+			wantProblem:   true,
+			wantSubstring: "does not run `go mod graph`",
+		},
+		{
+			name:          "job declared without the non-empty assertion",
+			workflow:      "jobs:\n  " + moduleGraphJobName + ":\n    runs-on: ubuntu-latest\n    steps:\n      - name: Update go_modules graph\n        run: go mod graph > go_modules_graph.txt\n",
+			wantJobs:      1,
+			wantProblem:   true,
+			wantSubstring: "test -s",
+		},
+		{
+			name:          "job declared only in a comment",
+			workflow:      "jobs:\n#  " + moduleGraphJobName + ":\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			wantProblem:   true,
+			wantSubstring: moduleGraphJobName,
+		},
+		{
+			name:        "required job with both commands",
+			workflow:    "jobs:\n  " + moduleGraphJobName + ":\n    name: " + moduleGraphJobName + "\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n" + graphSteps,
+			wantJobs:    1,
+			wantProblem: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, jobs, err := moduleGraphJobProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if jobs != tt.wantJobs {
+				t.Errorf("jobs declaring %s = %d, want %d", moduleGraphJobName, jobs, tt.wantJobs)
+			}
+			if !tt.wantProblem {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("workflow that would stop reporting the required status check accepted, want a problem")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantSubstring) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantSubstring)
+			}
+		})
 	}
 }
