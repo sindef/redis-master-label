@@ -73,6 +73,15 @@ jobs:
           go mod verify
           git diff --exit-code -- go.mod go.sum
 
+      # The module graph must be producible from go.mod/go.sum alone: this walks
+      # every module the build resolves and prints the JSON graph (discarded
+      # here; `-e` reports a module that cannot be loaded instead of failing).
+      # The `update-go_modules-graph` job below runs the same graph inside a job
+      # of its own, because that job name is the status check branch protection
+      # waits for.
+      - name: Export Go modules graph
+        run: go list -m -json -e all > /dev/null
+
       - name: Validate manifests
         run: |
           docker run --rm -v "$PWD":/workdir ghcr.io/yannh/kubeconform:v0.6.7 \
@@ -204,3 +213,29 @@ jobs:
             echo "org.opencontainers.image.licenses = '$got' on the shipping image, want '$want' (is the LABEL in the final stage?)" >&2
             exit 1
           fi
+
+  # GitHub keys a required status check on the name of the job that reported it,
+  # not on the steps that did the work, and branch protection requires the
+  # `update-go_modules-graph` check here. So the module-graph gate keeps a job of
+  # its own: it previously lived inside another job, and folding the workflow's
+  # jobs together kept running the same commands while the required context
+  # stopped reporting, leaving every pull request waiting on a check that could
+  # no longer arrive. The job rebuilds the graph from go.mod/go.sum and fails
+  # when the graph cannot be produced (for example when go.sum is missing an
+  # entry). TestWorkflowsReportModuleGraphCheck fails the pull request when this
+  # job is dropped, renamed or left without its graph commands.
+  update-go_modules-graph:
+    name: update-go_modules-graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Update go_modules graph
+        run: |
+          go mod graph > go_modules_graph.txt
+          test -s go_modules_graph.txt

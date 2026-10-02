@@ -1775,3 +1775,108 @@ jobs:
 		t.Fatal("workflow with attestations but no id-token/attestations write accepted")
 	}
 }
+
+// GitHub keys a required status check on the name of the job that reported it,
+// not on the steps that did the work, and branch protection requires the
+// `update-go_modules-graph` check here. The module-graph gate must therefore
+// stay a job of its own: folding its commands into another job keeps running
+// them while the required context stops reporting, and every pull request then
+// waits on a check that can no longer arrive (the reviewed conflict: the job was
+// gone from .github/workflows/ci.yml while the check was still required).
+func TestWorkflowsReportModuleGraphCheck(t *testing.T) {
+	problems, jobs, err := moduleGraphJobProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Fatalf("%s: %d workflows declare the %s job, want exactly 1: the required status check must report once per commit", ciWorkflowDir, jobs, moduleGraphJobName)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The failure modes at workflow level: the missing job (the reviewed shape and
+// the current one, where the same commands live inside another job), a job that
+// no longer rebuilds the graph, a job without the non-empty assertion, a
+// commented-out job and a renamed job must all be reported, while the required
+// job with its two commands must pass.
+func TestModuleGraphJobProblems_RegressionFixtures(t *testing.T) {
+	graphSteps := "      - name: Update go_modules graph\n        run: |\n          go mod graph > go_modules_graph.txt\n          test -s go_modules_graph.txt\n"
+
+	tests := []struct {
+		name          string
+		workflow      string
+		wantJobs      int
+		wantProblem   bool
+		wantSubstring string
+	}{
+		{
+			name:          "reviewed pre-repair shape: no module-graph job",
+			workflow:      "jobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			wantProblem:   true,
+			wantSubstring: moduleGraphJobName,
+		},
+		{
+			name:          "graph commands folded into another job",
+			workflow:      "jobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n" + graphSteps,
+			wantProblem:   true,
+			wantSubstring: moduleGraphJobName,
+		},
+		{
+			name:          "job declared without rebuilding the graph",
+			workflow:      "jobs:\n  " + moduleGraphJobName + ":\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			wantJobs:      1,
+			wantProblem:   true,
+			wantSubstring: "does not run `go mod graph`",
+		},
+		{
+			name:          "job declared without the non-empty assertion",
+			workflow:      "jobs:\n  " + moduleGraphJobName + ":\n    runs-on: ubuntu-latest\n    steps:\n      - name: Update go_modules graph\n        run: go mod graph > go_modules_graph.txt\n",
+			wantJobs:      1,
+			wantProblem:   true,
+			wantSubstring: "test -s",
+		},
+		{
+			name:          "job declared only in a comment",
+			workflow:      "jobs:\n#  " + moduleGraphJobName + ":\n  go:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+			wantProblem:   true,
+			wantSubstring: moduleGraphJobName,
+		},
+		{
+			name:        "required job with both commands",
+			workflow:    "jobs:\n  " + moduleGraphJobName + ":\n    name: " + moduleGraphJobName + "\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n" + graphSteps,
+			wantJobs:    1,
+			wantProblem: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, jobs, err := moduleGraphJobProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if jobs != tt.wantJobs {
+				t.Errorf("jobs declaring %s = %d, want %d", moduleGraphJobName, jobs, tt.wantJobs)
+			}
+			if !tt.wantProblem {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("workflow that would stop reporting the required status check accepted, want a problem")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantSubstring) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantSubstring)
+			}
+		})
+	}
+}
