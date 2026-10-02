@@ -13,7 +13,7 @@ jobs:
     name: Build and test (Go)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # One toolchain declaration only, and it is go.mod's. setup-go honours a
       # single version source: with both go-version and go-version-file set it
@@ -240,7 +240,7 @@ jobs:
     name: update-go_modules-graph
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v7
