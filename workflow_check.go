@@ -155,3 +155,81 @@ func workflowInput(line string) (key, value string, ok bool) {
 	}
 	return key, value, true
 }
+
+// attestationActionsStr and the two permission keys below name the documented
+// permission set docker/build-push-action needs when a push requests
+// provenance/SBOM attestations: the attestation manifests are signed and
+// uploaded with this workflow's OIDC identity, so the job needs id-token: write
+// and attestations: write. The reviewed defect was release.yml asking for
+// provenance: mode=max and sbom: true on push while the permissions block named
+// only contents: read and packages: write, so the README's claim about image
+// attestations could not be satisfied on tag push.
+const attestationActionStr = "docker/build-push-action"
+
+const (
+	idTokenPermission   = "id-token"
+	attestPermission    = "attestations"
+	writePermissionName = "write"
+)
+
+// attestationPermissionsProblems returns one message per workflow under dir
+// that pushes images with provenance/SBOM attestations but does not declare
+// id-token: write and attestations: write. A workflow that never requests
+// attestations is not flagged.
+func attestationPermissionsProblems(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var problems []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		problems = append(problems, attestationPermissionsProblemsIn(path, string(data))...)
+	}
+	return problems, nil
+}
+
+// attestationPermissionsProblemsIn scans one workflow's text.
+func attestationPermissionsProblemsIn(path, text string) []string {
+	var problems []string
+	attestationInputs := 0
+	idToken := false
+	attests := false
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(line, attestationActionStr) {
+			continue
+		}
+		key, value, ok := workflowInput(line)
+		if !ok {
+			continue
+		}
+		switch key {
+		case "provenance", "sbom":
+			attestationInputs++
+		case idTokenPermission:
+			idToken = value == writePermissionName
+		case attestPermission:
+			attests = value == writePermissionName
+		}
+	}
+	if attestationInputs > 0 && (!idToken || !attests) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: %d provenance/SBOM attestation inputs but id-token: write=%v, attestations: write=%v; build-push-action's documented push permission set is the pair of those writes",
+			path, attestationInputs, idToken, attests))
+	}
+	return problems
+}

@@ -1722,3 +1722,56 @@ func TestValidateCheckInterval(t *testing.T) {
 		t.Errorf("positive --check-interval rejected: %v", err)
 	}
 }
+
+// A workflow that pushes images with provenance/SBOM attestations needs the
+// permissions docker/build-push-action documents for that push: id-token: write
+// (keyless signing via the workflow's OIDC identity) and attestations: write
+// (upload through the GitHub attestations API). Without them the release job
+// fails or silently publishes unattested images, so the README's claim about
+// image attestations would be unprovable. The real workflows must pass, and a
+// workflow shaped like the pre-fix release.yml must be rejected.
+func TestWorkflowsDeclareAttestationPermissions(t *testing.T) {
+	problems, err := attestationPermissionsProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatalf("attestationPermissionsProblems: %v", err)
+	}
+	if len(problems) != 0 {
+		t.Fatalf("attestation permissions problems:\n%s", strings.Join(problems, "\n"))
+	}
+}
+
+func TestWorkflowsDeclareAttestationPermissions_MissingWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	preFix := `name: Release
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish image
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          provenance: mode=max
+          sbom: true
+`
+	path := filepath.Join(dir, "release.yml")
+	if err := os.WriteFile(path, []byte(preFix), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	problems, err := attestationPermissionsProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) == 0 {
+		t.Fatal("workflow with attestations but no id-token/attestations write accepted")
+	}
+}
