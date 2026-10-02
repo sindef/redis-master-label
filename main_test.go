@@ -1239,6 +1239,61 @@ func TestWorkflowGoToolchainProblems_RegressionFixtures(t *testing.T) {
 	}
 }
 
+// The reviewed defect: release.yml asked build-push-action for
+// provenance/SBOM attestations while its permissions block granted only
+// contents: read and packages: write, so the check on attestation publishing
+// could no longer pass. A build-push step that requests `provenance` or
+// `sbom` must run under id-token: write (signing) and attestations: write
+// (pushing the manifests) or the release ships no attestation manifests.
+func TestWorkflowsDeclareAttestationPermissions(t *testing.T) {
+	problems, err := attestationPermissionsProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 0 {
+		t.Fatalf("workflows must back their provenance/SBOM requests with id-token/attestations writes, problems = %v", problems)
+	}
+}
+
+// TestWorkflowsDeclareAttestationPermissions_MissingWriteFails replays the
+// reviewed pre-fix release.yml shape: build-push with provenance/sbom alongside
+// a permissions block lacking the two attestation writes is rejected, with and
+// without each write.
+func TestWorkflowsDeclareAttestationPermissions_MissingWriteFails(t *testing.T) {
+	fixture := "permissions:\n  contents: read\n  packages: write\njobs:\n  publish:\n    steps:\n      - uses: docker/build-push-action@v7\n        with:\n          push: true\n          provenance: mode=max\n          sbom: true\n"
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "release.yml")
+	if err := os.WriteFile(path, []byte(fixture), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	problems, err := attestationPermissionsProblems(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 2 {
+		t.Fatalf("pre-fix release.yml accepted, problems = %v, want both writes flagged", problems)
+	}
+	joined := strings.Join(problems, "\n")
+	for _, want := range []string{"id-token: write", "attestations: write"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("problems = %v, want one naming %q", problems, want)
+		}
+	}
+
+	// Fixing the permissions silences the guard.
+	if err := os.WriteFile(path, []byte(strings.Replace(fixture,
+		"  packages: write\n", "  packages: write\n  id-token: write\n  attestations: write\n", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if problems, err = attestationPermissionsProblems(dir); err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 0 {
+		t.Fatalf("workflow with the attestation writes accepted wrongly, problems = %v", problems)
+	}
+}
+
 // The reviewed infra_drift: the build file's builder stage read
 // `FROM golang:1.27-alpine` while go.mod declared go 1.26.0. CI's gofmt, vet,
 // build and test run on the version setup-go installs from go.mod, so the

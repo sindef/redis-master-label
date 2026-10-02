@@ -132,6 +132,95 @@ func goModGoDirective(path string) (string, error) {
 	return "", fmt.Errorf("%s: no go directive declaring the toolchain version", path)
 }
 
+// Attestation permissions check: docker/build-push-action computes provenance
+// and SBOM attestations only when the job's token can write attestations and
+// sign for them. A workflow that asks for `provenance`/`sbom` without
+// `id-token: write` and `attestations: write` either fails the publish step or
+// silently ships no attestation manifests, so pushing the mode=max/SBOM lines
+// demands those two writes. Guard in main_test.go:
+// TestWorkflowsDeclareAttestationPermissions.
+
+// buildPushWritePermissions are the write permissions the publish step needs
+// before provenance/SBOM attestations reach the registry.
+const (
+	attestationsIDTokenPermission = "id-token"
+	attestationsWritePermission   = "attestations"
+)
+
+// attestationPermissionsProblemsIn reports every publish step whose
+// provenance/SBOM request is not backed by id-token: write and
+// attestations: write in the same workflow.
+func attestationPermissionsProblemsIn(path, text string) []string {
+	var problems []string
+	hasPush := false
+	pushLine := 0
+	hasProvenance := false
+	idTokenWrite := false
+	attestationsWrite := false
+	for i, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "docker/build-push-action") {
+			hasPush = true
+			pushLine = i + 1
+		}
+		key, value, ok := workflowInput(trimmed)
+		if !ok {
+			continue
+		}
+		switch key {
+		case "provenance", "sbom":
+			hasProvenance = true
+		case attestationsIDTokenPermission:
+			idTokenWrite = value == "write"
+		case attestationsWritePermission:
+			attestationsWrite = value == "write"
+		}
+	}
+	if hasPush && hasProvenance {
+		if !idTokenWrite {
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: build-push publishes provenance attestations but the workflow does not declare %s: write, so the attestation manifests cannot be signed or pushed",
+				path, pushLine, attestationsIDTokenPermission))
+		}
+		if !attestationsWrite {
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: build-push publishes attestations but the workflow does not declare %s: write, so the attestation manifests cannot be pushed",
+				path, pushLine, attestationsWritePermission))
+		}
+	}
+	return problems
+}
+
+// attestationPermissionsProblems aggregates attestationPermissionsProblemsIn
+// over the workflows under dir.
+func attestationPermissionsProblems(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var problems []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		problems = append(problems, attestationPermissionsProblemsIn(path, string(data))...)
+	}
+	sort.Strings(problems)
+	return problems, nil
+}
+
 // workflowInput splits a `key: value` YAML mapping line, dropping a trailing
 // comment and the quotes around the value. It reports ok=false for any line that
 // is not such a mapping entry, so step names, list items and `uses:` lines are

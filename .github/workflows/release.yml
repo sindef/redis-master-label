@@ -15,6 +15,11 @@ on:
 permissions:
   contents: read
   packages: write
+  # Provenance/SBOM attestations are signed and pushed by build-push-action:
+  # id-token signs them, attestations pushes the manifests. Without these two
+  # writes the request for `provenance`/`sbom` below publishes nothing.
+  id-token: write
+  attestations: write
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -69,9 +74,10 @@ jobs:
           tags: |
             ${{ steps.image.outputs.image }}:${{ github.ref_name }}
 
-      - name: Report digest in step summary
+      - name: Report digest and attestation manifests in step summary
         run: |
           echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
