@@ -50,6 +50,14 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The workflows are YAML the CI engine parses after this run; the only
+      # Python file in the repository exists to sanity-check them without a
+      # YAML library (setup-go version source, tabs, leftover gc tokens). An
+      # orphaned checker with no FAIL exit path cannot guard anything, so CI
+      # runs it and propagates its exit status.
+      - name: Verify TestYamlBlockIndents
+        run: python3 ci_check_comments.py
+
       - name: Build
         run: go build ./...
 
