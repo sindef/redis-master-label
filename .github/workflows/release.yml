@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
   packages: write
+  # docker/build-push-action's documented permission set for pushing images
+  # with provenance/SBOM attestations: the keyless signing and attestation
+  # upload go through this workflow's OIDC identity, so without these the
+  # attestation steps fail (or silently produce no attestations) on tag push.
+  id-token: write
+  attestations: write
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -24,7 +30,7 @@ jobs:
     name: Build and publish release image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
         with:
@@ -59,7 +65,7 @@ jobs:
 
       - name: Publish image with provenance and SBOM attestations
         id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -69,9 +75,12 @@ jobs:
           tags: |
             ${{ steps.image.outputs.image }}:${{ github.ref_name }}
 
-      - name: Report digest in step summary
+      - name: Report digest and attestations in step summary
         run: |
           echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          # Prove the attestations landed: buildx imagetools inspect shows the
+          # index entries for the provenance and SBOM attestation manifests.
+          docker buildx imagetools inspect "${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY" 2>&1
           echo '```' >> "$GITHUB_STEP_SUMMARY"

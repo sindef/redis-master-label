@@ -23,8 +23,8 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 Flags (all have sensible defaults):
 - `--redis-addr` (default `localhost:6379`)
 - `--redis-password` (default empty; falls back to the `REDIS_PASSWORD` env var when not set)
-- `--redis-tls` (default `false`)
-- `--redis-tls-skip-verify` (default `false`)
+- `--redis-tls` (default `false`; attaches a TLS config to the Redis connection)
+- `--redis-tls-skip-verify` (default `false`; sets `InsecureSkipVerify` on that TLS config, so only meaningful together with `--redis-tls`. Passing it without `--redis-tls` is an invalid combination, rejected at startup: without TLS the connection is plaintext and the request to skip verification would silently do nothing)
 - `--label-key` (default `redis-role`)
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
@@ -53,6 +53,16 @@ must be a `golang` base image on the same MAJOR.MINOR line
 `TestDockerfileBuilderToolchainMatchesGoMod` and CI's "Check builder toolchain
 matches go.mod" step enforce. Bump the `go` directive and that image tag in the
 same change.
+
+CI reports the module-graph gate as a job of its own: `update-go_modules-graph`
+rebuilds the graph from `go.mod`/`go.sum` (`go mod graph`, then a non-empty
+check) and fails when the graph cannot be produced, for example when `go.sum` is
+missing an entry. It stays a separate job because GitHub keys a required status
+check on the name of the job that reported it: folding those commands into
+another job keeps running them while the `update-go_modules-graph` context stops
+reporting, and every pull request then waits on a check that can no longer
+arrive. `TestWorkflowsReportModuleGraphCheck` fails when the job is dropped,
+renamed, commented out, or left without its graph commands.
 
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
@@ -88,8 +98,11 @@ Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
 the tag-push workflow runs `go vet` and the full test suite, then builds the
 image with `--build-arg VERSION=<tag>` and pushes exactly
 `ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
-name, `GITHUB_TOKEN` with `packages: write`). The image carries provenance and
-SBOM attestations, and the workflow's step summary reports the pushed digest.
+name, `GITHUB_TOKEN` with `packages: write`, plus the `id-token: write` and
+`attestations: write` permissions attestations need). The image carries provenance
+and SBOM attestations, and the workflow's step summary reports the pushed digest
+plus the `docker buildx imagetools inspect` output for it, so the attestation
+manifests are visible on every release run.
 Nothing floating (`:latest`) is ever published.
 
 ### Release checklist
@@ -231,7 +244,7 @@ curl http://localhost:8080/healthz
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
-- If using TLS, set `--redis-tls` and `--redis-tls-skip-verify` if required.
+- If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
 - The health check endpoint can be used by Kubernetes liveness/readiness probes.
 
 ## License
