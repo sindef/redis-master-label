@@ -41,7 +41,7 @@ updates:
   # Container base images in the repository's only build file, `Dockerfile`
   # (formerly named `Containerfile`). Dependabot's docker ecosystem only scans
   # Dockerfile file names, so the rename is what makes base-image bumps
-  # (for example `alpine:3.24`, `golang:1.26-alpine`) arrive as pull requests.
+  # (for example `alpine:3.24`, `golang:1.27-alpine`) arrive as pull requests.
   # A `golang` bump has to keep the go.mod `go` directive on the same MAJOR.MINOR
   # line: CI's "Check builder toolchain matches go.mod" step and
   # TestDockerfileBuilderToolchainMatchesGoMod fail the pull request when the
