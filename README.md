@@ -54,6 +54,16 @@ must be a `golang` base image on the same MAJOR.MINOR line
 matches go.mod" step enforce. Bump the `go` directive and that image tag in the
 same change.
 
+CI reports the module-graph gate as a job of its own: `update-go_modules-graph`
+rebuilds the graph from `go.mod`/`go.sum` (`go mod graph`, then a non-empty
+check) and fails when the graph cannot be produced, for example when `go.sum` is
+missing an entry. It stays a separate job because GitHub keys a required status
+check on the name of the job that reported it: folding those commands into
+another job keeps running them while the `update-go_modules-graph` context stops
+reporting, and every pull request then waits on a check that can no longer
+arrive. `TestWorkflowsReportModuleGraphCheck` fails when the job is dropped,
+renamed, commented out, or left without its graph commands.
+
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
 ## Container build

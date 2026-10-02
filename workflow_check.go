@@ -289,3 +289,116 @@ func attestationPermissionsProblemsIn(path, text string) []string {
 	}
 	return problems
 }
+
+// Module-graph status check: GitHub keys a required status check on the name of
+// the job that reported it, not on the steps that did the work. Branch
+// protection on this repository requires the `update-go_modules-graph` check, so
+// the module-graph gate has to stay a job of its own: folding its commands into
+// another job (or renaming the job while reshuffling the workflow) keeps running
+// them while the required context stops reporting, and every pull request then
+// waits on a check that can no longer arrive. The reviewed conflict was exactly
+// that: the job was gone from .github/workflows/ci.yml while the check was still
+// required. No compiler can see a workflow file, so the check lives here
+// (main_test.go: TestWorkflowsReportModuleGraphCheck) and the job itself runs in
+// CI on every push and pull request.
+
+// moduleGraphJobName is the job name - and therefore the status-check context -
+// the module-graph gate must keep reporting under.
+const moduleGraphJobName = "update-go_modules-graph"
+
+// moduleGraphJobProblems returns one message per workflow under dir that
+// declares the module-graph job without rebuilding the graph and asserting it is
+// non-empty, plus the number of workflows declaring that job, so a caller can
+// tell "no problems" from "no job declared, so the check ran against nothing".
+// The workflow set as a whole must declare the job exactly once: it is the
+// status check pull requests wait for.
+func moduleGraphJobProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	jobs := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		found, declared := moduleGraphJobProblemsIn(path, string(data))
+		problems = append(problems, found...)
+		if declared {
+			jobs++
+		}
+	}
+
+	switch {
+	case jobs == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: no workflow declares the %s job, so the required %s status check never reports and pull requests wait for a check that cannot arrive; the graph commands must run in a job of that name",
+			dir, moduleGraphJobName, moduleGraphJobName))
+	case jobs > 1:
+		problems = append(problems, fmt.Sprintf(
+			"%s: %d workflows declare the %s job, so the same status check reports more than once per commit",
+			dir, jobs, moduleGraphJobName))
+	}
+	sort.Strings(problems)
+	return problems, jobs, nil
+}
+
+// moduleGraphJobProblemsIn scans one workflow's text for the module-graph job.
+func moduleGraphJobProblemsIn(path, text string) ([]string, bool) {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if !isJobDeclaration(line, moduleGraphJobName) {
+			continue
+		}
+
+		body := jobBody(lines[i+1:])
+		var problems []string
+		if !strings.Contains(body, "go mod graph") {
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: the %s job does not run `go mod graph`, so the graph its status check stands for is never rebuilt",
+				path, i+1, moduleGraphJobName))
+		}
+		if !strings.Contains(body, "test -s") {
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: the %s job does not assert the graph file is non-empty (`test -s`), so an empty graph would report the required check green",
+				path, i+1, moduleGraphJobName))
+		}
+		return problems, true
+	}
+	return nil, false
+}
+
+// isJobDeclaration reports whether a line is the YAML job key of the named job:
+// an indented `name:` line, not a comment and not a top-level key (a top-level
+// key is a workflow input, and a commented-out job reports nothing).
+func isJobDeclaration(line, name string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed != name+":" || strings.HasPrefix(trimmed, "#") {
+		return false
+	}
+	return len(line) > len(trimmed)
+}
+
+// jobBody returns the text of a job body: everything after the job key up to the
+// next top-level key. Job bodies in these workflows are indented, so the first
+// unindented line ends the job.
+func jobBody(lines []string) string {
+	var body []string
+	for _, line := range lines {
+		if line != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			break
+		}
+		body = append(body, line)
+	}
+	return strings.Join(body, "\n")
+}
