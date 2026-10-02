@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,23 @@ import (
 // --build-arg VERSION. Unstamped (local or CI test) builds report "dev".
 var version = "dev"
 
+// The names of the pod-identity flags and of the environment variables they
+// fall back to. resolvePodIdentity is the single place that reads them, and the
+// manifest reader (cmd_manifest_check.go) reads the same names to prove the
+// example sidecars carry the env wiring the fallback needs, so each string is
+// written once here.
+const (
+	podNameFlag      = "pod-name"
+	podNamespaceFlag = "pod-namespace"
+	envPodName       = "HOSTNAME"
+	envPodNamespace  = "POD_NAMESPACE"
+	// defaultPodNamespace is the namespace README "Configuration" documents as
+	// the last fallback after --pod-namespace and POD_NAMESPACE. It matches the
+	// namespace the example manifests deploy into, so an unlabelled environment
+	// still resolves to the pod the manifests create.
+	defaultPodNamespace = "default"
+)
+
 var (
 	redisAddr          = flag.String("redis-addr", "localhost:6379", "Redis server address")
 	redisPassword      = flag.String("redis-password", "", "Redis password")
@@ -29,8 +47,8 @@ var (
 	redisTLSSkipVerify = flag.Bool("redis-tls-skip-verify", false, "Skip TLS certificate verification for Redis connection")
 	labelKey           = flag.String("label-key", "redis-role", "Kubernetes label key to set")
 	labelValue         = flag.String("label-value", "master", "Kubernetes label value for master")
-	podName            = flag.String("pod-name", "", "Pod name to label (defaults to HOSTNAME env var)")
-	podNamespace       = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
+	podName            = flag.String(podNameFlag, "", "Pod name to label (defaults to HOSTNAME env var)")
+	podNamespace       = flag.String(podNamespaceFlag, "", "Pod namespace (defaults to POD_NAMESPACE env var)")
 	checkInterval      = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
 	healthPort         = flag.String("health-port", "8080", "Port for health check HTTP server")
 	showVersion        = flag.Bool("version", false, "Print the build version and exit")
@@ -47,8 +65,7 @@ var (
 func main() {
 	flag.Parse()
 
-	if *showVersion {
-		fmt.Printf("redis-master-label %s\n", version)
+	if printVersion(*showVersion, os.Stdout) {
 		return
 	}
 
@@ -57,20 +74,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *podName == "" {
-		*podName = os.Getenv("HOSTNAME")
-		if *podName == "" {
-			fmt.Fprintf(os.Stderr, "pod-name must be set or HOSTNAME env var must be available\n")
-			os.Exit(1)
-		}
+	// resolvePodIdentity owns the documented resolution (flags, then the
+	// Downward API env vars, then the namespace default) and the fatal empty
+	// pod name, so a regression in it fails a test instead of only a sidecar.
+	name, namespace, err := resolvePodIdentity(*podName, *podNamespace)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-
-	if *podNamespace == "" {
-		*podNamespace = os.Getenv("POD_NAMESPACE")
-		if *podNamespace == "" {
-			*podNamespace = "default"
-		}
-	}
+	*podName, *podNamespace = name, namespace
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -129,6 +141,56 @@ func main() {
 		}
 		time.Sleep(*checkInterval)
 	}
+}
+
+// versionLine is the exact line --version prints. README "Container build"
+// documents it and CI's "Verify image version output" step runs the real image
+// and compares against "redis-master-label <version>", so the shape lives here
+// once instead of inline in main.
+func versionLine() string {
+	return fmt.Sprintf("redis-master-label %s", version)
+}
+
+// printVersion reports whether startup must stop after --version: the build
+// version is written to out and no cluster, Redis or listener work happens.
+// Without the flag nothing is written and startup continues.
+func printVersion(showVersion bool, out io.Writer) bool {
+	if !showVersion {
+		return false
+	}
+	fmt.Fprintln(out, versionLine())
+	return true
+}
+
+// resolvePodIdentity resolves the pod to label from the flags and the
+// environment, in the order README "Configuration" documents: --pod-name wins,
+// otherwise the HOSTNAME environment variable (the Downward API's
+// fieldRef metadata.name); --pod-namespace wins, otherwise POD_NAMESPACE
+// (metadata.namespace), otherwise defaultPodNamespace.
+//
+// An empty pod name after both sources is a fatal error rather than a fallback:
+// the labeler would then GET a pod with an empty name on every interval and
+// never label anything, so startup must stop with the operator-visible message
+// instead. An empty namespace is not fatal, because the documented default
+// identifies the pod the example manifests deploy.
+func resolvePodIdentity(podNameFlagValue, podNamespaceFlagValue string) (name, namespace string, err error) {
+	name = podNameFlagValue
+	if name == "" {
+		name = os.Getenv(envPodName)
+	}
+	if name == "" {
+		return "", "", fmt.Errorf("pod-name must be set or %s env var must be available", envPodName)
+	}
+
+	namespace = podNamespaceFlagValue
+	if namespace == "" {
+		namespace = os.Getenv(envPodNamespace)
+	}
+	if namespace == "" {
+		namespace = defaultPodNamespace
+	}
+
+	return name, namespace, nil
 }
 
 // validateRedisTLSFlags rejects a nonsensical TLS flag combination:

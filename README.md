@@ -38,6 +38,25 @@ Environment defaults:
 - `POD_NAMESPACE` used when `--pod-namespace` not provided.
 - `REDIS_PASSWORD` used when `--redis-password` not provided. This is the preferred way to supply the Redis credential: an explicit `--redis-password` argument ends up in the container's argv, which Kubernetes records in the pod spec (visible to anyone with pod read access and echoed by `kubectl describe pod`) and in `/proc/<pid>/cmdline` inside the pod, readable by every container sharing the pod.
 
+Startup resolves the pod to label in that documented order: `--pod-name` first,
+otherwise `HOSTNAME`, and with neither set the process exits with
+`pod-name must be set or HOSTNAME env var must be available`; `--pod-namespace`
+first, otherwise `POD_NAMESPACE`, otherwise `default`. `resolvePodIdentity` is
+the single place that decides this, and `TestResolvePodIdentity` pins the
+flag/env/default combinations: dropping the `default` fallback, inverting the
+pod-name check or labelling a pod with an empty name would otherwise keep the
+suite green while the sidecars misbehave. The example manifests pass neither
+flag and rely on the `HOSTNAME`/`POD_NAMESPACE` Downward API wiring, which
+`TestManifestLabelerSidecarsWirePodIdentityEnv` keeps projected from
+`metadata.name` and `metadata.namespace`.
+
+`--version` prints `redis-master-label <version>` and exits before the pod
+identity is resolved, the Kubernetes client is built or the health listener is
+bound; `TestPrintVersion` pins that output and `TestMainStartupOrder` pins the
+order (binding the listener before the poll loop is what turns a taken port or
+an invalid `--health-port` into a startup failure instead of a running pod with
+no `/healthz`).
+
 ## Building locally
 ```bash
 go build -o redis-master-label .
