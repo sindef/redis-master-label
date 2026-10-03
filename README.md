@@ -156,7 +156,12 @@ Key points for the deployment:
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
 - Expose the health port the labeler is told to listen on and poll `/healthz` from a liveness and a readiness probe (see "Health Check Endpoint"); both example deployments do.
-- Run the labeler unprivileged (see "Running unprivileged" below).
+- Run the labeler unprivileged (see "Running unprivileged" below); the caveat
+  at the end of that section covers the co-located `redis` container.
+- A namespace enforcing the restricted Pod Security Standard rejects the two
+  example manifests as shipped: their `redis` containers carry no
+  `securityContext`. See the caveat at the end of "Running unprivileged"
+  before applying them into such a namespace.
 
 ### Running unprivileged
 The labeler only reads Redis and calls the Kubernetes API with its mounted
@@ -176,9 +181,49 @@ securityContext:
   seccompProfile:
     type: RuntimeDefault
 ```
-That is the shape the restricted Pod Security Standard requires, so the
-manifests are accepted by a namespace enforcing it. The uid matches the image:
-the final Dockerfile stage creates the `labeler` account (uid/gid 10001) and
+That<tool_call>edit_file<arg_key>new</arg_key><arg_value>That block covers the labeler container only, and the restricted Pod Security
+Standard is enforced against every container in the pod, not against the highest
+numbered one. Both example pods run a second container, `redis` (from
+`redis:7-alpine`) in `manifests/redis-leader.yaml` and
+`manifests/deployment-example.yaml`, which declares no `securityContext` at
+all: it runs with the image's default user (uid 0), can gain privileges,
+keeps every Linux capability, has a writable root filesystem, and carries no
+`seccompProfile`. A namespace enforcing the restricted Pod Security Standard
+therefore **rejects** both example manifests as shipped, even though the
+labeler container itself passes.
+
+Nothing in the test suite catches that gap:
+`TestManifestSidecarsRunUnprivileged` selects the containers that match the
+sidecar image, so the `redis` container can stay unhardened while the tests
+stay green, and kubeconform only checks the schema. The manifests really
+meet the restricted standard once the same shape is copied onto their other
+container instead of being asserted as already done. Until then, copy the
+labeler's `securityContext` onto the `redis` container before applying the
+manifests:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+  seccompProfile:
+    type: RuntimeDefault
+```
+
+Copying the YAML is not enough by itself: the strictest fields impose
+requirements on Redis itself. `redis-server` writes RDB/AOF snapshots under
+`/data`, so pair `readOnlyRootFilesystem: true` with a writable volume mounted
+there (an `emptyDir` plus a `volumeMount` is enough, and the pod spec currently
+declares none), and verify the chosen `runAsUser`/`runAsGroup` actually starts
+Redis under that uid. Do the work inside your own copy of the manifest.
+
+The uid matches the image: the final Dockerfile stage creates the
+`labeler` account (uid/gid 10001) and
 selects it with `USER 10001:10001`, so the shipping image no longer runs as
 root even when a manifest is applied without the block above. Copy the block
 into your own pod spec when you run the sidecar elsewhere — the cluster needs
