@@ -1,7 +1,7 @@
 """Offline check: rough YAML sanity without a YAML library for the workflows.
 
-- Verify every "run: |..." block uses block-scalar body indentation and
-  contains no GC-related token left over from an earlier tool.
+- Verify no GC-related token left over from an earlier tool appears in any
+  "run:" block.
 - Verify every setup-go step declares go-version-file: go.mod and no other
   Go version source. The scan is version-agnostic because actions/setup-go
   majors move underneath (v5 -> v7) with no change in the guarded inputs,

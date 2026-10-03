@@ -57,7 +57,7 @@ jobs:
       # runs it and propagates its exit status; harness.py replays the
       # checker's workflow fixtures so its setup-go scan stays step-aware (a
       # later step is never read as a second version source).
-      - name: Verify TestYamlBlockIndents
+      - name: Verify workflow scans and checker fixtures
         run: |
           python3 ci_check_comments.py
           python3 harness.py
