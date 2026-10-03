@@ -1041,6 +1041,144 @@ func TestManifestSidecarsDeclareHealthProbes_MissingProbeFails(t *testing.T) {
 	}
 }
 
+// The reviewed test_gap: nothing read the RBAC manifests. Both example
+// deployments only work while the whole chain lines up - the Deployments run as
+// the ServiceAccount the RoleBinding's subject names, the roleRef names the
+// Role that exists in the same namespace, and that Role grants the pod verbs
+// applyLabel issues - and the CI "Validate manifests" step runs kubeconform,
+// which validates each document's schema and resolves nothing across files. So
+// a renamed Role, a broken subject or a dropped verb passes CI and then fails
+// every check interval at runtime with forbidden/get errors (README "RBAC
+// requirements").
+func TestManifestRBACWiring(t *testing.T) {
+	chain, err := readRBACChain(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain.Deployments) != 2 {
+		t.Fatalf("deployments in %s = %d, want the two example deployments", manifestDir, len(chain.Deployments))
+	}
+	for _, problem := range rbacChainProblems(chain) {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The failure modes at manifest level: the reviewed chain is the only shape
+// that passes, so renaming the Role, pointing the RoleBinding subject at another
+// ServiceAccount, renaming the ServiceAccount and dropping a verb from the Role
+// must each be reported by the reader. Every fixture is a copy of the real
+// manifest set with one file edited, so the mutation is what fails and not a
+// reader that always complains.
+func TestManifestRBACWiring_BrokenChainFails(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(file, text string) string
+		wantProblem string
+	}{
+		{
+			name: "Role renamed without its roleRef",
+			mutate: func(file, text string) string {
+				if file != "role.yaml" {
+					return text
+				}
+				return strings.Replace(text, "name: redis-master-label", "name: redis-master-role", 1)
+			},
+			wantProblem: "roleRef.name",
+		},
+		{
+			name: "RoleBinding subject points at another ServiceAccount",
+			mutate: func(file, text string) string {
+				if file != "rolebinding.yaml" {
+					return text
+				}
+				return strings.Replace(text, "- kind: ServiceAccount\n  name: redis-master-label", "- kind: ServiceAccount\n  name: labeler-other", 1)
+			},
+			wantProblem: "serviceAccountName",
+		},
+		{
+			name: "ServiceAccount renamed",
+			mutate: func(file, text string) string {
+				if file != "serviceaccount.yaml" {
+					return text
+				}
+				return strings.Replace(text, "name: redis-master-label", "name: labeler-other", 1)
+			},
+			wantProblem: "ServiceAccount",
+		},
+		{
+			name: "Role drops the update verb applyLabel issues",
+			mutate: func(file, text string) string {
+				if file != "role.yaml" {
+					return text
+				}
+				return strings.Replace(text, `verbs: ["get", "update"]`, `verbs: ["get"]`, 1)
+			},
+			wantProblem: "update",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeManifestSet(t, dir, tt.mutate)
+
+			chain, err := readRBACChain(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			problems := rbacChainProblems(chain)
+			if len(problems) == 0 {
+				t.Fatal("broken RBAC chain accepted, want a problem reported")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+
+			// The same manifest set without the mutation must be accepted, so
+			// the fixture proves the edit is what the check caught.
+			dir = t.TempDir()
+			writeManifestSet(t, dir, nil)
+			chain, err = readRBACChain(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if problems := rbacChainProblems(chain); len(problems) != 0 {
+				t.Fatalf("unmutated manifest set rejected: %v", problems)
+			}
+		})
+	}
+}
+
+// writeManifestSet copies every example manifest into dir, applying mutate to
+// each file's text so one manifest can be broken while the rest stay as
+// shipped. A nil mutate copies the manifests unchanged.
+func writeManifestSet(t *testing.T, dir string, mutate func(file, text string) string) {
+	t.Helper()
+	entries, err := os.ReadDir(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(manifestDir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		if mutate != nil {
+			text = mutate(entry.Name(), text)
+		}
+		if err := os.WriteFile(filepath.Join(dir, entry.Name()), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // The pre-fix failure mode of the build file: a final stage with no USER (or
 // with root/0) must be rejected, and a USER in an earlier builder stage must
 // not count as the shipping image's user.
