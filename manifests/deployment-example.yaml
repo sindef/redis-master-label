@@ -43,6 +43,8 @@ spec:
         # The password comes from a Secret through valueFrom.secretKeyRef, not
         # from args: an --redis-password argument lands in the pod spec and in
         # /proc/<pid>/cmdline, readable by anyone who can inspect the pod.
+        # TestManifestSidecarsKeepPasswordOutOfArgs fails when a sidecar arg
+        # carries the credential.
         # Create the secret first (see README "Kubernetes deployment").
         - name: REDIS_PASSWORD
           valueFrom:

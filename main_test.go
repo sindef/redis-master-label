@@ -326,11 +326,15 @@ func TestManifestFlagsDefined_UnknownFlagFails(t *testing.T) {
 		t.Fatalf("unknown = %v, want the --redis-adr usage reported", unknown)
 	}
 
-	// A well-typed same manifest yields no unknown flags.
+	// A well-typed same manifest yields no unknown flags. The replacement is a
+	// flag the manifests may use: --redis-password is registered too, but
+	// TestManifestSidecarsKeepPasswordOutOfArgs forbids it in a manifest arg
+	// (the credential belongs in the REDIS_PASSWORD env var), so a fixture
+	// carrying it would document the opposite of the documented policy.
 	if err := os.Remove(filepath.Join(dir, "deployment-typo.yaml")); err != nil {
 		t.Fatal(err)
 	}
-	good := strings.ReplaceAll(manifest, "--redis-adr", "--redis-password")
+	good := strings.ReplaceAll(manifest, "--redis-adr", "--check-interval=10s")
 	if err := os.WriteFile(filepath.Join(dir, "deployment-good.yaml"), []byte(good), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -343,6 +347,161 @@ func TestManifestFlagsDefined_UnknownFlagFails(t *testing.T) {
 	}
 	if sidecars != 1 {
 		t.Fatalf("sidecars = %d, want 1", sidecars)
+	}
+}
+
+// The documented rule the suite did not enforce: README "Configuration" warns
+// that "an explicit --redis-password argument ends up in the container's argv,
+// which Kubernetes records in the pod spec (visible to anyone with pod read
+// access and echoed by kubectl describe pod) and in /proc/<pid>/cmdline inside
+// the pod", and README "Example usage" says "Never put the password in args".
+// TestManifestFlagsDefined cannot catch a manifest that breaks the rule, because
+// --redis-password IS a registered flag, and CI's "Validate manifests" step runs
+// kubeconform, which validates schemas and never reads container args, so the
+// policy needs this check over the same manifests. Both example deployments
+// satisfy it by passing the credential as the REDIS_PASSWORD env var from a
+// Secret.
+func TestManifestSidecarsKeepPasswordOutOfArgs(t *testing.T) {
+	problems, sidecars, err := sidecarCredentialArgProblems(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sidecars == 0 {
+		t.Fatal("no sidecar container found in manifests: the credential-in-args check ran against nothing")
+	}
+
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The shapes the check must not reject, so it cannot fail a legitimate manifest
+// once it is wired into CI: every argument the example deployments use, the
+// separate-value form of two of them, and a long DNS-style label value that is
+// not a credential. A false positive here would block a pull request that only
+// adds a flag.
+func TestContainerCredentialArgProblems_AcceptedShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "args both example deployments use",
+			args: []string{"/app/redis-master-label", "--redis-addr=localhost:6379", "--label-key=redis-role", "--label-value=master", "--check-interval=10s"},
+		},
+		{
+			name: "separate value form",
+			args: []string{"/app/redis-master-label", "--redis-addr", "localhost:6379", "--health-port", "8080"},
+		},
+		{
+			name: "single dash flags",
+			args: []string{"-redis-addr=localhost:6379", "-check-interval=10s"},
+		},
+		{
+			name: "flag name mentioning a key but carrying no credential",
+			args: []string{"--label-key=redis-role", "--label-value=ip-10-0-1-4.eu-west-1.compute.internal"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if problems := containerCredentialArgProblems("deployment.yaml", "redis-master-label", tt.args); len(problems) != 0 {
+				t.Fatalf("problems = %v, want none for args that carry no credential", problems)
+			}
+		})
+	}
+}
+
+// The failure mode at manifest level: an argument that carries a credential must
+// be reported whether it spells the password flag with an attached, a separate
+// or a single-dash value, names another credential flag, or hides the credential
+// in the value of an unrelated flag. Every fixture is a copy of the real
+// manifest set with the sidecar's args edited, so the edit is what the check
+// caught and not a reader that always complains.
+func TestManifestSidecarsKeepPasswordOutOfArgs_CredentialArgFails(t *testing.T) {
+	const checkInterval = "        - --check-interval=10s\n"
+	withArgs := func(text string, args ...string) string {
+		if !strings.Contains(text, checkInterval) {
+			return text
+		}
+		return strings.Replace(text, checkInterval, checkInterval+strings.Join(args, ""), 1)
+	}
+
+	tests := []struct {
+		name        string
+		mutate      func(file, text string) string
+		wantProblem string
+	}{
+		{
+			name:        "password flag with an attached value",
+			mutate:      func(file, text string) string { return withArgs(text, "        - --redis-password=supersecret\n") },
+			wantProblem: "redis-password",
+		},
+		{
+			name: "password flag with a separate value",
+			mutate: func(file, text string) string {
+				return withArgs(text, "        - --redis-password\n", "        - supersecret\n")
+			},
+			wantProblem: "redis-password",
+		},
+		{
+			name:        "password flag with a single dash and no value",
+			mutate:      func(file, text string) string { return withArgs(text, "        - -redis-password\n") },
+			wantProblem: "redis-password",
+		},
+		{
+			name:        "another credential flag",
+			mutate:      func(file, text string) string { return withArgs(text, "        - --redis-auth-token=c0ffee\n") },
+			wantProblem: "redis-auth-token",
+		},
+		{
+			name: "credential in the value of an unrelated flag",
+			mutate: func(file, text string) string {
+				return withArgs(text, "        - --label-value=aGVsbG9Xb3JsZDEyMzQ1Njc4OTBhYmNkZWZnaGlqa2xtbm8=\n")
+			},
+			wantProblem: "label-value",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeManifestSet(t, dir, tt.mutate)
+
+			problems, sidecars, err := sidecarCredentialArgProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sidecars != 2 {
+				t.Fatalf("sidecar containers = %d, want the two example deployments", sidecars)
+			}
+			if len(problems) == 0 {
+				t.Fatal("credential argument accepted, want a problem reported")
+			}
+			joined := strings.Join(problems, "\n")
+			if !strings.Contains(joined, tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+			if !strings.Contains(joined, "REDIS_PASSWORD") {
+				t.Errorf("problems = %v, want them to name the REDIS_PASSWORD env alternative", problems)
+			}
+
+			// The same manifest set without the edit must be accepted, so the
+			// fixture proves the edit is what the check caught.
+			dir = t.TempDir()
+			writeManifestSet(t, dir, nil)
+			problems, sidecars, err = sidecarCredentialArgProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sidecars != 2 {
+				t.Fatalf("sidecar containers = %d, want the two example deployments", sidecars)
+			}
+			if len(problems) != 0 {
+				t.Fatalf("unmutated manifest set rejected: %v", problems)
+			}
+		})
 	}
 }
 
