@@ -24,9 +24,10 @@ import (
 // The same file holds the readers for the other things CI cannot see:
 // the sidecar containers' securityContext (main_test.go,
 // TestManifestSidecarsRunUnprivileged), the health endpoint wiring of those
-// containers (main_test.go, TestManifestSidecarsDeclareHealthProbes) and the
-// USER the build file's final stage selects (dockerfileFinalStageUser,
-// TestDockerfileFinalStageRunsAsNonRootUser).
+// containers (main_test.go, TestManifestSidecarsDeclareHealthProbes), the USER
+// the build file's final stage selects (dockerfileFinalStageUser,
+// TestDockerfileFinalStageRunsAsNonRootUser) and the RBAC chain the example
+// deployments run under (readRBACChain, TestManifestRBACWiring).
 
 // manifestDir is where the example manifests live relative to the repo root.
 const manifestDir = "manifests"
@@ -468,4 +469,303 @@ func sidecarFlagUsages(dir string) (usages []string, sidecars int, err error) {
 		}
 	}
 	return usages, sidecars, readErr
+}
+
+// RBAC wiring check: the example manifests hand the labeler a ServiceAccount, a
+// Role granting the pod verbs it needs and a RoleBinding tying the two
+// together, and both Deployments run under that ServiceAccount. CI's kubeconform
+// step validates each document against the Kubernetes schemas and never
+// resolves a roleRef, a subject or a serviceAccountName across documents, and
+// the readers above only extract container fields, so a Role renamed without its
+// roleRef, a RoleBinding pointed at another subject or a Role that lost a verb
+// all pass CI and then fail every check interval at runtime with forbidden/get
+// errors (README "RBAC requirements"). The readers here make the chain visible
+// to main_test.go (TestManifestRBACWiring) instead.
+//
+// The pod verbs the Role has to grant are not guessed from the manifest: they
+// are the verbs main.go's applyLabel issues on the pod it labels.
+
+// The manifest kinds the RBAC chain is made of.
+const (
+	serviceAccountKind = "ServiceAccount"
+	roleKind           = "Role"
+	roleBindingKind    = "RoleBinding"
+	deploymentKind     = "Deployment"
+)
+
+// podsVerbsApplyLabelIssues are the pod verbs applyLabel issues on the pod it
+// labels, in the core API group: a Get of its own pod and the Update that
+// writes or removes the label. A Role missing either one lets the labeler start
+// and report Ready and then fail every check interval with a forbidden error.
+var podsVerbsApplyLabelIssues = []string{"get", "update"}
+
+// rbacManifest is the manifest subset the RBAC chain is read from: document
+// metadata, a Role's rules, a RoleBinding's subjects and roleRef, and the
+// Deployment pod spec's serviceAccountName. Fields absent from a document (the
+// example Service has none of them) read back as the zero value.
+type rbacManifest struct {
+	Kind     string `json:"kind"`
+	Metadata struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"metadata"`
+	Rules    []rbacRule    `json:"rules"`
+	Subjects []rbacSubject `json:"subjects"`
+	RoleRef  rbacRoleRef   `json:"roleRef"`
+	Spec     struct {
+		Template struct {
+			Spec struct {
+				ServiceAccountName string `json:"serviceAccountName"`
+			} `json:"spec"`
+		} `json:"template"`
+	} `json:"spec"`
+}
+
+// rbacRule is one policy rule of a Role.
+type rbacRule struct {
+	APIGroups []string `json:"apiGroups"`
+	Resources []string `json:"resources"`
+	Verbs     []string `json:"verbs"`
+}
+
+// rbacSubject is one subject of a RoleBinding.
+type rbacSubject struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+// rbacRoleRef is the role a RoleBinding refers to.
+type rbacRoleRef struct {
+	Kind     string `json:"kind"`
+	Name     string `json:"name"`
+	APIGroup string `json:"apiGroup"`
+}
+
+// rbacObject is one RBAC document with the metadata a reference to it has to
+// match, plus the manifest file it came from so a failure names that file.
+type rbacObject struct {
+	Manifest  string
+	Kind      string
+	Name      string
+	Namespace string
+}
+
+// rbacRole is a Role with the rules that decide which pod verbs its holder may
+// use; rbacRoleBinding is a RoleBinding with the subject it grants them to.
+type rbacRole struct {
+	rbacObject
+	Rules []rbacRule
+}
+
+type rbacRoleBinding struct {
+	rbacObject
+	Subjects []rbacSubject
+	RoleRef  rbacRoleRef
+}
+
+// rbacDeployment is one Deployment with the ServiceAccount its pod spec runs
+// as.
+type rbacDeployment struct {
+	rbacObject
+	ServiceAccountName string
+}
+
+// rbacChain is the RBAC chain the manifests under a directory describe. Each
+// list holds what was found, so a missing document is reported as an empty list
+// instead of being taken for the documents that exist.
+type rbacChain struct {
+	ServiceAccounts []rbacObject
+	Roles           []rbacRole
+	RoleBindings    []rbacRoleBinding
+	Deployments     []rbacDeployment
+}
+
+// readRBACManifest parses one manifest into the RBAC subset above. YAMLToJSON
+// handles the YAML syntax and json.Unmarshal fills the struct; a misspelled or
+// misplaced field reads back as the zero value and is reported by the checks
+// rather than silently passing.
+func readRBACManifest(path string) (rbacManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return rbacManifest{}, err
+	}
+	jsonData, err := utilyaml.ToJSON(data)
+	if err != nil {
+		return rbacManifest{}, fmt.Errorf("%s: YAML to JSON: %w", path, err)
+	}
+	var doc rbacManifest
+	if err := json.Unmarshal(jsonData, &doc); err != nil {
+		return rbacManifest{}, fmt.Errorf("%s: JSON decode: %w", path, err)
+	}
+	return doc, nil
+}
+
+// readRBACChain reads every manifest under dir and collects the RBAC documents
+// it holds. Documents of other kinds (the example Service) contribute nothing,
+// so the whole example manifest set can be read in one pass.
+func readRBACChain(dir string) (rbacChain, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return rbacChain{}, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var chain rbacChain
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		doc, err := readRBACManifest(path)
+		if err != nil {
+			return rbacChain{}, err
+		}
+		object := rbacObject{
+			Manifest:  entry.Name(),
+			Kind:      doc.Kind,
+			Name:      doc.Metadata.Name,
+			Namespace: doc.Metadata.Namespace,
+		}
+		switch doc.Kind {
+		case serviceAccountKind:
+			chain.ServiceAccounts = append(chain.ServiceAccounts, object)
+		case roleKind:
+			chain.Roles = append(chain.Roles, rbacRole{rbacObject: object, Rules: doc.Rules})
+		case roleBindingKind:
+			chain.RoleBindings = append(chain.RoleBindings, rbacRoleBinding{
+				rbacObject: object,
+				Subjects:   doc.Subjects,
+				RoleRef:    doc.RoleRef,
+			})
+		case deploymentKind:
+			chain.Deployments = append(chain.Deployments, rbacDeployment{
+				rbacObject:         object,
+				ServiceAccountName: doc.Spec.Template.Spec.ServiceAccountName,
+			})
+		}
+	}
+	return chain, nil
+}
+
+// rbacChainProblems returns one message per way a manifest set's RBAC chain
+// fails to line up, or nil when every link holds: one ServiceAccount, one Role
+// and one RoleBinding; the binding's roleRef naming that Role in its own
+// namespace; the binding's ServiceAccount subject naming that account; every
+// Deployment running as that subject in that namespace; and the Role granting
+// the pod verbs applyLabel issues. The messages name the manifest files, so a
+// failure points at the YAML rather than at the test.
+func rbacChainProblems(chain rbacChain) []string {
+	var problems []string
+	if len(chain.ServiceAccounts) != 1 {
+		problems = append(problems, fmt.Sprintf("%d ServiceAccount documents across the manifests, want exactly one: the account the Deployments run as and the RoleBinding's subject names", len(chain.ServiceAccounts)))
+	}
+	if len(chain.Roles) != 1 {
+		problems = append(problems, fmt.Sprintf("%d Role documents across the manifests, want exactly one: the role the RoleBinding's roleRef has to name", len(chain.Roles)))
+	}
+	if len(chain.RoleBindings) != 1 {
+		problems = append(problems, fmt.Sprintf("%d RoleBinding documents across the manifests, want exactly one: the binding that ties the subject to the role", len(chain.RoleBindings)))
+	}
+	if len(problems) > 0 {
+		return problems
+	}
+
+	serviceAccount := chain.ServiceAccounts[0]
+	role := chain.Roles[0]
+	binding := chain.RoleBindings[0]
+
+	if err := podsVerbsProblem(role); err != nil {
+		problems = append(problems, err.Error())
+	}
+
+	if binding.RoleRef.Kind != roleKind {
+		problems = append(problems, fmt.Sprintf("%s: roleRef.kind = %q, want %q: the binding has to name the namespaced Role %s declares", binding.Manifest, binding.RoleRef.Kind, roleKind, role.Manifest))
+	}
+	if binding.RoleRef.Name != role.Name {
+		problems = append(problems, fmt.Sprintf("%s: roleRef.name = %q, but %s declares Role %q: the binding grants no permissions, so every pod get/update the labeler issues is forbidden", binding.Manifest, binding.RoleRef.Name, role.Manifest, role.Name))
+	}
+	if role.Namespace != binding.Namespace {
+		problems = append(problems, fmt.Sprintf("%s: Role %q is in namespace %q, but %s is in %q: a RoleBinding only names a Role in its own namespace", role.Manifest, role.Name, role.Namespace, binding.Manifest, binding.Namespace))
+	}
+
+	subjects := make([]rbacSubject, 0, len(binding.Subjects))
+	for _, subject := range binding.Subjects {
+		if subject.Kind == serviceAccountKind {
+			subjects = append(subjects, subject)
+		}
+	}
+	if len(subjects) != 1 {
+		problems = append(problems, fmt.Sprintf("%s: %d ServiceAccount subjects, want exactly one naming the account the Deployments run as", binding.Manifest, len(subjects)))
+		return problems
+	}
+	subject := subjects[0]
+
+	if serviceAccount.Name != subject.Name {
+		problems = append(problems, fmt.Sprintf("%s: ServiceAccount %q is not the RoleBinding subject %q (%s): the subject names an account that does not exist, so the binding grants it nothing", serviceAccount.Manifest, serviceAccount.Name, subject.Name, binding.Manifest))
+	}
+	if serviceAccount.Namespace != subject.Namespace {
+		problems = append(problems, fmt.Sprintf("%s: ServiceAccount %q is in namespace %q, but the RoleBinding subject is in %q (%s)", serviceAccount.Manifest, serviceAccount.Name, serviceAccount.Namespace, subject.Namespace, binding.Manifest))
+	}
+
+	for _, deployment := range chain.Deployments {
+		if deployment.ServiceAccountName == "" {
+			problems = append(problems, fmt.Sprintf("%s: deployment %q declares no serviceAccountName, so its pods run as the namespace's default ServiceAccount instead of the subject %q (%s)", deployment.Manifest, deployment.Name, subject.Name, binding.Manifest))
+			continue
+		}
+		if deployment.ServiceAccountName != subject.Name {
+			problems = append(problems, fmt.Sprintf("%s: deployment %q declares serviceAccountName %q, but the RoleBinding subject is %q (%s): the pods' credentials are bound to no Role", deployment.Manifest, deployment.Name, deployment.ServiceAccountName, subject.Name, binding.Manifest))
+		}
+		if deployment.Namespace != subject.Namespace {
+			problems = append(problems, fmt.Sprintf("%s: deployment %q is in namespace %q, but the RoleBinding subject is in %q (%s): the subject's credentials exist only in its own namespace", deployment.Manifest, deployment.Name, deployment.Namespace, subject.Namespace, binding.Manifest))
+		}
+	}
+
+	return problems
+}
+
+// podsVerbsProblem returns why the Role does not grant every pod verb
+// applyLabel issues, or nil when it does. Only rules covering the core API
+// group's pods resource count: a rule naming another resource, or naming pods
+// in another API group, grants nothing here.
+func podsVerbsProblem(role rbacRole) error {
+	granted := make(map[string]bool)
+	for _, rule := range role.Rules {
+		if !ruleTargetsPods(rule) {
+			continue
+		}
+		for _, verb := range rule.Verbs {
+			granted[strings.ToLower(verb)] = true
+		}
+	}
+
+	var missing []string
+	for _, verb := range podsVerbsApplyLabelIssues {
+		if !granted[verb] {
+			missing = append(missing, verb)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s: Role %q grants no %s verb on pods, but applyLabel issues %s on the pod it labels every check interval: grant them in the Role",
+			role.Manifest, role.Name, strings.Join(missing, "/"), strings.Join(podsVerbsApplyLabelIssues, "+"))
+	}
+	return nil
+}
+
+// ruleTargetsPods reports whether a Role rule covers the core API group's pods
+// resource, which is what applyLabel's Get and Update target. A wildcard
+// resource or apiGroup counts: Kubernetes grants what the rule names.
+func ruleTargetsPods(rule rbacRule) bool {
+	return containsValue(rule.Resources, "pods") && containsValue(rule.APIGroups, "")
+}
+
+// containsValue reports whether values holds want or the "*" wildcard.
+func containsValue(values []string, want string) bool {
+	for _, value := range values {
+		if value == want || value == "*" {
+			return true
+		}
+	}
+	return false
 }

@@ -181,7 +181,7 @@ securityContext:
   seccompProfile:
     type: RuntimeDefault
 ```
-That<tool_call>edit_file<arg_key>new</arg_key><arg_value>That block covers the labeler container only, and the restricted Pod Security
+That block covers the labeler container only, and the restricted Pod Security
 Standard is enforced against every container in the pod, not against the highest
 numbered one. Both example pods run a second container, `redis` (from
 `redis:7-alpine`) in `manifests/redis-leader.yaml` and
