@@ -36,7 +36,7 @@ Flags (all have sensible defaults):
 Environment defaults:
 - `HOSTNAME` used when `--pod-name` not provided.
 - `POD_NAMESPACE` used when `--pod-namespace` not provided.
-- `REDIS_PASSWORD` used when `--redis-password` not provided. This is the preferred way to supply the Redis credential: an explicit `--redis-password` argument ends up in the container's argv, which Kubernetes records in the pod spec (visible to anyone with pod read access and echoed by `kubectl describe pod`) and in `/proc/<pid>/cmdline` inside the pod, readable by every container sharing the pod.
+- `REDIS_PASSWORD` used when `--redis-password` not provided. This is the preferred way to supply the Redis credential: an explicit `--redis-password` argument ends up in the container's argv, which Kubernetes records in the pod spec (visible to anyone with pod read access and echoed by `kubectl describe pod`) and in `/proc/<pid>/cmdline` inside the pod, readable by every container sharing the pod. `TestManifestSidecarsKeepPasswordOutOfArgs` fails the pull request when an example manifest passes the credential through args instead.
 
 ## Building locally
 ```bash

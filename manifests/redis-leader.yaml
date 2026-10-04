@@ -35,7 +35,9 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
         # Same as deployment-example.yaml: the password arrives through the
-        # REDIS_PASSWORD env var from a Secret, never through args.
+        # REDIS_PASSWORD env var from a Secret, never through args
+        # (TestManifestSidecarsKeepPasswordOutOfArgs fails when a sidecar arg
+        # carries the credential).
         - name: REDIS_PASSWORD
           valueFrom:
             secretKeyRef:

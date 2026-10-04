@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -24,8 +25,10 @@ import (
 // The same file holds the readers for the other things CI cannot see:
 // the sidecar containers' securityContext (main_test.go,
 // TestManifestSidecarsRunUnprivileged), the health endpoint wiring of those
-// containers (main_test.go, TestManifestSidecarsDeclareHealthProbes), the USER
-// the build file's final stage selects (dockerfileFinalStageUser,
+// containers (main_test.go, TestManifestSidecarsDeclareHealthProbes), the
+// credentials the sidecar must never carry in its args (main_test.go,
+// TestManifestSidecarsKeepPasswordOutOfArgs), the USER the build file's final
+// stage selects (dockerfileFinalStageUser,
 // TestDockerfileFinalStageRunsAsNonRootUser) and the RBAC chain the example
 // deployments run under (readRBACChain, TestManifestRBACWiring).
 
@@ -469,6 +472,154 @@ func sidecarFlagUsages(dir string) (usages []string, sidecars int, err error) {
 		}
 	}
 	return usages, sidecars, readErr
+}
+
+// Credential-in-args check: README "Configuration" states that an explicit
+// --redis-password argument "ends up in the container's argv, which Kubernetes
+// records in the pod spec (visible to anyone with pod read access and echoed by
+// `kubectl describe pod`) and in /proc/<pid>/cmdline inside the pod", README
+// "Example usage" says "Never put the password in args", and both example
+// manifests repeat the rule in comments. Nothing enforced it:
+// --redis-password is a registered flag, so TestManifestFlagsDefined - which
+// only asserts that every sidecar argument names a flag that exists - accepted
+// it, and CI's "Validate manifests" step runs kubeconform, which validates
+// schemas and never reads container args. A contributor adding
+// `- --redis-password=...` to either deployment therefore got a green pull
+// request while the credential landed in the pod spec. The reader below makes
+// the rule visible to main_test.go (TestManifestSidecarsKeepPasswordOutOfArgs),
+// which rejects such an argument and names the REDIS_PASSWORD Secret env var
+// (valueFrom.secretKeyRef), the documented alternative, in its message.
+
+// credentialFlagNameFragments are the substrings that mark a flag name as
+// carrying a credential: a password, a passwd, a secret, a token, a credential
+// or an API/access key. The list reads the flag's name, so a hypothetical flag
+// that only points at a credential without holding one (a --redis-password-file)
+// is the single false positive it can have; --label-key, which the example
+// manifests use, contains none of these fragments.
+var credentialFlagNameFragments = []string{
+	"password",
+	"passwd",
+	"secret",
+	"token",
+	"credential",
+	"api-key",
+	"apikey",
+	"access-key",
+	"secret-key",
+}
+
+// credentialValuePatterns match flag values shaped like a credential: an
+// unbroken base64 or hex blob, which is what a generated password, token or key
+// looks like. Both patterns require at least 32 characters, so they never fire
+// on the values the example manifests use - an address, a duration, a port, a
+// label key or a label value - because those either stay short or carry a
+// separator (':', '/', '.') that the alphabets below exclude. The second
+// pattern also has to mix upper case with digits before it counts, so a long
+// all-lowercase DNS-style name is not read as a credential.
+var credentialValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^[A-Za-z0-9+/]{32,}={0,2}$`),
+	regexp.MustCompile(`^[A-Za-z0-9_-]{32,}$`),
+}
+
+// credentialValueLooksSecret reports whether a flag value has the shape of a
+// credential, so a secret pasted under an unrelated flag name is still caught.
+// It is a shape rule, not an entropy estimate: a credential it misses is still
+// caught whenever the flag's own name names one.
+func credentialValueLooksSecret(value string) bool {
+	if credentialValuePatterns[0].MatchString(value) {
+		return true
+	}
+	if !credentialValuePatterns[1].MatchString(value) {
+		return false
+	}
+	return strings.ContainsAny(value, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") &&
+		strings.ContainsAny(value, "0123456789")
+}
+
+// flagValue returns the value of the argument at index i: the text after the
+// first '=' or, when the argument names a flag on its own, the next argument,
+// because the Go flag package accepts both forms.
+func flagValue(arg string, args []string, i int) string {
+	if _, value, found := strings.Cut(arg, "="); found {
+		return value
+	}
+	if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+		return args[i+1]
+	}
+	return ""
+}
+
+// credentialArgProblemMessage explains one rejected argument: what an argument
+// in the container's argv leaks and which documented alternative to use
+// instead.
+func credentialArgProblemMessage(manifest, container, arg string) string {
+	return fmt.Sprintf("%s/%s: %q puts a credential in the container's argv; Kubernetes records args in the pod spec (visible to anyone with pod read access and echoed by `kubectl describe pod`) and exposes them in /proc/<pid>/cmdline to every container in the pod. Supply the Redis credential through the REDIS_PASSWORD environment variable from a Secret (valueFrom.secretKeyRef) instead, as README \"Configuration\" and \"Example usage\" document (\"Never put the password in args\")", manifest, container, arg)
+}
+
+// containerCredentialArgProblems returns one message per command or argument of
+// one container that carries a credential, or nil when none does. Both argument
+// forms the flag package accepts are read: --flag=value and --flag value.
+func containerCredentialArgProblems(manifest, container string, args []string) []string {
+	var problems []string
+	for i, arg := range args {
+		name, ok := flagNameFromArg(arg)
+		if !ok {
+			continue
+		}
+		if credentialFlagName(name) || credentialValueLooksSecret(flagValue(arg, args, i)) {
+			problems = append(problems, credentialArgProblemMessage(manifest, container, arg))
+		}
+	}
+	return problems
+}
+
+// credentialFlagName reports whether a flag name is one whose value is a
+// credential.
+func credentialFlagName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, fragment := range credentialFlagNameFragments {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// sidecarCredentialArgProblems walks manifests/*.yaml and returns one message
+// per labeler argument that carries a credential, plus a count of sidecar
+// containers seen so the caller can detect a manifest set where the sidecar
+// silently disappeared. It walks the same manifest set as sidecarFlagUsages and
+// reads the same container: the other containers run different binaries with
+// flag sets of their own, so their arguments (redis-server's --replicaof, for
+// example) are none of this check's business.
+func sidecarCredentialArgProblems(dir string) (problems []string, sidecars int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", dir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		doc, err := readPodSpecManifest(path)
+		if err != nil {
+			return nil, sidecars, fmt.Errorf("parse manifest: %w", err)
+		}
+		for _, c := range doc.Spec.Template.Spec.Containers {
+			if !strings.Contains(c.Image, sidecarImage) {
+				continue
+			}
+			sidecars++
+			args := append(append([]string{}, c.Command...), c.Args...)
+			problems = append(problems, containerCredentialArgProblems(entry.Name(), c.Name, args)...)
+		}
+	}
+	return problems, sidecars, nil
 }
 
 // RBAC wiring check: the example manifests hand the labeler a ServiceAccount, a
