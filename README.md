@@ -43,6 +43,15 @@ Environment defaults:
 go build -o redis-master-label .
 ```
 
+The `module` path in `go.mod` is the code's import/install identity, so it names
+this repository - `github.com/redis-master-label/redis-master-label` - the same
+repository the image's `org.opencontainers.image.source` label and the GHCR
+release image name. A path naming only the account (`github.com/redis-master-label`)
+would resolve `go install` and module proxy fetches against a VCS path that does
+not exist. `TestGoModulePathNamesTheProjectRepository` reads go.mod, the build
+file's source label, `main_test.go`'s pinned image, the manifests and this
+README, and fails the pull request when those identities disagree.
+
 The Go toolchain version has a single source: the `go` directive at the top of
 `go.mod`. CI installs exactly that toolchain (`go-version-file: go.mod`) and the
 job prints `go version` next to the declared version, so the compiler running

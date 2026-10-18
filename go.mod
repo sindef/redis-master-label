@@ -1,4 +1,4 @@
-module github.com/redis-master-label
+module github.com/redis-master-label/redis-master-label
 
 go 1.27.0
 
