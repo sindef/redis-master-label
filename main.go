@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -32,6 +33,8 @@ var (
 	podName            = flag.String("pod-name", "", "Pod name to label (defaults to HOSTNAME env var)")
 	podNamespace       = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
 	checkInterval      = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
+	pollTimeout        = flag.Duration("poll-timeout", 5*time.Second, "Deadline for one poll iteration (ROLE plus label update); a deadline that expires reports the sidecar unhealthy")
+	apiTimeout         = flag.Duration("api-timeout", 5*time.Second, "Timeout for a single Kubernetes API request (rest.Config.Timeout)")
 	healthPort         = flag.String("health-port", "8080", "Port for health check HTTP server")
 	showVersion        = flag.Bool("version", false, "Print the build version and exit")
 )
@@ -57,6 +60,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := validateTimeouts(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	if *podName == "" {
 		*podName = os.Getenv("HOSTNAME")
 		if *podName == "" {
@@ -78,6 +86,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Bound every Kubernetes API request (Pods.Get and Pods.Update): a
+	// half-open TCP connection to the API server satisfies the socket-level
+	// timeouts and then never answers, and without rest.Config.Timeout such a
+	// request hangs until the process dies.
+	config, err = boundedConfig(config, *apiTimeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create Kubernetes client: %v\n", err)
@@ -92,8 +110,6 @@ func main() {
 
 	rdb := redis.NewClient(redisOptions)
 	defer rdb.Close()
-
-	ctx := context.Background()
 
 	// Bind the health check HTTP server before entering the main loop so a
 	// bind failure (port taken, invalid --health-port) aborts startup instead
@@ -121,10 +137,10 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
-
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
+		// Each iteration is bounded by --poll-timeout (and each API request by
+		// --api-timeout), so a stalled Redis socket or API call cannot freeze
+		// the loop and leave /healthz at its last 200: see runPollIteration.
+		if err := runPollIteration(rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
 		time.Sleep(*checkInterval)
@@ -185,6 +201,34 @@ func validateCheckInterval() error {
 	return nil
 }
 
+// validateTimeouts rejects non-positive --poll-timeout and --api-timeout. A
+// deadline of zero or less makes context.WithTimeout expire at once, so every
+// iteration would fail and /healthz would answer 503 permanently, while a
+// rest.Config.Timeout of zero means no request timeout at all: the stalled call
+// the deadline exists to bound would hang for ever again.
+func validateTimeouts() error {
+	if *pollTimeout <= 0 {
+		return fmt.Errorf("--poll-timeout must be positive, got %v", *pollTimeout)
+	}
+	if *apiTimeout <= 0 {
+		return fmt.Errorf("--api-timeout must be positive, got %v", *apiTimeout)
+	}
+	return nil
+}
+
+// boundedConfig applies rest.Config.Timeout to cfg and returns it, so every
+// request the derived client makes fails at the deadline instead of hanging on
+// a connection that never answers. A non-positive timeout is refused rather
+// than applied: client-go reads a zero Timeout as "no timeout", which is the
+// configuration this bounds.
+func boundedConfig(cfg *rest.Config, timeout time.Duration) (*rest.Config, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("--api-timeout must be positive, got %v (client-go reads zero as no request timeout)", timeout)
+	}
+	cfg.Timeout = timeout
+	return cfg, nil
+}
+
 // resolveRedisPassword returns the credential for the Redis connection. The
 // explicit --redis-password flag wins; when it is empty, the REDIS_PASSWORD
 // environment variable is used. Environment is the preferred way to supply
@@ -204,8 +248,28 @@ type roleQuerier interface {
 	Do(ctx context.Context, args ...interface{}) *redis.Cmd
 }
 
+// pollDeadline bounds one poll call with --poll-timeout. A parent that already
+// carries a deadline keeps it, so the calls of one iteration can share a single
+// deadline; a caller that hands in a context without one (context.Background(),
+// as the reviewed code did) gets the deadline applied here instead of leaving
+// the call unbounded. A Redis socket or API call that stops answering then
+// fails at the deadline instead of blocking the poll loop for ever.
+func pollDeadline(parent context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := parent.Deadline(); ok {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, *pollTimeout)
+}
+
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
+// Both the ROLE command and the Pods.Get/Pods.Update calls run under the poll
+// deadline: without it, a half-open connection to Redis or to the API server
+// leaves this call blocked indefinitely, so no label is applied or removed and
+// the health endpoint keeps its stale 200.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	ctx, cancel := pollDeadline(ctx)
+	defer cancel()
+
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
@@ -320,21 +384,81 @@ func serveHealth(listener net.Listener) <-chan error {
 	return errCh
 }
 
-func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
-	if err != nil {
-		healthStatus.mu.Lock()
-		healthStatus.consecutiveFailures++
-		if healthStatus.consecutiveFailures >= 3 {
-			healthStatus.isHealthy = false
-		}
-		healthStatus.mu.Unlock()
-		return
+// healthFailureThreshold is the number of consecutive failed poll iterations
+// after which /healthz reports unhealthy.
+const healthFailureThreshold = 3
+
+// runPollIteration performs one poll under a single --poll-timeout deadline and
+// records the health result of that call. The deadline is what ends a Redis
+// socket or API call that stops answering: without it the loop blocks for ever,
+// no ROLE runs, no label is applied or removed, and /healthz keeps answering
+// 200 from the last successful check, so a liveness probe cannot restart the
+// sidecar and readiness keeps the pod in Service endpoints with a stale
+// redis-role label.
+func runPollIteration(rdb roleQuerier, clientset kubernetes.Interface) error {
+	ctx, cancel := pollDeadline(context.Background())
+	defer cancel()
+
+	updateHealthStatus(ctx, rdb)
+	labelErr := checkAndLabel(ctx, rdb, clientset)
+
+	// A deadline that expired means the iteration did not finish. Waiting for
+	// healthFailureThreshold more iterations would keep answering the stale 200
+	// of the last successful check exactly while the sidecar is wedged, so the
+	// probe is failed at once; the deadline already is the grace period.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		markUnhealthyOverdue()
 	}
 
-	// Success - reset failure counter and mark as healthy
+	return labelErr
+}
+
+// recordHealthFailure counts one failed poll and fails the probe once
+// healthFailureThreshold consecutive failures are reached.
+func recordHealthFailure() {
+	healthStatus.mu.Lock()
+	healthStatus.consecutiveFailures++
+	if healthStatus.consecutiveFailures >= healthFailureThreshold {
+		healthStatus.isHealthy = false
+	}
+	healthStatus.mu.Unlock()
+}
+
+// recordHealthSuccess resets the failure counter and reports healthy.
+func recordHealthSuccess() {
 	healthStatus.mu.Lock()
 	healthStatus.consecutiveFailures = 0
 	healthStatus.isHealthy = true
 	healthStatus.mu.Unlock()
+}
+
+// markUnhealthyOverdue fails the probe immediately when a poll call outran its
+// deadline: the deadline is the grace period, and reporting unhealthy at once
+// is what turns a stalled Redis or API call into a 503 instead of leaving the
+// last 200 in place.
+func markUnhealthyOverdue() {
+	healthStatus.mu.Lock()
+	healthStatus.consecutiveFailures = healthFailureThreshold
+	healthStatus.isHealthy = false
+	healthStatus.mu.Unlock()
+}
+
+// updateHealthStatus runs the ROLE health check under the poll deadline and
+// records the outcome. A ROLE that never answers must not leave the failure
+// counter untouched: the expired deadline fails the probe at once, because
+// otherwise the stale 200 keeps the kubelet from restarting the sidecar.
+func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
+	ctx, cancel := pollDeadline(ctx)
+	defer cancel()
+
+	if _, err := rdb.Do(ctx, "ROLE").Result(); err != nil {
+		recordHealthFailure()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			markUnhealthyOverdue()
+		}
+		return
+	}
+
+	// Success - reset failure counter and mark as healthy
+	recordHealthSuccess()
 }

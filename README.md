@@ -30,6 +30,8 @@ Flags (all have sensible defaults):
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
 - `--check-interval` (default `10s`)
+- `--poll-timeout` (default `5s`; deadline for one poll iteration, covering both the `ROLE` check and the label update. A deadline that expires is reported unhealthy at once, so a stalled call cannot freeze `/healthz` at a stale `200`; see "Health Check Endpoint")
+- `--api-timeout` (default `5s`; deadline for a single Kubernetes API request — `rest.Config.Timeout` on the in-cluster client — so a half-open connection to the API server cannot hang `Pods.Get` or `Pods.Update` for ever)
 - `--health-port` (default `8080`)
 - `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
@@ -282,6 +284,18 @@ The application provides a health check endpoint at `/healthz` that:
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
 - Runs on port 8080 by default (configurable via `--health-port`)
 
+Each poll iteration is bounded, so the endpoint cannot report a stale `200`:
+every iteration shares one `--poll-timeout` deadline across the `ROLE` check and
+the label update (`Pods.Get`/`Pods.Update`), and the in-cluster client carries
+`--api-timeout` as its per-request timeout. A Redis socket or API server that
+stops answering therefore fails the iteration at the deadline instead of
+blocking the loop for ever, and an iteration that reaches its deadline reports
+unhealthy immediately (no further failure counting): `/healthz` answers `503`,
+the liveness probe restarts the sidecar, and the readiness probe takes the pod
+out of the Service endpoints with its stale `redis-role` label. A failed label
+update with a successful `ROLE` reply counts toward the same failure threshold,
+because applying the label is the sidecar's job.
+
 Example:
 ```bash
 curl http://localhost:8080/healthz
@@ -324,6 +338,7 @@ polls the port, which is how the wiring went missing. If you change
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
+- Each iteration is bounded by `--poll-timeout`, and each Kubernetes API request by `--api-timeout`; both must be positive, and a deadline that expires reports the sidecar unhealthy instead of leaving the last `200` in place.
 - If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
 - The health check endpoint is what the example deployments' probes poll, so the kubelet restarts the sidecar when it turns unhealthy (see "Health Check Endpoint").
 
