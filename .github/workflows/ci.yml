@@ -236,6 +236,14 @@ jobs:
   # when the graph cannot be produced (for example when go.sum is missing an
   # entry). TestWorkflowsReportModuleGraphCheck fails the pull request when this
   # job is dropped, renamed or left without its graph commands.
+  #
+  # The graph itself is written under $RUNNER_TEMP, outside the checkout, so the
+  # job cannot leave a generated file in the working tree for `git add -A` to
+  # commit as if it were source. .gitignore also covers go_modules_graph.txt, the
+  # file a hand-run of the same command leaves behind.
+  # TestModuleGraphStepWritesGraphOutsideCheckout fails when either half is
+  # undone, and the non-empty assertion below still runs so the required check
+  # keeps its meaning.
   update-go_modules-graph:
     name: update-go_modules-graph
     runs-on: ubuntu-latest
@@ -249,5 +257,11 @@ jobs:
 
       - name: Update go_modules graph
         run: |
-          go mod graph > go_modules_graph.txt
-          test -s go_modules_graph.txt
+          # The graph is generated output and belongs to no source file, so it is
+          # written outside the checkout: a bare `> go_modules_graph.txt` left the
+          # file in the working tree, where .gitignore did not cover it and
+          # `git add -A` could commit a generated dependency graph as source.
+          # ${RUNNER_TEMP:-/tmp} keeps a local reproduction of this step out of
+          # the tree as well. The non-empty assertion still runs.
+          go mod graph > "${RUNNER_TEMP:-/tmp}/go_modules_graph.txt"
+          test -s "${RUNNER_TEMP:-/tmp}/go_modules_graph.txt"

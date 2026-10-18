@@ -12,3 +12,8 @@ coverage*.txt
 # Go workspace files (never commit local overrides)
 go.work
 go.work.sum
+
+# Generated module graph (CI writes it under $RUNNER_TEMP, outside the checkout):
+# ignore the copy a local `go mod graph > go_modules_graph.txt` leaves in the
+# working tree, which `git add -A` would otherwise commit as if it were source.
+go_modules_graph.txt
