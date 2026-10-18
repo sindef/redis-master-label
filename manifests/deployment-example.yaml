@@ -24,6 +24,18 @@ spec:
         - --replicaof
         - "redis-leader.default.svc.cluster.local"
         - "6379"
+        # Without a request Kubernetes places the pod in the BestEffort QoS
+        # class, and the scheduler scores and evicts it first under node
+        # pressure; without a limit one replica's Redis can consume a whole
+        # node. TestManifestContainersDeclareResources fails the pull request
+        # when any example container loses its requests or limits.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
       - name: redis-master-label
         # Pinned to a registry-qualified versioned release, never :latest:
         # a floating tag makes every deployment's image depend on the newest
@@ -83,6 +95,17 @@ spec:
             port: health
           initialDelaySeconds: 5
           periodSeconds: 10
+        # Same as the redis container: requests keep the pod out of the
+        # BestEffort QoS class and limits cap the 10s poll loop
+        # (--check-interval=10s) at 100m CPU.
+        # TestManifestContainersDeclareResources fails when it is dropped.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
         # The labeler needs no privileges - it only reads Redis and calls the
         # Kubernetes API with its mounted credentials - and works fine with a
         # read-only root filesystem. Without this block the container ran as

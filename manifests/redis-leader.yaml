@@ -21,6 +21,17 @@ spec:
         - containerPort: 6379
         command:
         - redis-server
+        # Same as deployment-example.yaml: without a request Kubernetes places
+        # the pod in the BestEffort QoS class and evicts it first under node
+        # pressure, so every example container declares requests and limits.
+        # TestManifestContainersDeclareResources fails when one loses them.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
       - name: redis-master-label
         # Same as deployment-example.yaml: pinned versioned release image,
         # never a floating :latest reference.
@@ -72,6 +83,17 @@ spec:
             port: health
           initialDelaySeconds: 5
           periodSeconds: 10
+        # Same as deployment-example.yaml: requests keep the pod out of the
+        # BestEffort QoS class and limits cap the 10s poll loop
+        # (--check-interval=10s) at 100m CPU.
+        # TestManifestContainersDeclareResources fails when it is dropped.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
         # Same as deployment-example.yaml: the labeler needs no privileges
         # (it only reads Redis and calls the Kubernetes API with its mounted
         # credentials), so it runs as the image's non-root uid, cannot write

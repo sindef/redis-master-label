@@ -155,6 +155,15 @@ Key points for the deployment:
 - Inject Redis connection info via args (address, TLS) and the credential via the `REDIS_PASSWORD` env var from a Secret (see "Example usage in a pod").
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
+- Declare CPU and memory requests and limits on every container, as both
+  example deployments do. A pod whose containers declare no request runs in the
+  BestEffort QoS class, so the scheduler scores and evicts it first under node
+  pressure, and a container with no limit can consume a whole node (one
+  replica's Redis, or the labeler's 10s poll loop). The values in the examples
+  are a starting point, not a guarantee: size their requests and limits for your
+  own workload. `TestManifestContainersDeclareResources` fails the pull request
+  when an example container loses its requests or limits, exactly as
+  kubeconform cannot see it (its schema accepts resources as optional).
 - Expose the health port the labeler is told to listen on and poll `/healthz` from a liveness and a readiness probe (see "Health Check Endpoint"); both example deployments do.
 - Run the labeler unprivileged (see "Running unprivileged" below); the caveat
   at the end of that section covers the co-located `redis` container.
