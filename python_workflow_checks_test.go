@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +56,18 @@ func pythonCheckInterpreter() string {
 // assertion inside the suite fails the Go test that ran it.
 func runPythonCheckSuite(python, script string) ([]byte, error) {
 	return exec.Command(python, script).CombinedOutput()
+}
+
+// unittestNoTestsExit reports whether err is the exit status Python 3.12+
+// unittest uses for a run that collected no tests: it prints "NO TESTS RAN"
+// and exits 5. Older Pythons exit 0 for the same suite, so a caller must accept
+// both shapes and read the 0-test summary instead of the exit status.
+func unittestNoTestsExit(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	return exitErr.ExitCode() == 5
 }
 
 // unittestRanTests reads unittest's "Ran N tests in Xs" summary. It reports
@@ -112,6 +125,12 @@ func TestUnittestRanTestsSummary(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name:   "no cases left on python 3.12",
+			output: "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n",
+			want:   0,
+			wantOK: true,
+		},
+		{
 			name:   "no unittest summary",
 			output: "python3: can't open file 'test_workflow_checks.py': [Errno 2] No such file or directory\n",
 		},
@@ -142,6 +161,11 @@ func TestWorkflowChecksPythonSuitePasses(t *testing.T) {
 
 	out, err := runPythonCheckSuite(python, pythonWorkflowCheckSuite)
 	if err != nil {
+		// Python 3.12+ reports an emptied suite as exit status 5 rather than a
+		// 0-test summary followed by OK, so name that case the same way.
+		if count, ok := unittestRanTests(string(out)); unittestNoTestsExit(err) || (ok && count == 0) {
+			t.Fatalf("%s ran 0 tests: its cases were deleted or renamed, so the suite no longer guards the checker or the workflows this repository ships:\n%s", pythonWorkflowCheckSuite, out)
+		}
 		t.Fatalf("%s %s: %v\n%s", python, pythonWorkflowCheckSuite, err, out)
 	}
 	count, ok := unittestRanTests(string(out))
@@ -191,14 +215,16 @@ func TestRunPythonCheckSuite_RegressionFixtures(t *testing.T) {
 		t.Fatalf("suite with a failing case exited 0, so a broken case could not fail the build:\n%s", out)
 	}
 
-	// An entry point whose cases were removed exits 0 with "Ran 0 tests"; the
-	// summary reader is what keeps that from reading as a pass.
+	// An entry point whose cases were removed must not read as a pass. Python
+	// 3.12+ exits 5 and prints "NO TESTS RAN" for a suite with no cases, while
+	// older Pythons exit 0 with "OK"; either way the summary reader is what
+	// keeps the 0-case output from reading as a pass.
 	out, err = runPythonCheckSuite(python, empty)
-	if err != nil {
+	if err != nil && !unittestNoTestsExit(err) {
 		t.Fatalf("empty suite: %v\n%s", err, out)
 	}
 	if count, ok := unittestRanTests(string(out)); !ok || count != 0 {
-		t.Fatalf("empty suite reported %d tests (summary read=%v), want its 0-test summary detected", count, ok)
+		t.Fatalf("empty suite reported %d tests (summary read=%v), want its 0-test summary detected:\n%s", count, ok, out)
 	}
 
 	// A deleted entry point is an execution error, not a silent pass.
