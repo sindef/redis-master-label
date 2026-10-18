@@ -95,14 +95,32 @@ missing, empty, or when the version label disagrees with `--build-arg VERSION`.
 
 ## Releases
 Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
-the tag-push workflow runs `go vet` and the full test suite, then builds the
-image with `--build-arg VERSION=<tag>` and pushes exactly
+the tag-push workflow runs `go vet` and the full test suite, builds the image
+with `--build-arg VERSION=<tag>`, verifies that image the way CI does on a pull
+request, and only then pushes exactly
 `ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
 name, `GITHUB_TOKEN` with `packages: write`, plus the `id-token: write` and
-`attestations: write` permissions attestations need). The image carries provenance
-and SBOM attestations, and the workflow's step summary reports the pushed digest
-plus the `docker buildx imagetools inspect` output for it, so the attestation
-manifests are visible on every release run.
+`attestations: write` permissions attestations need).
+
+The verification steps run on the image the job just built, before any registry
+credential is used: they run it with `--version` and compare the output with the
+build arg, `docker inspect` all five `org.opencontainers.image.*` labels and
+compare the version label with the build arg, and check that the image's
+`licenses` label matches the `LICENSE` file the repository grants. A build-file
+regression that drops the VERSION stamp or moves a `LABEL` into the discarded
+builder stage therefore fails the tag push instead of reaching GHCR; `go test`
+cannot catch it because tests compile without the linker stamp and never run an
+image. `TestReleaseWorkflowVerifiesImageBeforePush` fails the pull request when
+one of these steps is removed or moved after the push.
+
+The workflow also runs on pull requests and manual dispatches, so the
+build-and-verify path is exercised before a release rather than discovered
+mid-release: only the steps gated on a tag ref log in to the registry and push,
+so those events build and verify the image and stop.
+
+The image carries provenance and SBOM attestations, and the workflow's step
+summary reports the pushed digest plus the `docker buildx imagetools inspect`
+output for it, so the attestation manifests are visible on every release run.
 Nothing floating (`:latest`) is ever published.
 
 ### Release checklist
@@ -125,8 +143,9 @@ even when the stale string lives in `main_test.go`.
    go test -count=1 ./...
    git tag v0.2.0 && git push origin v0.2.0
    ```
-   The tag push starts the release workflow (vet + tests, then build and push
-   `ghcr.io/<owner>/redis-master-label:<tag>`).
+   The tag push starts the release workflow (vet + tests, then build, verify the
+   built image's `--version` output, OCI labels and license metadata, and finally
+   push `ghcr.io/<owner>/redis-master-label:<tag>`).
 3. Apply the updated manifests; the pinned tag rolls out the new image.
 
 Rollback: redeploy the previous release's full image reference

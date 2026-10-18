@@ -2433,6 +2433,161 @@ func TestWorkflowsReportModuleGraphCheck(t *testing.T) {
 	}
 }
 
+// The reviewed release_hygiene defect: release.yml built the image and handed
+// it to docker/build-push-action, so the image-level checks that live only in
+// ci.yml ("Verify image version output", "Verify image OCI labels", "Verify
+// image license metadata") were absent from the publishing path. A build-file
+// regression that drops the VERSION stamp or moves a LABEL into the discarded
+// builder stage is invisible to `go test` (it compiles without the linker stamp
+// and never sees an image), so the tag push must run the built image and
+// inspect its metadata before anything reaches GHCR.
+func TestReleaseWorkflowVerifiesImageBeforePush(t *testing.T) {
+	problems, publishing, err := releaseImageVerificationProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatalf("releaseImageVerificationProblems: %v", err)
+	}
+	if publishing == 0 {
+		t.Fatal("no workflow pushes an image: the release verification check ran against nothing")
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The failure modes at workflow level: the reviewed shape (push with no
+// verification at all), verification placed after the push, a missing label
+// assertion, a license check that never reads the repository's LICENSE file, a
+// tag-only trigger, and a workflow that builds without pushing must each be
+// reported exactly as intended, while the verified publishing workflow must
+// pass.
+func TestReleaseImageVerificationProblems_RegressionFixtures(t *testing.T) {
+	const (
+		versionStep = "      - name: Verify image version output\n" +
+			"        run: |\n" +
+			"          docker run --rm example:test --version\n"
+		labelsStep = "      - name: Verify image OCI labels\n" +
+			"        run: |\n" +
+			"          docker inspect --format '{{json .Config.Labels}}' example:test\n" +
+			"          org.opencontainers.image.title\n" +
+			"          org.opencontainers.image.description\n" +
+			"          org.opencontainers.image.source\n" +
+			"          org.opencontainers.image.licenses\n" +
+			"          org.opencontainers.image.version\n"
+		licenseStep = "      - name: Verify image license metadata\n" +
+			"        run: |\n" +
+			"          test -f LICENSE\n"
+		buildStep = "      - name: Build image\n" +
+			"        run: docker build -t example:test .\n"
+		pushStep = "      - name: Publish image\n" +
+			"        uses: docker/build-push-action@v7\n" +
+			"        with:\n" +
+			"          push: true\n"
+		// The trigger block both events need: the tag push releases, and a pull
+		// request or manual dispatch exercises the same build-and-verify path.
+		bothTriggers = "on:\n  push:\n    tags:\n      - 'v*.*.*'\n  pull_request:\n"
+		tagOnly      = "on:\n  push:\n    tags:\n      - 'v*.*.*'\n"
+	)
+
+	workflow := func(trigger, steps string) string {
+		return "name: Release\n" + trigger +
+			"permissions:\n  contents: read\n" +
+			"jobs:\n  build-and-publish:\n    runs-on: ubuntu-latest\n    steps:\n" + steps
+	}
+
+	tests := []struct {
+		name           string
+		workflow       string
+		wantPublishing int
+		wantQuiet      bool
+		wantSubstr     string
+	}{
+		{
+			name:           "verification runs before the push step",
+			workflow:       workflow(bothTriggers, versionStep+labelsStep+licenseStep+pushStep),
+			wantPublishing: 1,
+			wantQuiet:      true,
+		},
+		{
+			name:           "reviewed pre-fix shape: push without running the image",
+			workflow:       workflow(bothTriggers, buildStep+pushStep),
+			wantPublishing: 1,
+			wantSubstr:     "never runs",
+		},
+		{
+			name:           "verification moved after the push step",
+			workflow:       workflow(bothTriggers, pushStep+versionStep+labelsStep+licenseStep),
+			wantPublishing: 1,
+			wantSubstr:     "never runs",
+		},
+		{
+			// The workflows document themselves heavily, so a comment naming the
+			// checks must not stand in for the steps that run them.
+			name: "checks named only in comments",
+			workflow: workflow(bothTriggers,
+				"      # docker run --rm example:test --version\n"+
+					"      # docker inspect --format '{{json .Config.Labels}}' example:test\n"+
+					"      # check LICENSE and every org.opencontainers.image.version label here\n"+
+					buildStep+pushStep),
+			wantPublishing: 1,
+			wantSubstr:     "never runs",
+		},
+		{
+			name:           "metadata never inspected",
+			workflow:       workflow(bothTriggers, versionStep+licenseStep+pushStep),
+			wantPublishing: 1,
+			wantSubstr:     "org.opencontainers.image.title",
+		},
+		{
+			name:           "license label not checked against the repository grant",
+			workflow:       workflow(bothTriggers, versionStep+labelsStep+pushStep),
+			wantPublishing: 1,
+			wantSubstr:     "LICENSE",
+		},
+		{
+			name:           "only triggered by a tag push",
+			workflow:       workflow(tagOnly, versionStep+labelsStep+licenseStep+pushStep),
+			wantPublishing: 1,
+			wantSubstr:     "pull_request",
+		},
+		{
+			name: "workflow that builds but never pushes",
+			workflow: workflow(bothTriggers, buildStep+
+				"      - name: Inspect image\n        run: docker inspect example:test\n"),
+			wantPublishing: 0,
+			wantQuiet:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "release.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, publishing, err := releaseImageVerificationProblems(dir)
+			if err != nil {
+				t.Fatalf("releaseImageVerificationProblems: %v", err)
+			}
+			if publishing != tt.wantPublishing {
+				t.Fatalf("publishing workflows = %d, want %d", publishing, tt.wantPublishing)
+			}
+			if tt.wantQuiet {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("workflow that would publish an unverified image accepted, want a problem reported")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantSubstr) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantSubstr)
+			}
+		})
+	}
+}
+
 // The failure modes at workflow level: the missing job (the reviewed shape and
 // the current one, where the same commands live inside another job), a job that
 // no longer rebuilds the graph, a job without the non-empty assertion, a

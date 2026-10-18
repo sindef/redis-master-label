@@ -402,3 +402,208 @@ func jobBody(lines []string) string {
 	}
 	return strings.Join(body, "\n")
 }
+
+// Release-path image verification: a vX.Y.Z tag push is the only path that
+// publishes an image, and nothing in this repository can see the image that job
+// builds. `go test` compiles the binary without the linker stamp the build file
+// feeds through -ldflags (dockerfile_check.go reads the stamp out of the build
+// file precisely because a test cannot run the image), and the offline Python
+// checker only scans workflow text. The reviewed defect was release.yml
+// building the image and handing it straight to docker/build-push-action: the
+// image-level checks that live only in ci.yml ("Verify image version output",
+// "Verify image OCI labels", "Verify image license metadata") were absent from
+// the publishing path, so a build-file regression that drops the VERSION stamp
+// or moves a LABEL into the discarded builder stage passed `go test` and
+// reached GHCR on the next tag push. The check below keeps those steps on every
+// workflow that pushes an image: the workflow text must run the built image
+// with --version and inspect its metadata before the push step.
+
+// buildPushActionStr is the action that publishes images; releaseImageVerify*
+// name the evidence a publishing workflow must show before it. The label names
+// are spelled out in full rather than assembled from a prefix so the scan can
+// report exactly which label nothing asserts.
+const (
+	buildPushActionStr        = "docker/build-push-action"
+	pushInputKey              = "push"
+	pushInputTrueValue        = "true"
+	releaseVerifyRunToken     = "docker run"
+	releaseVerifyVersionToken = "--version"
+	releaseVerifyInspectToken = "docker inspect"
+	releaseVerifyLicenseToken = "LICENSE"
+)
+
+// ociImageLabelNames are the five org.opencontainers.image.* labels the
+// shipping image must carry. ci.yml's "Verify image OCI labels" step asserts
+// each is present and non-empty and that the version label equals the build
+// arg; a publishing workflow must assert the same about the image it pushes.
+var ociImageLabelNames = []string{
+	"org.opencontainers.image.title",
+	"org.opencontainers.image.description",
+	"org.opencontainers.image.source",
+	"org.opencontainers.image.licenses",
+	"org.opencontainers.image.version",
+}
+
+// releaseImageVerificationProblems returns one message per workflow under dir
+// that publishes an image (docker/build-push-action with `push: true`) without
+// verifying that image first, plus the number of workflows that publish, so a
+// caller can tell "no problems" from "nothing publishes here, so nothing was
+// checked".
+func releaseImageVerificationProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	publishing := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		found, publishes := releaseImageVerificationProblemsIn(path, string(data))
+		problems = append(problems, found...)
+		if publishes {
+			publishing++
+		}
+	}
+	sort.Strings(problems)
+	return problems, publishing, nil
+}
+
+// releaseImageVerificationProblemsIn scans one workflow's text. A workflow that
+// never pushes an image is not flagged: only the publishing path has to prove
+// the image it hands to the registry.
+func releaseImageVerificationProblemsIn(path, text string) ([]string, bool) {
+	lines := strings.Split(text, "\n")
+
+	pushStep := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.Contains(line, buildPushActionStr) {
+			pushStep = i
+			break
+		}
+	}
+	if pushStep < 0 {
+		return nil, false
+	}
+
+	pushes := false
+	for _, line := range stepBody(lines, pushStep) {
+		key, value, ok := workflowInput(strings.TrimSpace(line))
+		if !ok {
+			continue
+		}
+		if key == pushInputKey && value == pushInputTrueValue {
+			pushes = true
+		}
+	}
+	if !pushes {
+		return nil, false
+	}
+
+	// Only the text before the push step counts: a check that runs after the
+	// image was handed to the registry verifies nothing, which is the reviewed
+	// shape where the CI-only steps sat in another workflow entirely. Comment
+	// lines are dropped, so a comment that merely names a check - this
+	// repository's workflows document themselves heavily - cannot stand in for
+	// the step that runs it.
+	before := releaseVerificationText(lines[:pushStep])
+	at := fmt.Sprintf("%s:%d", path, pushStep+1)
+	var problems []string
+
+	if !strings.Contains(before, releaseVerifyRunToken) || !strings.Contains(before, releaseVerifyVersionToken) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: %s pushes an image the job never runs, so a build-file regression that drops the VERSION stamp reaches the registry unverified; run the built image with --version before this step, the way ci.yml's \"Verify image version output\" step does",
+			at, buildPushActionStr))
+	}
+	if !strings.Contains(before, releaseVerifyInspectToken) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: %s pushes an image whose metadata is never inspected, so a LABEL left in the discarded builder stage reaches the registry with nothing to notice it; run docker inspect on the built image before this step, the way ci.yml's \"Verify image OCI labels\" step does",
+			at, buildPushActionStr))
+	}
+	for _, label := range ociImageLabelNames {
+		if !strings.Contains(before, label) {
+			problems = append(problems, fmt.Sprintf(
+				"%s: %s pushes an image whose %s label nothing asserts before the push, so an image missing that metadata is published; check the label on the built image, the way ci.yml's \"Verify image OCI labels\" step does",
+				at, buildPushActionStr, label))
+		}
+	}
+	if !strings.Contains(before, releaseVerifyLicenseToken) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: %s pushes an image advertising a license without checking that the repository grants it (no %s file read before the push), the way ci.yml's \"Verify image license metadata\" step does",
+			at, buildPushActionStr, releaseVerifyLicenseToken))
+	}
+	if !hasNonTagTrigger(lines) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: the workflow that pushes images is only triggered by a tag push, so a break in these steps is discovered mid-release; add a `pull_request:` or `workflow_dispatch:` trigger and gate the push steps on a tag ref so the same build-and-verify path runs before the release",
+			path))
+	}
+	return problems, true
+}
+
+// releaseVerificationText returns the pre-push workflow text the scan reads,
+// with comment-only lines removed so documentation cannot satisfy a check.
+func releaseVerificationText(lines []string) string {
+	var kept []string
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// stepBody returns the lines of the step whose `uses:` line is at index
+// usesIndex. Step bodies in these workflows are indented deeper than the step's
+// list item, so a following content line at or above that indentation (the next
+// step's `- name:`, another `uses:`, a job key) ends the step; when the `uses:`
+// itself sits on the list item (`- uses: ...`) a sibling item ends it.
+func stepBody(lines []string, usesIndex int) []string {
+	usesIndent := len(rawLineIndent(lines[usesIndex]))
+	dashOnUses := strings.HasPrefix(strings.TrimSpace(lines[usesIndex]), "- ")
+	body := []string{lines[usesIndex]}
+	for _, line := range lines[usesIndex+1:] {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			body = append(body, line)
+			continue
+		}
+		indent := len(rawLineIndent(line))
+		if indent < usesIndent || (dashOnUses && indent == usesIndent) {
+			break
+		}
+		body = append(body, line)
+	}
+	return body
+}
+
+// hasNonTagTrigger reports whether a workflow's trigger block names an event
+// that runs the job without a release tag (a pull request or a manual
+// dispatch). Only the exact trigger keys count, so a later step mentioning
+// `pull_request` in its text does not satisfy the scan.
+func hasNonTagTrigger(lines []string) bool {
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || len(rawLineIndent(line)) == 0 {
+			continue
+		}
+		switch trimmed {
+		case "pull_request:", "pull_request_target:", "workflow_dispatch:":
+			return true
+		}
+	}
+	return false
+}

@@ -1,16 +1,35 @@
 name: Release
 
-# Publishing path for release_hygiene: a vX.Y.Z tag is the single trigger. The
-# workflow runs the same tests as CI, builds one image stamped with the tag
-# version, and pushes exactly one immutable reference:
+# Publishing path for release_hygiene: a vX.Y.Z tag is the single release
+# trigger. The workflow runs the same tests as CI, builds one image stamped with
+# the tag version, verifies that image with the image-level checks CI runs on a
+# pull request, and only then pushes exactly one immutable reference:
 # <registry>/<image>:<tag>. Nothing floating like :latest is ever pushed, so
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
 # newer releases appear.
+#
+# The image-level checks matter on this path. `go test` compiles the binary
+# without the linker stamp and never sees a built image, so a build-file
+# regression that drops the VERSION stamp or moves an OCI LABEL into the
+# discarded builder stage is invisible to the test suite; without the steps
+# below it would be invisible here too, and the broken image would reach GHCR on
+# the next tag push. ci.yml's "Verify image version output", "Verify image OCI
+# labels" and "Verify image license metadata" steps assert the same things on
+# pull requests, and this workflow now runs the equivalent checks on the image
+# it is about to publish.
+#
+# The workflow also runs on pull requests and on manual dispatch, so the
+# build-and-verify path is exercised before a release instead of being
+# discovered mid-release. Only the steps gated on a tag ref log in to the
+# registry or push anything: every other event builds and verifies the image
+# and stops.
 on:
   push:
     tags:
       - 'v*.*.*'
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -49,14 +68,95 @@ jobs:
           lowercase=$(echo "${{ env.IMAGE }}" | tr '[:upper:]' '[:lower:]')
           echo "image=${lowercase}" >> "$GITHUB_OUTPUT"
 
-      # The tag checkout is a detached HEAD; the build-arg feeds both the
-      # binary's --version output and the image's OCI version label.
+      # The build-arg feeds both the binary's --version output and the image's
+      # OCI version label, and the same value tags the image this job builds,
+      # verifies and (on a tag push) publishes, so the verified reference and
+      # the published reference cannot drift apart. A release tag is the stamped
+      # version; on any other event (pull request, manual dispatch) there is no
+      # release to stamp, so a placeholder keeps this build-and-verify path
+      # exercisable without inventing one.
+      - name: Compute image version
+        id: version
+        shell: bash
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/*) version="${GITHUB_REF_NAME}" ;;
+            *)           version="v0.0.0-verify" ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build image
         run: |
-          version="${GITHUB_REF_NAME}"
+          version="${{ steps.version.outputs.version }}"
           docker build --build-arg VERSION="$version" -t "${{ steps.image.outputs.image }}:$version" .
 
+      # The version the image reports is documented behavior (README: an
+      # unstamped build reports `dev`, a release reports its tag) and `go test`
+      # cannot see a regression here because tests compile without the linker
+      # stamp. So run the image this job just built, exactly as ci.yml's
+      # "Verify image version output" step does, before any registry credential
+      # is used: a build file that stopped passing VERSION to the linker must
+      # fail the tag push instead of publishing an image that reports nothing.
+      - name: Verify image version output
+        run: |
+          image="${{ steps.image.outputs.image }}:${{ steps.version.outputs.version }}"
+          want="redis-master-label ${{ steps.version.outputs.version }}"
+          got=$(docker run --rm "$image" --version)
+          if [ "$got" != "$want" ]; then
+            echo "image built with --build-arg VERSION=${{ steps.version.outputs.version }} must report '$want', got '$got'" >&2
+            exit 1
+          fi
+
+      # The image metadata must survive into the image users pull. A LABEL block
+      # in the builder stage reads the same in the build file yet is discarded
+      # with that stage, and build args do not cross stage boundaries either, so
+      # a version label whose VERSION argument was left in the builder stage
+      # ships an image nobody can identify. Inspect the labels of the image this
+      # job built, as ci.yml's "Verify image OCI labels" step does: every
+      # expected label must be present and non-empty, and the version label must
+      # be the build arg.
+      - name: Verify image OCI labels
+        run: |
+          image="${{ steps.image.outputs.image }}:${{ steps.version.outputs.version }}"
+          labels=$(docker inspect --format '{{json .Config.Labels}}' "$image")
+          for key in org.opencontainers.image.title org.opencontainers.image.description org.opencontainers.image.source org.opencontainers.image.licenses org.opencontainers.image.version; do
+            if ! printf '%s' "$labels" | grep -q "\"$key\":\"[^\"]"; then
+              echo "shipping image declares no non-empty $key label (is the LABEL in the final stage?): $labels" >&2
+              exit 1
+            fi
+          done
+
+          got=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")
+          want="${{ steps.version.outputs.version }}"
+          if [ "$got" != "$want" ]; then
+            echo "org.opencontainers.image.version = '$got', want '$want': --build-arg VERSION must reach the label, which needs ARG VERSION in the final stage" >&2
+            exit 1
+          fi
+
+      # The published image must grant the license it advertises: the label
+      # value comes from the image this job built rather than a grep of the
+      # build file, because a LABEL in the discarded builder stage parses the
+      # same in the file yet never reaches the image. This is ci.yml's "Verify
+      # image license metadata" step on the image that is about to be pushed.
+      - name: Verify image license metadata
+        run: |
+          test -f LICENSE || { echo "LICENSE missing: the image advertises a license the repository does not grant" >&2; exit 1; }
+          grep -q 'Permission is hereby granted, free of charge' LICENSE || { echo "LICENSE does not contain the MIT permission text" >&2; exit 1; }
+
+          image="${{ steps.image.outputs.image }}:${{ steps.version.outputs.version }}"
+          got=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' "$image")
+          want=MIT
+          if [ "$got" != "$want" ]; then
+            echo "org.opencontainers.image.licenses = '$got' on the shipping image, want '$want' (is the LABEL in the final stage?)" >&2
+            exit 1
+          fi
+
+      # Everything above ran without a registry credential and before anything
+      # was pushed. The steps below are the publish path, so they only run for a
+      # release tag: a pull request or manual dispatch builds and verifies the
+      # image and stops here.
       - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -65,17 +165,19 @@ jobs:
 
       - name: Publish image with provenance and SBOM attestations
         id: push
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          build-args: VERSION=${{ github.ref_name }}
+          build-args: VERSION=${{ steps.version.outputs.version }}
           provenance: mode=max
           sbom: true
           tags: |
-            ${{ steps.image.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.image }}:${{ steps.version.outputs.version }}
 
       - name: Report digest and attestations in step summary
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
