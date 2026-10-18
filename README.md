@@ -115,6 +115,16 @@ so push a stale pin and no image is released — and the test's error text says
 the manifest image "is not the pinned release image", which points at the YAML
 even when the stale string lives in `main_test.go`.
 
+The module path is a fourth, quieter copy of the same identity: `go.mod`'s
+`module` line is both the import path and the VCS location of the project, so
+`go get`, module-proxy lookups and the SBOM purl metadata derived from it must
+resolve to the repository the image `org.opencontainers.image.source` label
+names and the release image pin publishes from. `TestModulePathMatchesPublishedRepository`
+reads all three and fails when they disagree, so the module path cannot be left
+naming a different repository (the reviewed drift was the bare organization,
+`github.com/redis-master-label`, beside a project published as
+`redis-master-label/redis-master-label`).
+
 1. Bump the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`
    reference in every one of these files:
    - `main_test.go` — `const releaseImage = "..."`
