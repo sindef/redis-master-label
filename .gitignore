@@ -9,6 +9,12 @@ redis-master-label
 coverage*.txt
 *.prof
 
+# Generated module-graph export. CI's update-go_modules-graph job writes it
+# outside the checkout ($RUNNER_TEMP); this entry covers a local run of the
+# same `go mod graph > go_modules_graph.txt` command, so the generated
+# dependency graph can never be staged as if it were source.
+go_modules_graph.txt
+
 # Go workspace files (never commit local overrides)
 go.work
 go.work.sum

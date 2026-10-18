@@ -247,7 +247,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The export is a throwaway proof that the graph can be produced from
+      # go.mod/go.sum alone, so it must not land in the checkout root: an
+      # untracked go_modules_graph.txt there is swept into a commit by any
+      # `git add -A`, which commits the whole dependency graph as if it were
+      # source. It goes to the runner's temp directory, outside the working
+      # tree (the file name is listed in .gitignore as well, so reproducing the
+      # same two commands by hand leaves nothing to stage), and the non-empty
+      # assertion still runs on the file that was written.
       - name: Update go_modules graph
         run: |
-          go mod graph > go_modules_graph.txt
-          test -s go_modules_graph.txt
+          go mod graph > "$RUNNER_TEMP/go_modules_graph.txt"
+          test -s "$RUNNER_TEMP/go_modules_graph.txt"
