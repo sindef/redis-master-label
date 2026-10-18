@@ -2,7 +2,9 @@ name: Release
 
 # Publishing path for release_hygiene: a vX.Y.Z tag is the single trigger. The
 # workflow runs the same tests as CI, builds one image stamped with the tag
-# version, and pushes exactly one immutable reference:
+# version, runs that image and inspects its metadata (the way ci.yml does, whose
+# image checks never run for a tag push), and only then pushes exactly one
+# immutable reference:
 # <registry>/<image>:<tag>. Nothing floating like :latest is ever pushed, so
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
@@ -55,6 +57,64 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME}"
           docker build --build-arg VERSION="$version" -t "${{ steps.image.outputs.image }}:$version" .
+
+      # A tag push runs this workflow alone: ci.yml is triggered by pull
+      # requests and pushes to main, so its image checks ("Verify image version
+      # output", "Verify image OCI labels", "Verify image license metadata") are
+      # skipped exactly on the path that publishes. The three steps below repeat
+      # them against the image built above, with the same --build-arg the push
+      # uses, so a build-file regression that drops the VERSION stamp or leaves
+      # a LABEL behind in the discarded builder stage fails the tag push before
+      # GHCR receives any reference. They run before the login and push steps,
+      # so a failure publishes nothing.
+      - name: Verify image version output
+        run: |
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          got=$(docker run --rm "$image" --version)
+          want="redis-master-label $version"
+          if [ "$got" != "$want" ]; then
+            echo "image built with --build-arg VERSION=$version must report '$want', got '$got': the release would publish a binary with no version stamp" >&2
+            exit 1
+          fi
+
+      - name: Verify image OCI labels
+        run: |
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          labels=$(docker inspect --format '{{json .Config.Labels}}' "$image")
+          for key in \
+            org.opencontainers.image.title \
+            org.opencontainers.image.description \
+            org.opencontainers.image.source \
+            org.opencontainers.image.licenses \
+            org.opencontainers.image.version; do
+            if ! printf '%s' "$labels" | grep -q "\"$key\":\"[^\"]"; then
+              echo "release image declares no non-empty $key label (is the LABEL in the final stage?): $labels" >&2
+              exit 1
+            fi
+          done
+
+          got=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")
+          if [ "$got" != "$version" ]; then
+            echo "org.opencontainers.image.version = '$got', want '$version': --build-arg VERSION must reach the label, which needs ARG VERSION in the final stage" >&2
+            exit 1
+          fi
+
+      - name: Verify image license metadata
+        run: |
+          test -f LICENSE || { echo "LICENSE missing: the image advertises a license the repository does not grant" >&2; exit 1; }
+          grep -q 'Permission is hereby granted, free of charge' LICENSE || { echo "LICENSE does not contain the MIT permission text" >&2; exit 1; }
+          grep -q 'LICENSE' README.md || { echo "README does not point at the LICENSE file" >&2; exit 1; }
+
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          got=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' "$image")
+          want=MIT
+          if [ "$got" != "$want" ]; then
+            echo "org.opencontainers.image.licenses = '$got' on the release image, want '$want' (is the LABEL in the final stage?)" >&2
+            exit 1
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@v4

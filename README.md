@@ -92,11 +92,19 @@ is pulled rather than being discarded with the builder stage. Verify them with
 `docker inspect --format '{{json .Config.Labels}}' redis-master-label:v0.1.0`;
 CI's "Verify image OCI labels" step fails the pull request when one of them is
 missing, empty, or when the version label disagrees with `--build-arg VERSION`.
+The release workflow performs the same inspection on the image it built before it
+pushes it, and `TestPublishingWorkflowVerifiesImageBeforePush` fails the pull
+request when the release job's run-and-inspect steps are removed, moved after the
+publishing step, or left commented out.
 
 ## Releases
 Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
 the tag-push workflow runs `go vet` and the full test suite, then builds the
-image with `--build-arg VERSION=<tag>` and pushes exactly
+image with `--build-arg VERSION=<tag>`, verifies the built image the way CI does
+(runs it and asserts `redis-master-label <tag>`, then `docker inspect`s its five
+OCI labels and the license metadata behind them — `ci.yml` runs on pull requests
+and pushes to `main` only, so a tag push is the one release path those checks
+would otherwise skip), and only then pushes exactly
 `ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
 name, `GITHUB_TOKEN` with `packages: write`, plus the `id-token: write` and
 `attestations: write` permissions attestations need). The image carries provenance
