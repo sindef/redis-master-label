@@ -13,11 +13,15 @@ A small Kubernetes sidecar/utility that watches the Redis instance co-located wi
 1. Starts with flags/env for Redis connection, label key/value, pod name/namespace, check interval, and health port.
 2. Builds a Kubernetes client from in-cluster config.
 3. Starts an HTTP server for health checks on the configured port (default 8080).
-4. On each interval:
+4. On each interval, under one deadline (`--check-timeout`) covering the whole
+   iteration:
    - Executes `ROLE` against Redis to check connectivity and update health status.
    - If the role is `master`, fetches the current pod and ensures the label key/value is set.
    - If the role is not `master` and the label key exists, removes the label key from the pod. The value currently under that key does not matter: only the value `--label-value` is compared when adding the label.
-5. Repeats forever.
+5. Repeats forever. An iteration that does not finish within the deadline is
+   reported unhealthy at once: `/healthz` answers 503 instead of keeping the
+   result of the last successful check, so the kubelet's liveness probe can
+   restart a sidecar whose Redis or API calls stopped returning at all.
 
 ## Configuration
 Flags (all have sensible defaults):
@@ -30,6 +34,7 @@ Flags (all have sensible defaults):
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
 - `--check-interval` (default `10s`)
+- `--check-timeout` (default `5s`; deadline for one poll iteration: the `ROLE` query that feeds `/healthz`, the pod `get` and the pod `update`. A non-positive value is rejected at startup, because such a deadline expires before the first `ROLE` call and would report a healthy sidecar as stalled)
 - `--health-port` (default `8080`)
 - `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
@@ -280,6 +285,14 @@ The application provides a health check endpoint at `/healthz` that:
 - Returns `503 Service Unavailable` when unhealthy
 - Monitors Redis connectivity by executing the `ROLE` command
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
+- Reports unhealthy at once when one poll iteration exceeds `--check-timeout`
+  (default `5s`), without waiting for the three-failure threshold and without
+  waiting for another `--check-interval` round: a stalled `ROLE`, pod `get` or
+  pod `update` would otherwise leave the endpoint on the last successful 200,
+  which no liveness probe can act on. The Kubernetes client is built with the
+  same timeout as its per-request timeout, because `rest.Config` sets none by
+  default. The endpoint reports healthy again as soon as one iteration runs
+  through, so recovery needs no restart
 - Runs on port 8080 by default (configurable via `--health-port`)
 
 Example:
@@ -324,6 +337,10 @@ polls the port, which is how the wiring went missing. If you change
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
 - Update frequency controlled by `--check-interval`.
+- One poll iteration is bounded by `--check-timeout` (default `5s`), which is
+  also the clientset's per-request timeout. Keep it below `--check-interval` so
+  an iteration fits inside one round; a deadline that expires keeps `/healthz`
+  at 503 until an iteration completes within the deadline again.
 - If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
 - The health check endpoint is what the example deployments' probes poll, so the kubelet restarts the sidecar when it turns unhealthy (see "Health Check Endpoint").
 

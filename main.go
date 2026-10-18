@@ -32,6 +32,7 @@ var (
 	podName            = flag.String("pod-name", "", "Pod name to label (defaults to HOSTNAME env var)")
 	podNamespace       = flag.String("pod-namespace", "", "Pod namespace (defaults to POD_NAMESPACE env var)")
 	checkInterval      = flag.Duration("check-interval", 10*time.Second, "Interval to check Redis role")
+	checkTimeout       = flag.Duration("check-timeout", 5*time.Second, "Deadline for one poll iteration (Redis ROLE, pod get/update)")
 	healthPort         = flag.String("health-port", "8080", "Port for health check HTTP server")
 	showVersion        = flag.Bool("version", false, "Print the build version and exit")
 )
@@ -41,6 +42,12 @@ var (
 		mu                  sync.RWMutex
 		consecutiveFailures int
 		isHealthy           bool
+		// iterationStalled records that the most recent poll iteration was cut
+		// short by its --check-timeout deadline. While it is set, a successful
+		// ROLE reply must not flip the endpoint back to 200: the iteration that
+		// just started has not finished either, so the sidecar is still not
+		// labelling anything.
+		iterationStalled bool
 	}
 )
 
@@ -53,6 +60,11 @@ func main() {
 	}
 
 	if err := validateCheckInterval(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if err := validateCheckTimeout(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -78,7 +90,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	// The clientset's requests carry the same deadline as one poll iteration:
+	// rest.Config has no timeout by default, so a half-open TCP connection to
+	// the API server would leave a pod get or update pending forever.
+	clientset, err := kubernetes.NewForConfig(withRequestTimeout(config, *checkTimeout))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create Kubernetes client: %v\n", err)
 		os.Exit(1)
@@ -93,6 +108,9 @@ func main() {
 	rdb := redis.NewClient(redisOptions)
 	defer rdb.Close()
 
+	// The loop's context is the process lifetime: it is never cancelled, so the
+	// bound that keeps a stalled Redis or API call from freezing the loop is the
+	// per-iteration deadline pollIteration applies.
 	ctx := context.Background()
 
 	// Bind the health check HTTP server before entering the main loop so a
@@ -121,10 +139,11 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
-
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
+		// One bounded iteration: the ROLE query that feeds /healthz and the
+		// label check (ROLE, pod get, pod update) share the --check-timeout
+		// deadline, and a deadline that expires marks the sidecar unhealthy
+		// instead of leaving /healthz on the last successful 200.
+		if err := pollIteration(ctx, rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
 		time.Sleep(*checkInterval)
@@ -183,6 +202,29 @@ func validateCheckInterval() error {
 		return fmt.Errorf("--check-interval must be positive, got %v", *checkInterval)
 	}
 	return nil
+}
+
+// validateCheckTimeout rejects a non-positive --check-timeout. Such a deadline
+// expires before the iteration issues its first ROLE call, so every iteration
+// would be reported as stalled: the sidecar would answer 503 and its liveness
+// probe would restart it while Redis and the API server are perfectly healthy.
+func validateCheckTimeout() error {
+	if *checkTimeout <= 0 {
+		return fmt.Errorf("--check-timeout must be positive, got %v", *checkTimeout)
+	}
+	return nil
+}
+
+// withRequestTimeout applies timeout as the client-go per-request timeout and
+// returns config. rest.Config carries no timeout by default, so a half-open TCP
+// connection to the API server - the connection is accepted and then goes
+// silent - leaves a pod get or update pending with no error to report. The
+// per-iteration context deadline bounds the same calls; this timeout bounds the
+// HTTP request itself, so it also covers a call made from a code path that
+// carries no deadline.
+func withRequestTimeout(config *rest.Config, timeout time.Duration) *rest.Config {
+	config.Timeout = timeout
+	return config
 }
 
 // resolveRedisPassword returns the credential for the Redis connection. The
@@ -332,9 +374,76 @@ func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
 		return
 	}
 
-	// Success - reset failure counter and mark as healthy
+	// Success - reset failure counter and mark as healthy. A stalled iteration
+	// keeps the endpoint unhealthy until an iteration actually runs through:
+	// while the deadline is the reason the label was not applied, a successful
+	// ROLE reply is not evidence that the sidecar is doing its job.
 	healthStatus.mu.Lock()
 	healthStatus.consecutiveFailures = 0
-	healthStatus.isHealthy = true
+	if !healthStatus.iterationStalled {
+		healthStatus.isHealthy = true
+	}
 	healthStatus.mu.Unlock()
+}
+
+// pollIteration runs one poll iteration under its own --check-timeout deadline.
+// The deadline covers the ROLE query that feeds /healthz and the whole label
+// check (ROLE again, pod get, pod update), because nothing else bounds them:
+// client-go sets no request timeout at all, and the Redis client's socket-level
+// timeouts (a 3s read timeout with up to 3 retries by default) are defeated by a
+// peer that keeps the connection open and never answers, whether a half-open TCP
+// connection or a stalled proxy. Such an iteration would never return: /healthz
+// would keep answering 200 from the last successful check, the kubelet's
+// liveness probe would never restart the sidecar, and readiness would keep the
+// pod in Service endpoints with a stale redis-role label.
+//
+// An iteration cut short by the deadline is reported unhealthy immediately
+// rather than through updateHealthStatus's three-consecutive-failures threshold:
+// a stalled iteration is not one failed check among successful ones, it is the
+// loop making no progress at all, and a stuck Redis or API call must turn
+// /healthz into 503 as soon as the deadline expires.
+func pollIteration(parent context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	ctx, cancel := context.WithTimeout(parent, *checkTimeout)
+	defer cancel()
+
+	// Redis connectivity first: this keeps the consecutive-failure counter and
+	// the recovery behaviour (a successful ROLE clears the count).
+	updateHealthStatus(ctx, rdb)
+
+	err := checkAndLabel(ctx, rdb, clientset)
+
+	// An expired context tells the two outcomes apart: err without an expired
+	// context is Redis or the API server answering with a failure, while err
+	// with an expired context is the iteration being cut short mid-call.
+	if err != nil && ctx.Err() != nil {
+		recordStalledIteration()
+		return fmt.Errorf("poll iteration did not finish within --check-timeout=%v (%v): %w", *checkTimeout, ctx.Err(), err)
+	}
+
+	recordCompletedIteration(err == nil)
+	return err
+}
+
+// recordStalledIteration reports the sidecar unhealthy at once and latches the
+// stalled state, so the next iteration's successful ROLE reply cannot clear the
+// verdict while the call that applies the label still does not return.
+func recordStalledIteration() {
+	healthStatus.mu.Lock()
+	defer healthStatus.mu.Unlock()
+	healthStatus.iterationStalled = true
+	healthStatus.isHealthy = false
+}
+
+// recordCompletedIteration clears the stalled latch after an iteration returned
+// within its deadline. A fully successful iteration also reports healthy again
+// immediately, so recovery does not have to wait for another --check-interval
+// round (and a restart from the liveness probe) once Redis and the API server
+// answer again.
+func recordCompletedIteration(succeeded bool) {
+	healthStatus.mu.Lock()
+	defer healthStatus.mu.Unlock()
+	healthStatus.iterationStalled = false
+	if succeeded {
+		healthStatus.isHealthy = true
+	}
 }
