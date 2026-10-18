@@ -21,6 +21,18 @@ spec:
         - containerPort: 6379
         command:
         - redis-server
+        # Same as deployment-example.yaml: every container in the pod declares
+        # requests and limits, so the pod runs at the Burstable QoS class
+        # instead of BestEffort (README "Resource sizing").
+        # TestManifestContainersDeclareResourceRequestsAndLimits fails the pull
+        # request when a container drops the pair.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
       - name: redis-master-label
         # Same as deployment-example.yaml: pinned versioned release image,
         # never a floating :latest reference.
@@ -72,6 +84,18 @@ spec:
             port: health
           initialDelaySeconds: 5
           periodSeconds: 10
+        # Same as deployment-example.yaml: the labeler's poll loop declares
+        # requests and limits, so the pod is Burstable rather than BestEffort
+        # and a wedged loop cannot consume the node (README "Resource sizing").
+        # TestManifestContainersDeclareResourceRequestsAndLimits fails the pull
+        # request when a container drops the pair.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
         # Same as deployment-example.yaml: the labeler needs no privileges
         # (it only reads Redis and calls the Kubernetes API with its mounted
         # credentials), so it runs as the image's non-root uid, cannot write

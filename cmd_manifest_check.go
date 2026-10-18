@@ -30,7 +30,9 @@ import (
 // TestManifestSidecarsKeepPasswordOutOfArgs), the USER the build file's final
 // stage selects (dockerfileFinalStageUser,
 // TestDockerfileFinalStageRunsAsNonRootUser) and the RBAC chain the example
-// deployments run under (readRBACChain, TestManifestRBACWiring).
+// deployments run under (readRBACChain, TestManifestRBACWiring). The requests
+// and limits the example containers declare are read in
+// manifest_resources_check.go (TestManifestContainersDeclareResourceRequestsAndLimits).
 
 // manifestDir is where the example manifests live relative to the repo root.
 const manifestDir = "manifests"
@@ -87,11 +89,12 @@ type podSpecManifest struct {
 					Image           string
 					Command         []string
 					Args            []string
-					Ports           []containerPort           `json:"ports"`
-					LivenessProbe   *containerProbe           `json:"livenessProbe"`
-					ReadinessProbe  *containerProbe           `json:"readinessProbe"`
-					StartupProbe    *containerProbe           `json:"startupProbe"`
-					SecurityContext *containerSecurityContext `json:"securityContext"`
+					Ports           []containerPort               `json:"ports"`
+					LivenessProbe   *containerProbe               `json:"livenessProbe"`
+					ReadinessProbe  *containerProbe               `json:"readinessProbe"`
+					StartupProbe    *containerProbe               `json:"startupProbe"`
+					SecurityContext *containerSecurityContext     `json:"securityContext"`
+					Resources       containerResourceRequirements `json:"resources"`
 				}
 			}
 		}

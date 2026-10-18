@@ -158,10 +158,51 @@ Key points for the deployment:
 - Expose the health port the labeler is told to listen on and poll `/healthz` from a liveness and a readiness probe (see "Health Check Endpoint"); both example deployments do.
 - Run the labeler unprivileged (see "Running unprivileged" below); the caveat
   at the end of that section covers the co-located `redis` container.
+- Size every container: both example Deployments declare `resources.requests`
+  and `resources.limits` for cpu and memory on their `redis` and
+  `redis-master-label` containers, so the pods run at the Burstable QoS class
+  instead of BestEffort (see "Resource sizing" below).
 - A namespace enforcing the restricted Pod Security Standard rejects the two
   example manifests as shipped: their `redis` containers carry no
   `securityContext`. See the caveat at the end of "Running unprivileged"
   before applying them into such a namespace.
+
+### Resource sizing
+
+Every container of both example Deployments declares requests and limits:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+That is the `redis` container's block; the `redis-master-label` sidecar is
+smaller and steadier (it runs only the `ROLE` command every
+`--check-interval` and patches its own pod), so its containers declare
+`cpu: 10m` / `memory: 32Mi` requests and `cpu: 100m` / `memory: 64Mi` limits.
+
+The pair is what keeps the pods out of the **BestEffort** QoS class: with no
+request the scheduler has nothing to score or reserve, so the pod is evicted
+first under node pressure, and with no limit one container — a replica's
+`redis-server`, or the labeler's `--check-interval=10s` poll loop after a Redis
+outage — may consume the whole node. Before the manifests declared these
+blocks, they shipped exactly that shape: the example a user applies is the
+shape a user copies, so the omission was teaching BestEffort.
+
+The numbers are sized for this example, not for your data: raising the `redis`
+limits, or lowering the labeler's, is expected once you know your workload.
+What has to stay is the pair itself — a request and a limit for cpu and memory
+on every container.
+`TestManifestContainersDeclareResourceRequestsAndLimits` fails the pull request
+when a container drops either half, leaves a limit below its request, declares
+a quantity the API cannot parse, or when a pod comes out BestEffort.
+kubeconform cannot catch any of that: an absent `resources:` block is valid
+against the schema, which is how the blocks went missing.
 
 ### Running unprivileged
 The labeler only reads Redis and calls the Kubernetes API with its mounted
