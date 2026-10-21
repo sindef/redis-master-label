@@ -7,6 +7,24 @@ name: Release
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
 # newer releases appear.
+#
+# GitHub matches push.tags against the tag name alone, so a tag pushed from a
+# commit that never merged selects this workflow exactly like a real release.
+# The trigger stays 'v*.*.*'; the first steps after checkout decide whether the
+# tag may be released at all:
+#
+#   1. the tagged commit must be reachable from main, so no release is published
+#      from a revision main never held, and
+#   2. the tag must be the one the repository deploys: the pinned reference in
+#      main_test.go (releaseImage, which TestManifestsPinVersionedReleaseImage
+#      enforces against manifests/) must end in <tag>, and a manifest must
+#      reference it.
+#
+# Both gates run before anything is built or pushed, so a tag that disagrees
+# with the pin fails the run instead of publishing an image no manifest
+# references. workflow_check.go's release tag gate check
+# (main_test.go: TestReleaseWorkflowGatesTagOnPinnedReleaseImage) fails the
+# pull request when either gate is dropped or moved after the build.
 on:
   push:
     tags:
@@ -31,6 +49,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The reachability gate below asks whether the tagged commit is an
+          # ancestor of main. A shallow checkout holds neither main nor the
+          # history between the two, so the answer would be unreadable.
+          fetch-depth: 0
+
+      # A tag push is not evidence of a release: a tag on a commit that never
+      # merged still triggers this workflow. Only a commit main holds may be
+      # released, because only that commit is what a redeploy of main would run.
+      - name: Verify tag is reachable from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit=$(git rev-parse HEAD)
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor "$tag_commit" FETCH_HEAD; then
+            echo "tag ${GITHUB_REF_NAME} points at $tag_commit, which is reachable from main"
+          else
+            echo "tag ${GITHUB_REF_NAME} points at $tag_commit, which is not reachable from main: release only a commit main holds" >&2
+            exit 1
+          fi
+
+      # The published tag is ${GITHUB_REF_NAME} and nothing else, so it has to be
+      # the tag the repository deploys. releaseImage in main_test.go is that pin
+      # (TestManifestsPinVersionedReleaseImage holds manifests/ to it), so a tag
+      # pushed without the matching bump - or a bump tagged with a different
+      # version - stops here instead of publishing an image no manifest runs.
+      - name: Verify tag matches the pinned release image
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          pinned=$(sed -n 's/^const releaseImage = "\(.*\)"$/\1/p' main_test.go)
+          [ -n "$pinned" ] || { echo "main_test.go declares no releaseImage constant, so tag $tag cannot be compared with the image the manifests pin" >&2; exit 1; }
+          pinned_tag="${pinned##*:}"
+          if [ "$pinned_tag" != "$tag" ]; then
+            echo "tag $tag does not match the pinned release image $pinned (pinned tag $pinned_tag): bump releaseImage and the manifests to $tag, merge that, and tag that commit" >&2
+            exit 1
+          fi
+
+          # The pin only means something if the manifests deploy it: a constant
+          # no manifest references keeps every test green while <tag> is an image
+          # nothing deploys.
+          if ! grep -rqF -- "$pinned" manifests/; then
+            echo "no manifest under manifests/ references the pinned release image $pinned, so tag $tag would publish an image nothing deploys" >&2
+            exit 1
+          fi
+          echo "tag $tag matches the pinned release image $pinned"
 
       - uses: actions/setup-go@v7
         with:
