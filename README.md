@@ -105,6 +105,18 @@ plus the `docker buildx imagetools inspect` output for it, so the attestation
 manifests are visible on every release run.
 Nothing floating (`:latest`) is ever published.
 
+The tag must also name the release this repository deploys, and it must be cut
+from main. Two gates run before anything is built: `release_gate.sh <tag>
+<image>` fails unless every reference to the published image in `manifests/` is
+exactly `<image>:<tag>`, and the tagged commit must be an ancestor of `main`
+(`git merge-base --is-ancestor`), so a tag pushed from a branch that never
+merged cannot publish. Without them a `v0.2.0` tag pushed from a tree still
+pinning `v0.1.0` passed vet and the test suite (which compares the manifests
+with `releaseImage`, not with the tag) and published an image no manifest in
+the repository references. Because `TestManifestsPinVersionedReleaseImage`
+holds the manifests to `releaseImage`, a tag that disagrees with the manifests
+also disagrees with `releaseImage`.
+
 ### Release checklist
 
 The pinned image reference must be identical in three places: the example
@@ -123,10 +135,14 @@ even when the stale string lives in `main_test.go`.
 2. Commit the bumps, verify the gate locally, then tag that commit:
    ```bash
    go test -count=1 ./...
+   bash release_gate.sh v0.2.0 ghcr.io/redis-master-label/redis-master-label
    git tag v0.2.0 && git push origin v0.2.0
    ```
-   The tag push starts the release workflow (vet + tests, then build and push
-   `ghcr.io/<owner>/redis-master-label:<tag>`).
+   The tag push starts the release workflow (vet + tests, then the release
+   gates, then build and push
+   `ghcr.io/<owner>/redis-master-label:<tag>`). The tag has to point at a commit
+   merged to `main`: the workflow stops before the build when the tag is not on
+   `main` or when the tag names an image the manifests do not pin.
 3. Apply the updated manifests; the pinned tag rolls out the new image.
 
 Rollback: redeploy the previous release's full image reference

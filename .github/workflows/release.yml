@@ -7,6 +7,15 @@ name: Release
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
 # newer releases appear.
+#
+# The tag is also the only thing that used to decide the published reference:
+# nothing compared it with the image the manifests pin, so pushing v0.2.0 from
+# a tree that still pinned v0.1.0 published ghcr.io/...:v0.2.0 that no manifest
+# in the repository deploys, and a tag pushed from a commit that never merged
+# skipped CI entirely. Two gates therefore run before the build: the tagged
+# commit must be reachable from main (a release is cut from merged code), and
+# the tag must name exactly the release image every manifest pins
+# (release_gate.sh, which CI's `go test` also covers).
 on:
   push:
     tags:
@@ -30,7 +39,12 @@ jobs:
     name: Build and publish release image
     runs-on: ubuntu-latest
     steps:
+      # Full history, not a shallow tag checkout: the release gate below asks
+      # whether the tagged commit is an ancestor of main, which a depth-1 clone
+      # cannot answer.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v7
         with:
@@ -48,6 +62,28 @@ jobs:
         run: |
           lowercase=$(echo "${{ env.IMAGE }}" | tr '[:upper:]' '[:lower:]')
           echo "image=${lowercase}" >> "$GITHUB_OUTPUT"
+
+      # Restricting the trigger to main-reachable tags: a tag pushed from a
+      # branch that never merged bypasses CI, so the commit it points at was
+      # never built or tested against main. The push event carries no branch
+      # filter for tags, so the ancestry is checked here, before the build.
+      - name: Verify tag is reachable from main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "tag ${GITHUB_REF_NAME} is not reachable from main: cut releases from a commit that is merged to main, so the published image is the one CI tested" >&2
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} is on main"
+
+      # The tag decides what is published, so it must name the image the
+      # manifests deploy. main_test.go's releaseImage is held to the manifests
+      # by TestManifestsPinVersionedReleaseImage (run by the Test step above),
+      # so comparing the tag with the manifest pin also holds it to
+      # releaseImage.
+      - name: Verify tag matches the pinned release image
+        run: |
+          sh release_gate.sh "${GITHUB_REF_NAME}" "${{ steps.image.outputs.image }}"
 
       # The tag checkout is a detached HEAD; the build-arg feeds both the
       # binary's --version output and the image's OCI version label.
