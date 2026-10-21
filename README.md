@@ -280,6 +280,7 @@ The application provides a health check endpoint at `/healthz` that:
 - Returns `503 Service Unavailable` when unhealthy
 - Monitors Redis connectivity by executing the `ROLE` command
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
+- Bounds every Redis command and Kubernetes API call by half `--check-interval` (minimum 100ms), so a stalled backend is counted as a failure instead of freezing the loop while `/healthz` keeps answering `200`
 - Runs on port 8080 by default (configurable via `--health-port`)
 
 Example:

@@ -77,6 +77,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to get in-cluster config: %v\n", err)
 		os.Exit(1)
 	}
+	// rest.Config.Timeout defaults to 0, meaning no client-side timeout: a
+	// half-open connection to the API server would otherwise block the poll
+	// loop while /healthz kept answering 200.
+	boundClientConfig(config)
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -121,12 +125,18 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
+		// Bound one whole poll iteration by --check-interval, so a stalled
+		// Redis or Kubernetes API cannot freeze the loop between health
+		// updates. Each call inside the iteration gets a tighter bound.
+		checkCtx, cancel := context.WithTimeout(ctx, *checkInterval)
 
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
+		// Update health status based on Redis connectivity
+		updateHealthStatus(checkCtx, rdb)
+
+		if err := checkAndLabel(checkCtx, rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
+		cancel()
 		time.Sleep(*checkInterval)
 	}
 }
@@ -140,6 +150,35 @@ func validateRedisTLSFlags() error {
 		return fmt.Errorf("--redis-tls-skip-verify requires --redis-tls: without --redis-tls the connection is plaintext and the flag has no effect")
 	}
 	return nil
+}
+
+// minBackendCallTimeout floors the per-call deadline so a very small
+// --check-interval cannot produce a deadline no network round trip can meet.
+const minBackendCallTimeout = 100 * time.Millisecond
+
+// backendCallTimeout is the deadline for one Redis command or Kubernetes API
+// call. It is half of --check-interval, so a stalled backend surfaces as an
+// error inside the poll interval instead of blocking the loop while /healthz
+// keeps answering 200.
+func backendCallTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < minBackendCallTimeout {
+		timeout = minBackendCallTimeout
+	}
+	return timeout
+}
+
+// boundContext applies backendCallTimeout to ctx. An earlier deadline already
+// on ctx wins, which is how main shares one budget across a poll iteration.
+func boundContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, backendCallTimeout())
+}
+
+// boundClientConfig caps every Kubernetes API call the labeler makes.
+// rest.Config.Timeout defaults to 0 (no client-side timeout), which lets a
+// half-open connection to the API server block a poll iteration forever.
+func boundClientConfig(config *rest.Config) {
+	config.Timeout = backendCallTimeout()
 }
 
 // redisOptionsFromFlags builds the redis.Options for the client from the
@@ -161,9 +200,13 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 		return nil, err
 	}
 
+	timeout := backendCallTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
@@ -204,9 +247,41 @@ type roleQuerier interface {
 	Do(ctx context.Context, args ...interface{}) *redis.Cmd
 }
 
+// queryRole executes ROLE under a deadline derived from --check-interval. The
+// command runs in its own goroutine so even a client that ignores context
+// cancellation cannot freeze the caller: a stalled backend is reported as a
+// deadline error, which the health path counts as a failure. The result channel
+// is buffered, so an abandoned command that finishes later does not block.
+func queryRole(ctx context.Context, rdb roleQuerier) (interface{}, error) {
+	ctx, cancel := boundContext(ctx)
+	defer cancel()
+
+	type outcome struct {
+		reply interface{}
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		reply, err := rdb.Do(ctx, "ROLE").Result()
+		done <- outcome{reply: reply, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case out := <-done:
+		return out.reply, out.err
+	}
+}
+
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
+// The context is bounded so a stalled Redis or API server cannot outlive a
+// poll iteration.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
-	role, err := rdb.Do(ctx, "ROLE").Result()
+	ctx, cancel := boundContext(ctx)
+	defer cancel()
+
+	role, err := queryRole(ctx, rdb)
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
 	}
@@ -321,7 +396,7 @@ func serveHealth(listener net.Listener) <-chan error {
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
+	_, err := queryRole(ctx, rdb)
 	if err != nil {
 		healthStatus.mu.Lock()
 		healthStatus.consecutiveFailures++
