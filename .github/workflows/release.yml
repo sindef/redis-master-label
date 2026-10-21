@@ -7,6 +7,12 @@ name: Release
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
 # newer releases appear.
+#
+# The tag alone must not decide what is published: the two release gates below
+# (release_gate.sh) run before anything is built. The tag has to be the tag the
+# manifests pin, and the tagged commit has to be reachable from main, so a
+# release can neither publish an image nothing deploys nor come from a commit
+# that never merged and therefore never saw CI.
 on:
   push:
     tags:
@@ -30,7 +36,43 @@ jobs:
     name: Build and publish release image
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 fetches the branch and tag history the ancestry gate
+      # reads; the default single-commit clone of a tag carries no main ref, so
+      # the gate would have nothing to compare against.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute lowercase image name
+        id: image
+        shell: bash
+        run: |
+          lowercase=$(echo "${{ env.IMAGE }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${lowercase}" >> "$GITHUB_OUTPUT"
+
+      # Release gate 1: reachability. `on: push: tags:` cannot express "only
+      # tags on main", and a tag pushed from a commit that never merged bypasses
+      # CI entirely, so the release proves the commit it publishes is on main
+      # before it builds. The explicit fetch makes the check independent of how
+      # checkout configured its remote refspecs.
+      - name: Require the tag to be reachable from main
+        shell: bash
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          sh release_gate.sh main "$GITHUB_SHA" origin/main
+
+      # Release gate 2: the tag must be the release the manifests pin. Before
+      # this gate, `version="${GITHUB_REF_NAME}"` was the only source of the
+      # published reference and nothing compared it with the pin: pushing v0.2.0
+      # while releaseImage and the manifests still pinned v0.1.0 passed vet and
+      # the whole test suite (the pin matched itself) and published
+      # ghcr.io/<repo>:v0.2.0, an image no manifest in the repository references.
+      # The pin is read from manifests/ here; the Test step below keeps the
+      # manifests and main_test.go's releaseImage identical.
+      - name: Require the tag to match the pinned release image
+        shell: bash
+        run: |
+          sh release_gate.sh tag "$GITHUB_REF_NAME" "${{ steps.image.outputs.image }}" manifests
 
       - uses: actions/setup-go@v7
         with:
@@ -41,13 +83,6 @@ jobs:
 
       - name: Test
         run: go test -count=1 ./...
-
-      - name: Compute lowercase image name
-        id: image
-        shell: bash
-        run: |
-          lowercase=$(echo "${{ env.IMAGE }}" | tr '[:upper:]' '[:lower:]')
-          echo "image=${lowercase}" >> "$GITHUB_OUTPUT"
 
       # The tag checkout is a detached HEAD; the build-arg feeds both the
       # binary's --version output and the image's OCI version label.

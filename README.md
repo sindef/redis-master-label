@@ -105,6 +105,23 @@ plus the `docker buildx imagetools inspect` output for it, so the attestation
 manifests are visible on every release run.
 Nothing floating (`:latest`) is ever published.
 
+Two gates run before anything is built (`release_gate.sh`, invoked by
+`.github/workflows/release.yml`):
+
+- **The tag must be the pin.** Every image reference in `manifests/` that names
+  the published repository has to pin exactly the tag being released. Without
+  that gate the tag alone decided what was published: pushing `v0.2.0` while the
+  pin still said `v0.1.0` passed `go vet` and the whole suite (the pin matched
+  itself) and pushed an image no manifest references.
+- **The tag must be on `main`.** The tagged commit has to be reachable from
+  `main` (the workflow fetches full history and checks ancestry), so a tag
+  pushed from a commit that never merged — and therefore never ran CI — cannot
+  publish a release.
+
+`TestReleaseWorkflowGatesTagAgainstPinnedImage` fails when either gate is
+dropped from the workflow, when it compares something other than the released
+tag and commit, or when it is moved after the build and push steps.
+
 ### Release checklist
 
 The pinned image reference must be identical in three places: the example
@@ -113,20 +130,25 @@ what `TestManifestsPinVersionedReleaseImage` accepts. The release workflow's
 Test step runs `go test -count=1 ./...` before it builds or publishes anything,
 so push a stale pin and no image is released — and the test's error text says
 the manifest image "is not the pinned release image", which points at the YAML
-even when the stale string lives in `main_test.go`.
+even when the stale string lives in `main_test.go`. The tag is checked against
+the manifests too: the workflow's "Require the tag to match the pinned release
+image" step fails before the build when the pushed tag is not the pinned one.
 
 1. Bump the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`
    reference in every one of these files:
    - `main_test.go` — `const releaseImage = "..."`
    - `manifests/deployment-example.yaml`
    - `manifests/redis-leader.yaml`
-2. Commit the bumps, verify the gate locally, then tag that commit:
+2. Commit the bumps, verify the gate locally, merge to `main`, then tag that
+   merged commit:
    ```bash
    go test -count=1 ./...
    git tag v0.2.0 && git push origin v0.2.0
    ```
-   The tag push starts the release workflow (vet + tests, then build and push
-   `ghcr.io/<owner>/redis-master-label:<tag>`).
+   The tag push starts the release workflow (the pin and ancestry gates, then
+   vet + tests, then build and push
+   `ghcr.io/<owner>/redis-master-label:<tag>`). A tag on a commit that is not on
+   `main` fails the ancestry gate instead of releasing.
 3. Apply the updated manifests; the pinned tag rolls out the new image.
 
 Rollback: redeploy the previous release's full image reference
