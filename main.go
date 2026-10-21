@@ -77,6 +77,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to get in-cluster config: %v\n", err)
 		os.Exit(1)
 	}
+	config = backendRestConfig(config)
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -121,11 +122,22 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
+		// One deadline per iteration, derived from --check-interval, bounds
+		// every backend call the iteration makes: the Redis ROLE and the pod
+		// get/update. Without it a stalled backend (half-open connection,
+		// black-holed packets, unresponsive API server) blocks the loop, so
+		// updateHealthStatus never counts a failure and /healthz keeps
+		// answering 200 while no label is applied or removed - exactly the
+		// state the liveness/readiness probes exist to detect.
+		checkCtx, cancel := context.WithTimeout(ctx, backendTimeout())
 
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
-			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
+		// Update health status based on Redis connectivity
+		updateHealthStatus(checkCtx, rdb)
+
+		checkErr := checkAndLabel(checkCtx, rdb, clientset)
+		cancel()
+		if checkErr != nil {
+			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", checkErr)
 		}
 		time.Sleep(*checkInterval)
 	}
@@ -156,14 +168,26 @@ func validateRedisTLSFlags() error {
 //
 // Startup config invalid in combination (--redis-tls-skip-verify without
 // --redis-tls) is rejected instead of applied silently.
+//
+// The connection also carries finite timeouts derived from --check-interval
+// (backendTimeout). Leaving DialTimeout, ReadTimeout and WriteTimeout at the
+// library defaults ties the worst-case cost of one check to a number this
+// program does not control: a stalled server then costs several plug
+// attempts per check, so a check can outlast the interval and the failures
+// the health endpoint counts arrive far slower than the interval the
+// probes are tuned to.
 func redisOptionsFromFlags() (*redis.Options, error) {
 	if err := validateRedisTLSFlags(); err != nil {
 		return nil, err
 	}
 
+	timeout := backendTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
@@ -183,6 +207,37 @@ func validateCheckInterval() error {
 		return fmt.Errorf("--check-interval must be positive, got %v", *checkInterval)
 	}
 	return nil
+}
+
+// minBackendTimeout floors the per-check deadline, so a tiny --check-interval
+// still yields a positive timeout instead of an already-expired context.
+const minBackendTimeout = time.Millisecond
+
+// backendTimeout is the deadline for the backend calls of one poll iteration:
+// the Redis ROLE and the pod get/update. It is half of --check-interval,
+// floored at minBackendTimeout, so it is always finite and always leaves half
+// the interval for the loop to react, and it never depends on a library
+// default. A non-positive --check-interval is rejected at startup; the floor
+// keeps this helper safe for callers that build options before that check.
+func backendTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < minBackendTimeout {
+		return minBackendTimeout
+	}
+	return timeout
+}
+
+// backendRestConfig bounds the Kubernetes REST client: rest.Config.Timeout is
+// the http.Client timeout every request through the clientset inherits. The
+// in-cluster config sets none, so a stalled API server response blocks the
+// call (and with it the poll loop) until the TCP connection dies on its own,
+// which for a half-open connection is never.
+func backendRestConfig(config *rest.Config) *rest.Config {
+	if config == nil {
+		return nil
+	}
+	config.Timeout = backendTimeout()
+	return config
 }
 
 // resolveRedisPassword returns the credential for the Redis connection. The
@@ -321,7 +376,13 @@ func serveHealth(listener net.Listener) <-chan error {
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
+	// The ROLE check carries its own deadline so a stalled Redis fails the
+	// check and counts toward consecutiveFailures instead of blocking here
+	// forever. A parent deadline (the per-iteration one main sets) still
+	// wins when it is sooner.
+	checkCtx, cancel := context.WithTimeout(ctx, backendTimeout())
+	_, err := rdb.Do(checkCtx, "ROLE").Result()
+	cancel()
 	if err != nil {
 		healthStatus.mu.Lock()
 		healthStatus.consecutiveFailures++

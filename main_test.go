@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -2222,6 +2223,181 @@ func TestValidateCheckInterval(t *testing.T) {
 	*checkInterval = 10 * time.Second
 	if err := validateCheckInterval(); err != nil {
 		t.Errorf("positive --check-interval rejected: %v", err)
+	}
+}
+
+// The per-check deadline must be finite, positive and derived from
+// --check-interval, so a stalled backend cannot outlive the interval the health
+// probes are tuned to.
+func TestBackendTimeout_DerivedFromCheckInterval(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	tests := []struct {
+		name     string
+		interval time.Duration
+		want     time.Duration
+	}{
+		{"default interval", 10 * time.Second, 5 * time.Second},
+		{"one minute", time.Minute, 30 * time.Second},
+		{"odd interval halves", 101 * time.Millisecond, 50*time.Millisecond + 500*time.Microsecond},
+		{"tiny interval uses the floor", time.Nanosecond, minBackendTimeout},
+		{"zero interval uses the floor", 0, minBackendTimeout},
+		{"negative interval uses the floor", -time.Second, minBackendTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*checkInterval = tt.interval
+			if got := backendTimeout(); got != tt.want {
+				t.Fatalf("backendTimeout() with --check-interval=%v = %v, want %v", tt.interval, got, tt.want)
+			}
+		})
+	}
+
+	// For every interval the binary accepts that is longer than the floor, the
+	// deadline has to fit inside the interval so the loop still has time to
+	// run the next check.
+	for _, interval := range []time.Duration{10 * time.Millisecond, time.Second, 10 * time.Second, time.Hour} {
+		*checkInterval = interval
+		got := backendTimeout()
+		if got <= 0 {
+			t.Errorf("backendTimeout() with --check-interval=%v = %v, want a positive deadline", interval, got)
+		}
+		if got >= interval {
+			t.Errorf("backendTimeout() with --check-interval=%v = %v, want a deadline shorter than the interval", interval, got)
+		}
+	}
+}
+
+// The Redis client must not keep the library defaults: a check whose worst case
+// is decided by go-redis defaults can outlast --check-interval, so the failures
+// the health endpoint counts arrive slower than the interval the probes use.
+func TestRedisOptionsFromFlags_BackendTimeouts(t *testing.T) {
+	origInterval, origAddr := *checkInterval, *redisAddr
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*checkInterval, *redisAddr = origInterval, origAddr
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*redisAddr = "redis.example.com:6379"
+	*redisTLS = false
+	*redisTLSSkipVerify = false
+
+	for _, interval := range []time.Duration{time.Minute, 200 * time.Millisecond} {
+		*checkInterval = interval
+		opts, err := redisOptionsFromFlags()
+		if err != nil {
+			t.Fatalf("redisOptionsFromFlags with --check-interval=%v: %v", interval, err)
+		}
+
+		want := backendTimeout()
+		if opts.DialTimeout != want {
+			t.Errorf("--check-interval=%v: DialTimeout = %v, want the derived deadline %v", interval, opts.DialTimeout, want)
+		}
+		if opts.ReadTimeout != want {
+			t.Errorf("--check-interval=%v: ReadTimeout = %v, want the derived deadline %v", interval, opts.ReadTimeout, want)
+		}
+		if opts.WriteTimeout != want {
+			t.Errorf("--check-interval=%v: WriteTimeout = %v, want the derived deadline %v", interval, opts.WriteTimeout, want)
+		}
+		for name, timeout := range map[string]time.Duration{
+			"DialTimeout":  opts.DialTimeout,
+			"ReadTimeout":  opts.ReadTimeout,
+			"WriteTimeout": opts.WriteTimeout,
+		} {
+			if timeout <= 0 {
+				t.Errorf("--check-interval=%v: %s = %v, want a finite positive timeout", interval, name, timeout)
+			}
+			if timeout >= interval {
+				t.Errorf("--check-interval=%v: %s = %v, want a timeout shorter than the interval", interval, name, timeout)
+			}
+		}
+	}
+}
+
+// The in-cluster config sets no Timeout, so a stalled API server response blocks
+// the pod get/update until the connection dies on its own - never, for a
+// half-open connection - and the poll loop stops updating the label and the
+// health endpoint with it.
+func TestBackendRestConfig_SetsTimeout(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	*checkInterval = 4 * time.Second
+	config := &rest.Config{Host: "https://10.0.0.1:443", BearerToken: "from-service-account"}
+
+	bounded := backendRestConfig(config)
+	if bounded.Timeout != 2*time.Second {
+		t.Fatalf("rest.Config.Timeout = %v, want the derived deadline %v", bounded.Timeout, 2*time.Second)
+	}
+	if bounded.Host != config.Host || bounded.BearerToken != config.BearerToken {
+		t.Errorf("backendRestConfig changed the in-cluster config: %+v", bounded)
+	}
+
+	if got := backendRestConfig(nil); got != nil {
+		t.Errorf("backendRestConfig(nil) = %+v, want nil", got)
+	}
+}
+
+// hangingRedis models a half-open Redis connection: ROLE never answers, and the
+// call returns only when its context is done. A call that arrives without a
+// deadline is refused immediately, so a regression fails here instead of hanging
+// the test.
+type hangingRedis struct {
+	waits []time.Duration
+}
+
+func (h *hangingRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return redis.NewCmdResult(nil, errors.New("ROLE command carries no deadline: a stalled Redis blocks the poll loop"))
+	}
+	h.waits = append(h.waits, time.Until(deadline))
+
+	<-ctx.Done()
+	return redis.NewCmdResult(nil, ctx.Err())
+}
+
+// The reported failure mode: a Redis that stops answering must turn the health
+// endpoint unhealthy, so the kubelet's liveness and readiness probes can restart
+// or de-register the sidecar. With no deadline the ROLE call never returns,
+// updateHealthStatus never counts a failure, and /healthz answers 200 forever.
+func TestUpdateHealthStatus_HangingRoleQuerierBecomesUnhealthy(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 20 * time.Millisecond
+
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	rdb := &hangingRedis{}
+	start := time.Now()
+
+	for i := 1; i <= 2; i++ {
+		updateHealthStatus(context.Background(), rdb)
+		if healthy, failures := healthSnapshot(); !healthy || failures != i {
+			t.Fatalf("after %d stalled ROLE calls: isHealthy = %v, consecutiveFailures = %d, want true / %d", i, healthy, failures, i)
+		}
+	}
+
+	updateHealthStatus(context.Background(), rdb)
+	if healthy, failures := healthSnapshot(); healthy || failures != 3 {
+		t.Fatalf("after 3 stalled ROLE calls: isHealthy = %v, consecutiveFailures = %d, want false / 3", healthy, failures)
+	}
+
+	// The calls have to have waited on their deadline, not returned early with
+	// some other error, and each deadline must fit inside one interval.
+	if len(rdb.waits) != 3 {
+		t.Fatalf("%d ROLE calls carried a deadline, want 3", len(rdb.waits))
+	}
+	for i, wait := range rdb.waits {
+		if wait <= 0 || wait > backendTimeout() {
+			t.Errorf("ROLE call %d waited %v, want a deadline of at most %v", i+1, wait, backendTimeout())
+		}
+	}
+	if elapsed := time.Since(start); elapsed < backendTimeout() {
+		t.Errorf("three stalled ROLE calls returned in %v, faster than one deadline: they did not block on the deadline", elapsed)
 	}
 }
 

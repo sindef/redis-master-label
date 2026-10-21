@@ -29,7 +29,7 @@ Flags (all have sensible defaults):
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
-- `--check-interval` (default `10s`)
+- `--check-interval` (default `10s`; also sets the deadline of one check, see "Health Check Endpoint")
 - `--health-port` (default `8080`)
 - `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
@@ -280,6 +280,7 @@ The application provides a health check endpoint at `/healthz` that:
 - Returns `503 Service Unavailable` when unhealthy
 - Monitors Redis connectivity by executing the `ROLE` command
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
+- Bounds every backend call of a check: the Redis `ROLE`, the pod `get` and the pod `update` run under a deadline of half of `--check-interval` (at least 1ms), and the Redis client's dial, read and write timeouts plus the Kubernetes client's request timeout are set from the same value. A half-open Redis connection or a stalled API server therefore fails the check instead of blocking the poll loop while `/healthz` keeps answering `200` — the state the probes exist to catch
 - Runs on port 8080 by default (configurable via `--health-port`)
 
 Example:
@@ -313,6 +314,9 @@ The liveness probe restarts the labeler after three failing polls, so a sidecar
 whose Redis became unreachable — or whose health listener died — is restarted
 instead of sitting `Running` with a stale `redis-role` label; the readiness
 probe takes the pod out of Service endpoints while the endpoint answers 503.
+Those three failures only arrive while each check finishes on time, so a check
+is bounded by half the interval: a stalled Redis or API server then reaches the
+endpoint within roughly one and a half intervals instead of never.
 Declaring the port alone changes nothing: only a probe makes the kubelet poll
 the endpoint, so `TestManifestSidecarsDeclareHealthProbes` fails the build when
 a labeler container serves `/healthz` on `--health-port` without a probe
