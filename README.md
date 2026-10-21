@@ -105,6 +105,28 @@ plus the `docker buildx imagetools inspect` output for it, so the attestation
 manifests are visible on every release run.
 Nothing floating (`:latest`) is ever published.
 
+Two gates run before anything is built or published, because the tag is the only
+source of the published reference:
+
+- **The tag must match the pin.** The workflow reads `const releaseImage` out of
+  `main_test.go` and requires the tag being released to be the tag of that
+  reference; it also requires every `redis-master-label` image reference under
+  `manifests/` to be that same reference. A `v0.2.0` tag pushed while the pin
+  still read `v0.1.0` therefore fails here instead of publishing
+  `ghcr.io/<owner>/redis-master-label:v0.2.0`, which no manifest references.
+  `go vet` and the test suite cannot catch that on their own: the pin agrees with
+  itself, so `TestManifestsPinVersionedReleaseImage` stays green.
+- **The tagged commit must be on main.** A tag can be pushed from any commit,
+  and a tag pushed from a branch that never merged starts no pull request check
+  at all. The workflow fetches `main` and requires the tagged commit to be an
+  ancestor of it (`git merge-base --is-ancestor`), so only a merged commit can
+  release. Actions has no branch filter for tag pushes, which is why this is a
+  gate step and not an `on:` filter.
+
+`TestReleaseWorkflowGatesTagOnPinnedImage` fails when either gate is dropped,
+moved after the build, or left unable to answer (no `fetch-depth: 0` on the
+checkout, no comparison against the pin or against `main`).
+
 ### Release checklist
 
 The pinned image reference must be identical in three places: the example
@@ -113,20 +135,24 @@ what `TestManifestsPinVersionedReleaseImage` accepts. The release workflow's
 Test step runs `go test -count=1 ./...` before it builds or publishes anything,
 so push a stale pin and no image is released — and the test's error text says
 the manifest image "is not the pinned release image", which points at the YAML
-even when the stale string lives in `main_test.go`.
+even when the stale string lives in `main_test.go`. The release gates then
+require the tag to be that pin's tag and the tagged commit to be on `main`, so
+tag a merged commit.
 
 1. Bump the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`
    reference in every one of these files:
    - `main_test.go` — `const releaseImage = "..."`
    - `manifests/deployment-example.yaml`
    - `manifests/redis-leader.yaml`
-2. Commit the bumps, verify the gate locally, then tag that commit:
+2. Commit the bumps, merge them to `main`, verify the gate locally, then tag
+   that merged commit:
    ```bash
    go test -count=1 ./...
    git tag v0.2.0 && git push origin v0.2.0
    ```
    The tag push starts the release workflow (vet + tests, then build and push
-   `ghcr.io/<owner>/redis-master-label:<tag>`).
+   `ghcr.io/<owner>/redis-master-label:<tag>`). A tag whose commit is not on
+   `main`, or whose tag differs from the pin, fails before the build.
 3. Apply the updated manifests; the pinned tag rolls out the new image.
 
 Rollback: redeploy the previous release's full image reference

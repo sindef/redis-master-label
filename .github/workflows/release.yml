@@ -7,6 +7,20 @@ name: Release
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
 # newer releases appear.
+#
+# The tag is the only source of the version and of the published reference, so
+# two gates run before anything is built or published:
+#
+#   - the tag must equal the tag of the reference the repository pins
+#     (main_test.go's `releaseImage`, which the example manifests deploy), so a
+#     v0.2.0 tag pushed while the pin still said v0.1.0 cannot publish
+#     ghcr.io/<image>:v0.2.0 that no manifest references. vet plus the whole
+#     test suite cannot catch that on their own: the pin is self-consistent, so
+#     TestManifestsPinVersionedReleaseImage stayed green.
+#   - the tagged commit must be reachable from main. Actions has no branch
+#     filter for tag pushes, and a tag pushed from a branch that never merged
+#     starts no pull request check at all, so the ancestry check is what keeps
+#     such a commit from releasing.
 on:
   push:
     tags:
@@ -30,7 +44,61 @@ jobs:
     name: Build and publish release image
     runs-on: ubuntu-latest
     steps:
+      # Full history: the gate below proves the tagged commit is an ancestor of
+      # main, and `git merge-base --is-ancestor` cannot answer that on the
+      # default shallow (depth 1) tag checkout.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # First gate, before any toolchain setup or build: the release publishes
+      # `${{ env.IMAGE }}:${GITHUB_REF_NAME}`, so the tag has to be the tag of
+      # the image the repository pins.
+      - name: Verify the tag matches the pinned release image
+        shell: bash
+        run: |
+          set -u
+          tag="${GITHUB_REF_NAME}"
+          image="${IMAGE:-<registry>/<image>}"
+          pinned=$(sed -n 's/^const releaseImage = "\([^"]*\)"$/\1/p' main_test.go)
+          if [ -z "$pinned" ]; then
+            echo "main_test.go declares no 'const releaseImage = \"...\"' line, so the release tag cannot be compared with the image the manifests pin" >&2
+            exit 1
+          fi
+          pinned_tag="${pinned##*:}"
+          echo "tag: ${tag}, pinned release image: ${pinned}"
+
+          if [ "$tag" != "$pinned_tag" ]; then
+            echo "tag ${tag} is not the tag of the pinned release image ${pinned}: bump releaseImage and the manifests in one change before tagging, otherwise this release publishes ${image}:${tag}, which no manifest in the repository references" >&2
+            exit 1
+          fi
+
+          # The pin only names the release if the manifests deploy it: every
+          # sidecar image reference under manifests/ must be that reference, so
+          # a manifest left on the previous tag fails the release too.
+          refs=$(grep -rhoE 'image:[[:space:]]+[^[:space:]]*redis-master-label[^[:space:]]*' manifests/ | sed -E 's/^image:[[:space:]]+//' | sort -u || true)
+          if [ -z "$refs" ]; then
+            echo "no redis-master-label image reference found under manifests/, so no manifest documents the image this release publishes" >&2
+            exit 1
+          fi
+          if [ "$refs" != "$pinned" ]; then
+            printf 'manifests/ pins:\n%s\nbut releaseImage is %s: bump the manifests and the pin in one change before tagging\n' "$refs" "$pinned" >&2
+            exit 1
+          fi
+
+      # Second gate: a tag can be pushed from any commit, and such a commit
+      # never went through a pull request check. Only a commit main contains may
+      # release.
+      - name: Verify the tag is reachable from main
+        shell: bash
+        run: |
+          set -u
+          base=refs/remotes/origin/main
+          git fetch --no-tags origin "+refs/heads/main:${base}"
+          if ! git merge-base --is-ancestor HEAD "$base"; then
+            echo "tag ${GITHUB_REF_NAME} points at $(git rev-parse --short HEAD), which is not an ancestor of origin/main: refusing to release a commit that never merged" >&2
+            exit 1
+          fi
 
       - uses: actions/setup-go@v7
         with:
