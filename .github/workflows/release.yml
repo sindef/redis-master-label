@@ -1,12 +1,21 @@
 name: Release
 
 # Publishing path for release_hygiene: a vX.Y.Z tag is the single trigger. The
-# workflow runs the same tests as CI, builds one image stamped with the tag
-# version, and pushes exactly one immutable reference:
+# workflow runs the same tests as CI, checks that the tag is the release image
+# the repository pins and that its commit reached main, builds one image stamped
+# with the tag version, and pushes exactly one immutable reference:
 # <registry>/<image>:<tag>. Nothing floating like :latest is ever pushed, so
 # an image reference stays point-in-time: an old release can be rolled back to
 # by redeploying its tag, and a manifest that pins <tag> keeps working when
 # newer releases appear.
+#
+# The tag alone used to be the whole input: nothing compared it with the pin, so
+# pushing v0.2.0 while main_test.go and manifests/ still said v0.1.0 passed vet
+# and the full suite (TestManifestsPinVersionedReleaseImage compares the pin with
+# the manifests, never with the tag) and published an image no manifest deploys.
+# A tag naming a commit that never merged bypassed CI the same way. The first
+# step below is the gate that closes both holes; a YAML trigger cannot express
+# "this commit is an ancestor of main", so the reachability check runs there.
 on:
   push:
     tags:
@@ -30,7 +39,57 @@ jobs:
     name: Build and publish release image
     runs-on: ubuntu-latest
     steps:
+      # Full history and every branch: the release gate below proves the tagged
+      # commit is an ancestor of main, which a shallow single-ref checkout
+      # cannot see.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # release_hygiene gate: the tag being released must be the release image
+      # this repository pins, and the tagged commit must be reachable from main.
+      # This runs before the build, so a mismatched or unmerged tag never
+      # produces an image, let alone a published one.
+      - name: Check released tag matches the pinned release image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The pin's single declaration. TestManifestsPinVersionedReleaseImage
+          # (run by the Test step below) compares this constant with the example
+          # manifests, so it is the reference the released tag has to equal.
+          pinned=$(sed -nE 's/^[[:space:]]*const releaseImage = "([^"]+)".*/\1/p' main_test.go | head -n 1 || true)
+          [ -n "$pinned" ] || { echo "main_test.go declares no 'const releaseImage = \"...\"', so the release image this repository pins cannot be read and the tag cannot be checked" >&2; exit 1; }
+          case "$pinned" in
+            *:*) pinned_tag=${pinned##*:} ;;
+            *) echo "pinned release image $pinned carries no tag" >&2; exit 1 ;;
+          esac
+
+          # The pin must be what the deployable YAML references: a gate reading
+          # only the constant would accept a pin no manifest deploys.
+          deployed=$(grep -hoE 'ghcr\.io/redis-master-label/redis-master-label:[^[:space:]"]+' manifests/*.yaml | sort -u || true)
+          [ -n "$deployed" ] || { echo "no ghcr.io/redis-master-label/redis-master-label image reference found in manifests/: the release image this workflow publishes would deploy nowhere" >&2; exit 1; }
+          if [ "$deployed" != "$pinned" ]; then
+            echo "manifests/ deploy $deployed but main_test.go pins $pinned: bump the pin and the manifests in one change before tagging" >&2
+            exit 1
+          fi
+
+          tag="${GITHUB_REF_NAME}"
+          if [ "$tag" != "$pinned_tag" ]; then
+            echo "releasing tag $tag, but the release image this repository pins is $pinned: bump main_test.go's releaseImage and the manifests to $tag in one change and tag that, so the published image is one the manifests deploy" >&2
+            exit 1
+          fi
+
+          # A tag can name a commit that never merged, and such a commit ran no
+          # CI. Requiring the tagged commit to be an ancestor of main keeps the
+          # published image on code review and CI saw.
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "tag $tag points at a commit that is not reachable from main: merge the release commit to main and let CI pass before tagging it" >&2
+            exit 1
+          fi
+
+          echo "release tag $tag matches the pinned release image $pinned and is reachable from main"
 
       - uses: actions/setup-go@v7
         with:
