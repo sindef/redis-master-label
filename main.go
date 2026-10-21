@@ -78,6 +78,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Bound every Kubernetes API request. Without a Timeout on the rest.Config
+	// the HTTP client waits forever for a peer that accepted the connection and
+	// then went silent, so a stalled apiserver would block checkAndLabel with no
+	// error for updateHealthStatus to count (see boundKubeConfig).
+	config = boundKubeConfig(config)
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create Kubernetes client: %v\n", err)
@@ -142,6 +148,44 @@ func validateRedisTLSFlags() error {
 	return nil
 }
 
+// minCheckTimeout floors the per-check budget so a very small --check-interval
+// (1ms, say) still gives one Redis round trip a usable deadline instead of
+// expiring it the instant the check starts.
+const minCheckTimeout = 100 * time.Millisecond
+
+// checkTimeout is the budget for a single ROLE round trip and a single
+// Kubernetes API call: half of --check-interval, floored at minCheckTimeout.
+// Deriving it from the interval is what keeps one stalled backend from holding
+// the poll loop past its own interval: a half-open peer (packet black hole, node
+// network partition) then fails the check with an error instead of blocking it,
+// so updateHealthStatus can count the failure and /healthz turns 503.
+func checkTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < minCheckTimeout {
+		timeout = minCheckTimeout
+	}
+	return timeout
+}
+
+// withCheckTimeout bounds ctx with checkTimeout unless the caller already set a
+// deadline, so every ROLE call and every pod get/update carries a deadline even
+// when the caller passes context.Background().
+func withCheckTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, checkTimeout())
+}
+
+// boundKubeConfig gives the in-cluster client a finite per-request Timeout.
+// rest.Config carries no timeout by default, and the poll loop calls the API
+// with a context that has no deadline of its own, so a black-holed apiserver
+// connection would block the loop forever while /healthz kept its last answer.
+func boundKubeConfig(config *rest.Config) *rest.Config {
+	config.Timeout = checkTimeout()
+	return config
+}
+
 // redisOptionsFromFlags builds the redis.Options for the client from the
 // --redis-* flags (and the REDIS_PASSWORD environment fallback). It is the
 // single place a TLS config is attached: a TLS config with
@@ -161,9 +205,19 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 		return nil, err
 	}
 
+	// Finite socket timeouts, derived from --check-interval: connect, read and
+	// write each get one check budget, so a peer that accepts the connection and
+	// then goes silent fails the ROLE command instead of stalling it.
+	// go-redis defaults are finite too, but they are unrelated to the interval
+	// (ReadTimeout 3s with up to three retries rides over a 10s interval), so
+	// they are pinned here rather than left implicit.
+	timeout := checkTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
@@ -205,7 +259,12 @@ type roleQuerier interface {
 }
 
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
+// The whole sequence runs under one checkTimeout budget, so a stalled Redis or
+// apiserver returns an error instead of holding the loop.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	ctx, cancel := withCheckTimeout(ctx)
+	defer cancel()
+
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
@@ -320,7 +379,14 @@ func serveHealth(listener net.Listener) <-chan error {
 	return errCh
 }
 
+// updateHealthStatus runs one ROLE check under a checkTimeout deadline and
+// updates the health counters. The deadline is what makes a half-open Redis
+// connection observable: without it the call blocks with no error to count, the
+// failure counter never advances and /healthz keeps its previous answer.
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
+	ctx, cancel := withCheckTimeout(ctx)
+	defer cancel()
+
 	_, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		healthStatus.mu.Lock()

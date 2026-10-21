@@ -29,7 +29,7 @@ Flags (all have sensible defaults):
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
-- `--check-interval` (default `10s`)
+- `--check-interval` (default `10s`; also the source of the per-check budget: one `ROLE` round trip and one Kubernetes API call each get half of it, floored at 100ms, so a stalled backend fails the check instead of blocking it)
 - `--health-port` (default `8080`)
 - `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
@@ -281,6 +281,16 @@ The application provides a health check endpoint at `/healthz` that:
 - Monitors Redis connectivity by executing the `ROLE` command
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
 - Runs on port 8080 by default (configurable via `--health-port`)
+
+Each check runs under a deadline of half `--check-interval`, floored at 100ms,
+and the same budget is applied to the Redis client's dial/read/write timeouts and
+to the Kubernetes client's per-request timeout. A half-open Redis connection (a
+packet black hole, a partitioned node) or a stalled apiserver therefore returns
+an error within one check instead of blocking the poll loop with no error to
+count: `consecutiveFailures` keeps advancing, so three intervals of it turn
+`/healthz` into 503 and the probes below restart or de-register the sidecar.
+`TestUpdateHealthStatus_HangingQuerierGoesUnhealthyAfterThreeIntervals` fails
+when that deadline goes missing.
 
 Example:
 ```bash
