@@ -280,6 +280,13 @@ The application provides a health check endpoint at `/healthz` that:
 - Returns `503 Service Unavailable` when unhealthy
 - Monitors Redis connectivity by executing the `ROLE` command
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
+- Each check runs under a deadline derived from `--check-interval` (half the
+  interval, at least 100ms), so a Redis or Kubernetes backend that stops
+  answering — a half-open connection, a packet black hole, a node network
+  partition — counts as a failed check instead of blocking the loop and leaving
+  the endpoint at 200. The same budget is set as the Redis client's
+  dial/read/write timeouts, the Kubernetes client's per-request timeout, and the
+  per-iteration context deadline
 - Runs on port 8080 by default (configurable via `--health-port`)
 
 Example:
@@ -326,6 +333,15 @@ polls the port, which is how the wiring went missing. If you change
 - Update frequency controlled by `--check-interval`.
 - If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
 - The health check endpoint is what the example deployments' probes poll, so the kubelet restarts the sidecar when it turns unhealthy (see "Health Check Endpoint").
+- Every backend call is bounded. One poll iteration runs under a context
+  deadline of half `--check-interval` (floored at 100ms), the Redis client is
+  built with `DialTimeout`, `ReadTimeout` and `WriteTimeout` set to that budget,
+  and the Kubernetes client built from `rest.InClusterConfig()` gets the same
+  value as `rest.Config.Timeout` (the in-cluster config sets none by default).
+  A stalled Redis therefore surfaces as a `ROLE` error that trips the unhealthy
+  path after three intervals instead of freezing the loop while `/healthz` keeps
+  answering 200. `TestRunCheckOnce_HangingRoleGoesUnhealthyAfterThreeIntervals`
+  fails when that deadline is removed.
 
 ## License
 Released under the [MIT License](LICENSE). The container image advertises the

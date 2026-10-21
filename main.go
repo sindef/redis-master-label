@@ -78,6 +78,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Bound every Kubernetes API call: rest.InClusterConfig() sets no timeout,
+	// so a stalled API server would block the poll loop exactly like a stalled
+	// Redis does, and /healthz would keep answering 200 meanwhile.
+	boundRESTConfig(config)
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create Kubernetes client: %v\n", err)
@@ -121,13 +126,63 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
-
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
-			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
-		}
+		// Probe health and reconcile the label under one deadline, so a backend
+		// that stops answering surfaces as an error instead of freezing the loop.
+		runCheckOnce(ctx, rdb, clientset)
 		time.Sleep(*checkInterval)
+	}
+}
+
+// minBackendTimeout floors one backend call's budget so that a tiny
+// --check-interval cannot produce a timeout so short that every call fails
+// before a healthy server could answer.
+const minBackendTimeout = 100 * time.Millisecond
+
+// backendTimeout returns the budget for one backend call: half of
+// --check-interval, floored at minBackendTimeout. The result is always finite
+// and positive, also for the non-positive --check-interval that
+// validateCheckInterval rejects at startup, so no code path can build a client
+// with a zero (unbounded) timeout.
+//
+// The value exists because a half-open connection (packet black hole, node
+// network partition) never returns an error by itself: without a deadline
+// rdb.Do blocks forever, updateHealthStatus never counts a failure and
+// /healthz answers 200 forever while no label is applied or removed - the
+// failure the liveness and readiness probes documented in the README are meant
+// to catch.
+func backendTimeout() time.Duration {
+	if *checkInterval <= 0 {
+		return minBackendTimeout
+	}
+	if timeout := *checkInterval / 2; timeout > minBackendTimeout {
+		return timeout
+	}
+	return minBackendTimeout
+}
+
+// boundRESTConfig gives the Kubernetes client a finite per-request timeout.
+// rest.InClusterConfig() leaves rest.Config.Timeout at zero, which means no
+// timeout at all, so a pod Get/Update against a stalled API server would block
+// the poll loop the same way a stalled Redis does.
+func boundRESTConfig(config *rest.Config) {
+	config.Timeout = backendTimeout()
+}
+
+// runCheckOnce performs one poll iteration with all backend work bounded by
+// backendTimeout. The health probe and the ROLE/label check share one deadline,
+// so a Redis or Kubernetes call that never answers returns a context error that
+// updateHealthStatus counts as a failure and checkAndLabel reports, instead of
+// freezing the loop while /healthz keeps answering 200. main runs this every
+// --check-interval, and the tests drive it directly.
+func runCheckOnce(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) {
+	checkCtx, cancel := context.WithTimeout(ctx, backendTimeout())
+	defer cancel()
+
+	// Update health status based on Redis connectivity
+	updateHealthStatus(checkCtx, rdb)
+
+	if err := checkAndLabel(checkCtx, rdb, clientset); err != nil {
+		fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 	}
 }
 
@@ -161,9 +216,18 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 		return nil, err
 	}
 
+	// Dial/read/write timeouts are set explicitly: left at zero go-redis
+	// substitutes its own multi-second defaults, and a half-open connection to
+	// Redis would keep a read pending through them. They carry the same
+	// backendTimeout budget the per-check context deadline uses, so a stalled
+	// Redis surfaces as a ROLE error that trips the unhealthy path.
+	timeout := backendTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
