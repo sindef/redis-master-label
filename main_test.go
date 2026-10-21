@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -2200,6 +2202,185 @@ func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
 	updateHealthStatus(context.Background(), rdbOk)
 	if healthy, _ := healthSnapshot(); healthy != true {
 		t.Error("isHealthy stays false after one successful ROLE, want true")
+	}
+}
+
+// hangingRedis models the reviewed half-open connection: ROLE never answers on
+// its own and only returns when the deadline the caller attached expires, the
+// way go-redis aborts a command whose context is done. A client without a
+// deadline blocks here forever, which is the failure the fix removes.
+type hangingRedis struct {
+	calls int32
+}
+
+func (h *hangingRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	atomic.AddInt32(&h.calls, 1)
+	<-ctx.Done()
+	return redis.NewCmdResult(nil, ctx.Err())
+}
+
+// The reviewed defect: a hung Redis left the health status at its previous
+// value forever, because Do never returned and never incremented
+// consecutiveFailures, so /healthz kept answering 200. Three intervals against
+// a server that never answers must therefore trip the unhealthy path within a
+// bounded time instead of holding the loop.
+func TestUpdateHealthStatus_HangingRoleQuerierGoesUnhealthy(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 200 * time.Millisecond
+
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	hanging := &hangingRedis{}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 3; i++ {
+			updateHealthStatus(context.Background(), hanging)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("updateHealthStatus blocked on a hanging ROLE for more than 10s: the check has no deadline")
+	}
+
+	healthy, failures := healthSnapshot()
+	if healthy {
+		t.Error("isHealthy = true after three hung ROLE calls, want false: /healthz would answer 200 forever")
+	}
+	if failures != 3 {
+		t.Errorf("consecutiveFailures = %d, want 3", failures)
+	}
+	if calls := atomic.LoadInt32(&hanging.calls); calls != 3 {
+		t.Errorf("ROLE calls = %d, want 3", calls)
+	}
+}
+
+// The same hang must not hold checkAndLabel either: after a bounded ROLE the
+// loop continues to the next interval instead of stopping with the label it
+// last applied.
+func TestCheckAndLabel_HangingRoleQuerierReturnsError(t *testing.T) {
+	defer configureTestFlags()()
+
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 200 * time.Millisecond
+
+	cs := newPodClientset(testPod("test-pod", nil))
+	hanging := &hangingRedis{}
+
+	start := time.Now()
+	err := checkAndLabel(context.Background(), hanging, cs)
+	if err == nil {
+		t.Fatal("checkAndLabel against a hanging ROLE returned no error, want the deadline failure")
+	}
+	if !strings.HasPrefix(err.Error(), "failed to execute ROLE command") {
+		t.Errorf("error = %v, want the wrapped ROLE command failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("checkAndLabel took %v against a hanging ROLE, want it bounded by the check deadline", elapsed)
+	}
+	updates := 0
+	for _, action := range cs.Actions() {
+		if action.GetVerb() == "update" {
+			updates++
+		}
+	}
+	if updates != 0 {
+		t.Errorf("update calls = %d, want 0: no label change is known without a ROLE reply", updates)
+	}
+}
+
+// backendTimeout is derived from --check-interval and stays finite and
+// positive, so neither the client options nor a per-check context can carry a
+// zero/no deadline.
+func TestBackendTimeout(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	tests := []struct {
+		name     string
+		interval time.Duration
+		want     time.Duration
+	}{
+		{name: "default interval halves", interval: 10 * time.Second, want: 5 * time.Second},
+		{name: "four seconds halves", interval: 4 * time.Second, want: 2 * time.Second},
+		{name: "half already at the floor", interval: 200 * time.Millisecond, want: minBackendTimeout},
+		{name: "tiny interval floors", interval: time.Millisecond, want: minBackendTimeout},
+		{name: "zero interval floors", interval: 0, want: minBackendTimeout},
+		{name: "negative interval floors", interval: -time.Second, want: minBackendTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			*checkInterval = tt.interval
+			if got := backendTimeout(); got != tt.want {
+				t.Fatalf("backendTimeout() with --check-interval=%v = %v, want %v", tt.interval, got, tt.want)
+			}
+			if backendTimeout() <= 0 {
+				t.Fatal("backendTimeout() = 0 or less, want a positive deadline")
+			}
+		})
+	}
+}
+
+// The reviewed shape of redisOptionsFromFlags: Addr/Password/TLSConfig only,
+// leaving DialTimeout/ReadTimeout/WriteTimeout at their defaults so a stalled
+// connection is never abandoned. All three must carry the finite deadline.
+func TestRedisOptionsFromFlags_FiniteTimeouts(t *testing.T) {
+	origInterval := *checkInterval
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*checkInterval = origInterval
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*redisTLS = false
+	*redisTLSSkipVerify = false
+	*checkInterval = time.Second
+
+	opts, err := redisOptionsFromFlags()
+	if err != nil {
+		t.Fatalf("redisOptionsFromFlags: %v", err)
+	}
+
+	timeouts := map[string]time.Duration{
+		"DialTimeout":  opts.DialTimeout,
+		"ReadTimeout":  opts.ReadTimeout,
+		"WriteTimeout": opts.WriteTimeout,
+	}
+	for name, got := range timeouts {
+		if got <= 0 {
+			t.Errorf("%s = %v, want a finite positive timeout: a half-open connection never returns on its own", name, got)
+		}
+		if want := backendTimeout(); got != want {
+			t.Errorf("%s = %v, want %v (derived from --check-interval=%v)", name, got, want, *checkInterval)
+		}
+	}
+}
+
+// The Kubernetes client has no default request timeout either, so the config
+// built from InClusterConfig must carry the same finite deadline.
+func TestWithBackendTimeoutBoundsKubernetesClient(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 2 * time.Second
+
+	config := withBackendTimeout(&rest.Config{Host: "https://kubernetes.default.svc"})
+	if config == nil {
+		t.Fatal("withBackendTimeout returned nil")
+	}
+	if want := backendTimeout(); config.Timeout != want {
+		t.Fatalf("rest.Config.Timeout = %v, want %v", config.Timeout, want)
+	}
+	if config.Timeout <= 0 {
+		t.Fatal("rest.Config.Timeout = 0 or less, want a finite positive timeout")
+	}
+	if config.Host != "https://kubernetes.default.svc" {
+		t.Errorf("config.Host = %q, want the in-cluster host preserved", config.Host)
 	}
 }
 

@@ -77,6 +77,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to get in-cluster config: %v\n", err)
 		os.Exit(1)
 	}
+	config = withBackendTimeout(config)
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -92,8 +93,6 @@ func main() {
 
 	rdb := redis.NewClient(redisOptions)
 	defer rdb.Close()
-
-	ctx := context.Background()
 
 	// Bind the health check HTTP server before entering the main loop so a
 	// bind failure (port taken, invalid --health-port) aborts startup instead
@@ -121,14 +120,62 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
+		// Update health status based on Redis connectivity. The iteration
+		// context carries the same finite deadline as the client options, so
+		// a half-open Redis connection or a stalled API server returns an
+		// error here instead of blocking the loop: without it
+		// consecutiveFailures never increments and /healthz keeps answering
+		// 200 while no label is applied or removed.
+		ctx, cancel := context.WithTimeout(context.Background(), backendTimeout())
 		updateHealthStatus(ctx, rdb)
 
 		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
 		}
+		cancel()
 		time.Sleep(*checkInterval)
 	}
+}
+
+// minBackendTimeout floors the deadline derived from --check-interval. A very
+// small interval must not produce a deadline so short that every healthy ROLE
+// round trip times out, and it keeps the derived deadline finite.
+const minBackendTimeout = 100 * time.Millisecond
+
+// backendTimeout is the deadline applied to one Redis command round trip, one
+// Kubernetes API request and one whole poll iteration: half --check-interval,
+// never below minBackendTimeout. A half-open connection (packet black hole,
+// node network partition) never returns an error on its own, so without a
+// finite deadline the poll loop blocks inside the client, the health status
+// keeps its previous value and /healthz answers 200 forever while the README's
+// liveness/readiness probes can neither restart nor de-register the sidecar.
+func backendTimeout() time.Duration {
+	if *checkInterval <= 0 {
+		return minBackendTimeout
+	}
+	timeout := *checkInterval / 2
+	if timeout < minBackendTimeout {
+		return minBackendTimeout
+	}
+	return timeout
+}
+
+// withBackendTimeout bounds every HTTP request the Kubernetes client builds
+// from config. client-go has no default request timeout, so a stalled API server
+// would otherwise hold the poll loop the same way a hung Redis does.
+func withBackendTimeout(config *rest.Config) *rest.Config {
+	config.Timeout = backendTimeout()
+	return config
+}
+
+// boundedRole issues ROLE under the per-check deadline. A client that honours
+// contexts (go-redis does) aborts the command and reports the deadline error,
+// which is what the unhealthy path counts; a caller that already holds a
+// shorter deadline keeps it.
+func boundedRole(ctx context.Context, rdb roleQuerier) *redis.Cmd {
+	ctx, cancel := context.WithTimeout(ctx, backendTimeout())
+	defer cancel()
+	return rdb.Do(ctx, "ROLE")
 }
 
 // validateRedisTLSFlags rejects a nonsensical TLS flag combination:
@@ -154,6 +201,12 @@ func validateRedisTLSFlags() error {
 //	--redis-tls=true:  TLSConfig carries InsecureSkipVerify from
 //	                   --redis-tls-skip-verify.
 //
+// It is also the single place the connection timeouts are set. go-redis
+// leaves DialTimeout/ReadTimeout/WriteTimeout at their defaults, which a
+// half-open connection never trips, so all three are pinned to
+// backendTimeout() (derived from --check-interval) and every command carries
+// the boundedRole deadline on top.
+//
 // Startup config invalid in combination (--redis-tls-skip-verify without
 // --redis-tls) is rejected instead of applied silently.
 func redisOptionsFromFlags() (*redis.Options, error) {
@@ -161,9 +214,13 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 		return nil, err
 	}
 
+	timeout := backendTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
@@ -206,7 +263,7 @@ type roleQuerier interface {
 
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
-	role, err := rdb.Do(ctx, "ROLE").Result()
+	role, err := boundedRole(ctx, rdb).Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
 	}
@@ -321,7 +378,7 @@ func serveHealth(listener net.Listener) <-chan error {
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
+	_, err := boundedRole(ctx, rdb).Result()
 	if err != nil {
 		healthStatus.mu.Lock()
 		healthStatus.consecutiveFailures++

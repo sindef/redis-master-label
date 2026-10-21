@@ -29,7 +29,7 @@ Flags (all have sensible defaults):
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
-- `--check-interval` (default `10s`)
+- `--check-interval` (default `10s`; also sets the deadline on backend calls: the Redis dial, read and write timeouts, the Kubernetes client timeout and the per-check context each use half the interval, floored at `100ms`)
 - `--health-port` (default `8080`)
 - `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
@@ -280,6 +280,7 @@ The application provides a health check endpoint at `/healthz` that:
 - Returns `503 Service Unavailable` when unhealthy
 - Monitors Redis connectivity by executing the `ROLE` command
 - Tracks consecutive failures; after 3 consecutive failures, the endpoint reports unhealthy
+- Bounds every `ROLE` round trip, every Kubernetes API request and the whole poll iteration with a finite deadline (half `--check-interval`, floored at `100ms`), so a half-open Redis connection or a stalled API server surfaces as an error and counts as a failure instead of blocking the loop with the endpoint stuck at 200
 - Runs on port 8080 by default (configurable via `--health-port`)
 
 Example:
