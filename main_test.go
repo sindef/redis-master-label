@@ -2203,6 +2203,116 @@ func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
 	}
 }
 
+// A half-open Redis connection (packet black hole, network partition) must not
+// block the poll loop forever: the ROLE probe has to give up on its own and
+// count as a failure, or /healthz keeps its previous healthy answer while no
+// label is ever applied or removed.
+func TestUpdateHealthStatus_HangingRedisGoesUnhealthyAfterThreeChecks(t *testing.T) {
+	origInterval := *checkInterval
+	defer func() { *checkInterval = origInterval }()
+	// Small interval so the test stays fast; backendTimeout floors the
+	// derived deadline at minBackendTimeout.
+	*checkInterval = 20 * time.Millisecond
+
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	start := time.Now()
+	for i := 1; i <= 3; i++ {
+		updateHealthStatus(context.Background(), hangingRedis{})
+
+		healthy, failures := healthSnapshot()
+		if failures != i {
+			t.Fatalf("after %d hanging checks, consecutiveFailures = %d, want %d", i, failures, i)
+		}
+		if want := i < 3; healthy != want {
+			t.Errorf("after %d hanging checks, isHealthy = %v, want %v", i, healthy, want)
+		}
+	}
+	if healthy, _ := healthSnapshot(); healthy {
+		t.Error("isHealthy = true after three hanging checks, want false")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("three hanging checks took %v, want each bounded by backendTimeout()", elapsed)
+	}
+}
+
+// hangingRedis never answers ROLE until its context is done, which is what a
+// black-holed connection looks like to the caller.
+type hangingRedis struct{}
+
+func (hangingRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	select {
+	case <-ctx.Done():
+		return redis.NewCmdResult(nil, ctx.Err())
+	case <-time.After(5 * time.Second):
+		return redis.NewCmdResult(nil, errors.New("hanging ROLE ignored the context deadline"))
+	}
+}
+
+// The Redis client must carry explicit finite dial/read/write timeouts derived
+// from --check-interval. Relying on library defaults still leaves operations
+// unbounded relative to the configured check cadence, and a zero field is how
+// "no timeout" is configured.
+func TestRedisOptionsFromFlags_FiniteTimeouts(t *testing.T) {
+	origInterval := *checkInterval
+	origTLS, origSkipVerify := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*checkInterval = origInterval
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*redisTLS = false
+	*redisTLSSkipVerify = false
+	*checkInterval = 2 * time.Second
+
+	opts, err := redisOptionsFromFlags()
+	if err != nil {
+		t.Fatalf("redisOptionsFromFlags: %v", err)
+	}
+
+	want := time.Second
+	for name, got := range map[string]time.Duration{
+		"DialTimeout":  opts.DialTimeout,
+		"ReadTimeout":  opts.ReadTimeout,
+		"WriteTimeout": opts.WriteTimeout,
+	} {
+		if got <= 0 {
+			t.Errorf("%s = %v, want a finite positive timeout", name, got)
+		}
+		if got != want {
+			t.Errorf("%s = %v, want %v derived from --check-interval", name, got, want)
+		}
+	}
+}
+
+// backendTimeout must stay finite and positive even for the non-positive
+// --check-interval values validateCheckInterval rejects, so a direct call cannot
+// build an already-expired context.
+func TestBackendTimeoutIsFiniteAndPositive(t *testing.T) {
+	origInterval := *checkInterval
+	defer func() { *checkInterval = origInterval }()
+
+	tests := []struct {
+		interval time.Duration
+		want     time.Duration
+	}{
+		{20 * time.Second, 10 * time.Second},
+		{2 * time.Second, time.Second},
+		{0, minBackendTimeout},
+		{-time.Second, minBackendTimeout},
+		{time.Nanosecond, minBackendTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.interval.String(), func(t *testing.T) {
+			*checkInterval = tt.interval
+			if got := backendTimeout(); got != tt.want {
+				t.Fatalf("backendTimeout() with --check-interval=%v = %v, want %v", tt.interval, got, tt.want)
+			}
+		})
+	}
+}
+
 // Non-positive --check-interval values must be rejected at startup:
 // time.Sleep returns immediately for them, so the poll loop busy-spins,
 // hammering the Redis server and the Kubernetes API server.

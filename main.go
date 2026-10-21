@@ -77,6 +77,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to get in-cluster config: %v\n", err)
 		os.Exit(1)
 	}
+	// Without a Timeout a half-open connection to the API server (network
+	// partition, black-holed node) blocks a pod Get/Update forever, which
+	// freezes the poll loop and leaves /healthz answering 200 forever.
+	config.Timeout = backendTimeout()
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -142,6 +146,24 @@ func validateRedisTLSFlags() error {
 	return nil
 }
 
+// minBackendTimeout floors the per-call timeout so a very small
+// --check-interval still leaves room for a healthy ROLE round trip.
+const minBackendTimeout = 100 * time.Millisecond
+
+// backendTimeout bounds one Redis or Kubernetes backend call. It is derived
+// from --check-interval so a stalled backend returns an error before the next
+// scheduled check, and never below minBackendTimeout. --check-interval is
+// validated positive before the main loop starts, but a non-positive value
+// still yields a finite, positive timeout instead of an immediately expired
+// context.
+func backendTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < minBackendTimeout {
+		return minBackendTimeout
+	}
+	return timeout
+}
+
 // redisOptionsFromFlags builds the redis.Options for the client from the
 // --redis-* flags (and the REDIS_PASSWORD environment fallback). It is the
 // single place a TLS config is attached: a TLS config with
@@ -161,9 +183,13 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 		return nil, err
 	}
 
+	timeout := backendTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
@@ -206,6 +232,9 @@ type roleQuerier interface {
 
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	ctx, cancel := context.WithTimeout(ctx, backendTimeout())
+	defer cancel()
+
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
@@ -321,6 +350,12 @@ func serveHealth(listener net.Listener) <-chan error {
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
+	// Bound the probe itself: a half-open Redis connection that never answers
+	// must surface as a ROLE error instead of blocking the poll loop and
+	// leaving /healthz at its previous value forever.
+	ctx, cancel := context.WithTimeout(ctx, backendTimeout())
+	defer cancel()
+
 	_, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		healthStatus.mu.Lock()
