@@ -29,7 +29,7 @@ Flags (all have sensible defaults):
 - `--label-value` (default `master`)
 - `--pod-name` (defaults to `HOSTNAME` env)
 - `--pod-namespace` (defaults to `POD_NAMESPACE` env or `default`)
-- `--check-interval` (default `10s`)
+- `--check-interval` (default `10s`; also the source of the per-call backend timeout: each Redis command, Redis dial and Kubernetes request is bounded by half an interval, never less than 1ms)
 - `--health-port` (default `8080`)
 - `--version` (prints the build version and exits; stamped at Docker build time via `--build-arg VERSION=<tag>`, `dev` otherwise)
 
@@ -326,6 +326,7 @@ polls the port, which is how the wiring went missing. If you change
 - Update frequency controlled by `--check-interval`.
 - If using TLS, set `--redis-tls` and, if required, `--redis-tls-skip-verify`. `--redis-tls-skip-verify` without `--redis-tls` is rejected at startup instead of being silently ignored.
 - The health check endpoint is what the example deployments' probes poll, so the kubelet restarts the sidecar when it turns unhealthy (see "Health Check Endpoint").
+- Backend calls cannot block the poll loop: `--check-interval` bounds every Redis `ROLE`, Redis connect and Kubernetes request with a timeout of half the interval (minimum 1ms). A half-open connection (packet black hole, node network partition) therefore fails with an error, the health status trips after three consecutive failures, and the probes restart or de-register the sidecar instead of `/healthz` answering 200 while nothing is labelled.
 
 ## License
 Released under the [MIT License](LICENSE). The container image advertises the

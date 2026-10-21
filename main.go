@@ -77,6 +77,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to get in-cluster config: %v\n", err)
 		os.Exit(1)
 	}
+	applyRESTTimeout(config)
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -161,9 +162,16 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 		return nil, err
 	}
 
+	// Explicit finite timeouts: go-redis defaults a fixed 3s read timeout
+	// that ignores --check-interval, so the connection options must carry the
+	// loop's own bound (backendTimeout) instead of relying on them.
+	timeout := backendTimeout()
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
 	}
 
 	if *redisTLS {
@@ -173,6 +181,50 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 	}
 
 	return options, nil
+}
+
+// minBackendTimeout is the lower bound backendTimeout applies, so a very small
+// --check-interval cannot produce a zero timeout: to the Redis client a zero
+// DialTimeout/ReadTimeout means "use the library default" and to a
+// context.WithTimeout a zero duration means "already expired", neither of
+// which is the finite per-interval bound this loop wants.
+const minBackendTimeout = time.Millisecond
+
+// backendTimeout bounds one backend call made by the poll loop: half of
+// --check-interval, always finite and positive.
+//
+// The bound is attached in three places: the redis.Options
+// DialTimeout/ReadTimeout/WriteTimeout, rest.Config.Timeout for the Kubernetes
+// client, and the context of every ROLE and pod call. Relying on the library
+// defaults is not enough. go-redis defaults a 3s read timeout that ignores
+// --check-interval, and a rest.Config that leaves Timeout at zero gives the
+// client-go HTTP client no response timeout at all - dialing is bounded, a
+// server that accepts the connection and then stops answering is not. A
+// half-open connection (packet black hole, node network partition) then blocks
+// a pod Get/Update indefinitely: the loop never reaches updateHealthStatus
+// again, consecutiveFailures never grows, /healthz keeps answering 200 while
+// no label is ever applied or removed, and the liveness and readiness probes
+// documented in the README can neither restart nor de-register the sidecar.
+func backendTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < minBackendTimeout {
+		timeout = minBackendTimeout
+	}
+	return timeout
+}
+
+// backendContext derives the context one backend call runs under. A deadline
+// the caller already set still applies; the earlier of the two wins.
+func backendContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, backendTimeout())
+}
+
+// applyRESTTimeout bounds every Kubernetes request the client issues.
+// rest.InClusterConfig leaves Timeout at zero, which means no client-side
+// response timeout: transport dialing and TLS handshakes are bounded, a
+// request whose response never arrives is not.
+func applyRESTTimeout(config *rest.Config) {
+	config.Timeout = backendTimeout()
 }
 
 // validateCheckInterval rejects a non-positive --check-interval. time.Sleep
@@ -205,7 +257,13 @@ type roleQuerier interface {
 }
 
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
+// Both the ROLE command and the pod read/update run under a bounded context
+// (backendContext), so a connection that stops answering fails the call
+// instead of stalling the poll loop.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	ctx, cancel := backendContext(ctx)
+	defer cancel()
+
 	role, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
@@ -320,7 +378,14 @@ func serveHealth(listener net.Listener) <-chan error {
 	return errCh
 }
 
+// updateHealthStatus probes Redis for the /healthz state. The ROLE call is
+// bounded by backendTimeout, so a backend that stops answering yields a ROLE
+// error and counts as a failure; an unbounded wait here is what kept the
+// endpoint answering 200 after the loop had already stalled.
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
+	ctx, cancel := backendContext(ctx)
+	defer cancel()
+
 	_, err := rdb.Do(ctx, "ROLE").Result()
 	if err != nil {
 		healthStatus.mu.Lock()
