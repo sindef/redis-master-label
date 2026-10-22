@@ -56,11 +56,26 @@ jobs:
       # orphaned checker with no FAIL exit path cannot guard anything, so CI
       # runs it and propagates its exit status; harness.py replays the
       # checker's workflow fixtures so its setup-go scan stays step-aware (a
-      # later step is never read as a second version source).
+      # later step is never read as a second version source). harness.py only
+      # replays setup-go shapes, so test_workflow_checks.py - the unittest
+      # fixtures for the tab scan and the GC-token scan as well - runs here
+      # too. A deleted suite makes `python3 -m unittest` exit non-zero, and an
+      # emptied one still exits 0 after "Ran 0 tests", so the summary must
+      # report at least one case.
       - name: Verify workflow scans and checker fixtures
         run: |
           python3 ci_check_comments.py
           python3 harness.py
+          log="${RUNNER_TEMP:-/tmp}/test_workflow_checks.log"
+          if ! python3 -m unittest -v test_workflow_checks > "$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          if ! grep -Eq '^Ran [1-9][0-9]* tests?' "$log"; then
+            echo "test_workflow_checks reported no test case: the checker's tab and GC-token rules lost their fixtures" >&2
+            exit 1
+          fi
 
       - name: Build
         run: go build ./...

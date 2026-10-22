@@ -10,7 +10,9 @@ same checker over the workflows this repository actually ships, so a workflow
 that starts violating a rule fails here as well.
 
 Only the standard library is used: the checker itself is dependency-free, so
-these tests need no install step.
+these tests need no install step. CI runs this suite in the "Verify workflow
+scans and checker fixtures" step and fails when it reports zero tests, so
+deleting the file or emptying it cannot retire the coverage.
 """
 
 import os
