@@ -2360,6 +2360,55 @@ func TestCiCheckCommentsSetupGoScanIsStepAware(t *testing.T) {
 	}
 }
 
+// The reviewed ci_gap: test_workflow_checks.py asserted every checker rule
+// against fixtures - the tab scan and the leftover GC-token scan included -
+// but no CI step ran it (the step ran only ci_check_comments.py and
+// harness.py, and harness.py replays setup-go shapes only), so a rule that
+// stopped firing left every check green. The suite must stay wired into the CI
+// step together with its zero-test guard: an emptied suite still exits 0 after
+// "Ran 0 tests", so the step fails unless the unittest summary reports at
+// least one case. A Go test can only rerun the suite where a local python
+// exists; the workflow wiring and the suite file are checked unconditionally.
+func TestCIWorkflowRunsWorkflowCheckerTests(t *testing.T) {
+	workflowPath := filepath.Join(ciWorkflowDir, "ci.yml")
+	data, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, want := range []string{
+		"python3 -m unittest -v test_workflow_checks",
+		"^Ran [1-9][0-9]* tests?",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Errorf("%s no longer contains %q: the checker's unittest fixtures must run in CI, and an emptied suite must fail instead of passing with zero tests", workflowPath, want)
+		}
+	}
+
+	if _, err := os.Stat("test_workflow_checks.py"); err != nil {
+		t.Fatalf("test_workflow_checks.py: %v (the checker's tab and GC-token fixtures live there)", err)
+	}
+
+	var python string
+	for _, candidate := range []string{"python3", "python"} {
+		if found, err := exec.LookPath(candidate); err == nil {
+			python = found
+			break
+		}
+	}
+	if python == "" {
+		t.Skip("no local python; native CI runs test_workflow_checks.py directly")
+	}
+
+	out, err := exec.Command(python, "-m", "unittest", "-v", "test_workflow_checks").CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s -m unittest test_workflow_checks: %v\n%s", python, err, out)
+	}
+	if !regexp.MustCompile(`(?m)^Ran [1-9][0-9]* tests?`).Match(out) {
+		t.Fatalf("test_workflow_checks reported no test case:\n%s", out)
+	}
+}
+
 // A workflow that pushes images with provenance/SBOM attestations needs the
 // permissions docker/build-push-action documents for that push: id-token: write
 // (keyless signing via the workflow's OIDC identity) and attestations: write
