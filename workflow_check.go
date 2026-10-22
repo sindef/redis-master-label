@@ -290,6 +290,209 @@ func attestationPermissionsProblemsIn(path, text string) []string {
 	return problems
 }
 
+// Release tag gate: release.yml is the only place a `vX.Y.Z` tag becomes a
+// published image, and `version="${GITHUB_REF_NAME}"` is the only source of the
+// published tag. Nothing compared that tag with the image the repository
+// deploys: `go vet` and the full test suite pass on `v0.2.0` while the pin is
+// still v0.1.0 (TestManifestsPinVersionedReleaseImage only compares the pin with
+// manifests/), so the run published an image no manifest references, and the
+// README's three-file bump was the only thing keeping tag and pin aligned. A tag
+// pushed from a commit that never merged bypassed CI entirely. No compiler and no
+// `go test` can see a workflow file, so the workflow itself must carry both
+// gates, and this scan (main_test.go:
+// TestReleaseWorkflowGatesTagOnPinnedReleaseImage) fails the pull request when a
+// workflow that triggers on release tags loses one of them or runs it after the
+// image is built.
+
+const (
+	// releaseTagTrigger is the push.tags pattern release.yml selects on.
+	releaseTagTrigger = "v*.*.*"
+
+	// releaseImageConstName is the pinned reference the release tag must equal:
+	// the constant TestManifestsPinVersionedReleaseImage holds manifests/ to.
+	releaseImageConstName = "releaseImage"
+
+	// releasePinFile declares that constant.
+	releasePinFile = "main_test.go"
+
+	// releaseGateFetchDepth is the checkout depth the ancestry gate needs: a
+	// shallow checkout holds neither main nor the history joining it to the tag.
+	releaseGateFetchDepth = "fetch-depth: 0"
+)
+
+// workflowStep is one item of a job's `steps:` list: the line of its `- name:`
+// or `- uses:` item and the text up to the next item. Without a step split the
+// scan could not tell whether a gate runs before the build, and text anywhere in
+// the file (a comment included) would look like a gate.
+type workflowStep struct {
+	line int
+	body string
+}
+
+// workflowSteps splits workflow text into job steps. A step starts at an
+// indented list item whose key is name or uses; list items elsewhere (a tags
+// pattern, run arguments) start with other keys and are not steps.
+func workflowSteps(text string) []workflowStep {
+	lines := strings.Split(text, "\n")
+	var steps []workflowStep
+	start := -1
+	closeStep := func(end int) {
+		if start >= 0 {
+			steps = append(steps, workflowStep{
+				line: start + 1,
+				body: strings.Join(lines[start:end], "\n"),
+			})
+		}
+		start = -1
+	}
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		item := strings.TrimPrefix(trimmed, "- ")
+		if item != trimmed && len(line) > len(trimmed) &&
+			(strings.HasPrefix(item, "name:") || strings.HasPrefix(item, "uses:")) {
+			closeStep(i)
+			start = i
+		}
+	}
+	closeStep(len(lines))
+	return steps
+}
+
+// stepBuildsImage reports whether a step builds or pushes the release image.
+// Both markers count: the Docker CLI build in release.yml and the
+// build-push-action the publish step uses.
+func stepBuildsImage(body string) bool {
+	return strings.Contains(body, "docker build") || strings.Contains(body, attestationActionStr)
+}
+
+// stepPinsTag reports whether a step compares the tag being released with the
+// pinned release image and fails the run when they differ: it reads the
+// releaseImage constant out of main_test.go, names the tag GitHub sets for the
+// push, and exits non-zero on disagreement. All four must be in the same step,
+// because a step that reads the pin without comparing it releases anything.
+func stepPinsTag(body string) bool {
+	return strings.Contains(body, releaseImageConstName) &&
+		strings.Contains(body, releasePinFile) &&
+		(strings.Contains(body, "GITHUB_REF_NAME") || strings.Contains(body, "github.ref_name")) &&
+		strings.Contains(body, "exit 1")
+}
+
+// stepChecksMainAncestry reports whether a step refuses a tag whose commit is
+// not on main. `git merge-base --is-ancestor <commit> <main tip>` is that
+// answer, so the step must run it against a main ref and fail the run.
+func stepChecksMainAncestry(body string) bool {
+	return strings.Contains(body, "merge-base") &&
+		strings.Contains(body, "--is-ancestor") &&
+		strings.Contains(body, "main") &&
+		strings.Contains(body, "exit 1")
+}
+
+// releaseTagGateProblems returns one message per problem in the workflows under
+// dir that trigger on release tags, plus the number of such workflows, so a
+// caller can tell "no problems" from "no release workflow found, so nothing was
+// checked".
+func releaseTagGateProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	releaseWorkflows := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		found, release := releaseTagGateProblemsIn(path, string(data))
+		problems = append(problems, found...)
+		if release {
+			releaseWorkflows++
+		}
+	}
+	sort.Strings(problems)
+	return problems, releaseWorkflows, nil
+}
+
+// releaseTagGateProblemsIn scans one workflow's text. A workflow that never
+// triggers on release tags is not flagged: it publishes nothing on a tag push.
+func releaseTagGateProblemsIn(path, text string) ([]string, bool) {
+	triggers := 0
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, releaseTagTrigger) {
+			triggers++
+		}
+	}
+	if triggers == 0 {
+		return nil, false
+	}
+
+	steps := workflowSteps(text)
+	buildLine := 0
+	for _, step := range steps {
+		if stepBuildsImage(step.body) {
+			buildLine = step.line
+			break
+		}
+	}
+
+	var problems []string
+	pinGateLine := 0
+	ancestryLine := 0
+	for _, step := range steps {
+		if pinGateLine == 0 && stepPinsTag(step.body) {
+			pinGateLine = step.line
+		}
+		if ancestryLine == 0 && stepChecksMainAncestry(step.body) {
+			ancestryLine = step.line
+		}
+	}
+
+	switch {
+	case pinGateLine == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step compares the tag with the %s constant in %s and fails on a mismatch, so a tag that no manifest pins publishes an image nothing deploys",
+			path, releaseTagTrigger, releaseImageConstName, releasePinFile))
+	case buildLine != 0 && pinGateLine > buildLine:
+		problems = append(problems, fmt.Sprintf(
+			"%s:%d: the tag/pin gate runs after the image is built at line %d, so the release is published before the tag is compared with the pin",
+			path, pinGateLine, buildLine))
+	}
+
+	switch {
+	case ancestryLine == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step refuses a tag whose commit is not reachable from main, so a tag pushed from a commit that never merged is released",
+			path, releaseTagTrigger))
+	case buildLine != 0 && ancestryLine > buildLine:
+		problems = append(problems, fmt.Sprintf(
+			"%s:%d: the main-reachability gate runs after the image is built at line %d, so the release is published before the tag is checked",
+			path, ancestryLine, buildLine))
+	}
+
+	// `git merge-base --is-ancestor` needs the history joining the tag to main,
+	// and actions/checkout is shallow by default. Without the full history the
+	// ancestry gate either cannot resolve the commit or answers from a partial
+	// graph, which is the bypass it exists to close.
+	if !strings.Contains(text, releaseGateFetchDepth) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: checkout does not request %q, so `git merge-base --is-ancestor` cannot tell whether the tagged commit is on main",
+			path, releaseGateFetchDepth))
+	}
+	return problems, true
+}
+
 // Module-graph status check: GitHub keys a required status check on the name of
 // the job that reported it, not on the steps that did the work. Branch
 // protection on this repository requires the `update-go_modules-graph` check, so
