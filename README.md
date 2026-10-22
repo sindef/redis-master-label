@@ -95,8 +95,13 @@ missing, empty, or when the version label disagrees with `--build-arg VERSION`.
 
 ## Releases
 Releases are cut by pushing a `vX.Y.Z` tag (`.github/workflows/release.yml`):
-the tag-push workflow runs `go vet` and the full test suite, then builds the
-image with `--build-arg VERSION=<tag>` and pushes exactly
+before anything is built, the tag-push workflow checks that the tagged commit is
+reachable from `main` and that the tag is the version the repository deploys —
+it reads `releaseImage` from `main_test.go` and requires that reference to end in
+the tag and to appear in `manifests/`. A tag that disagrees with the pin, or a
+tag on a commit `main` never held, fails the run instead of publishing an image
+no manifest references. The workflow then runs `go vet` and the full test suite,
+builds the image with `--build-arg VERSION=<tag>` and pushes exactly
 `ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
 name, `GITHUB_TOKEN` with `packages: write`, plus the `id-token: write` and
 `attestations: write` permissions attestations need). The image carries provenance
@@ -109,24 +114,29 @@ Nothing floating (`:latest`) is ever published.
 
 The pinned image reference must be identical in three places: the example
 manifests that deploy it and `main_test.go`, whose `releaseImage` constant pins
-what `TestManifestsPinVersionedReleaseImage` accepts. The release workflow's
-Test step runs `go test -count=1 ./...` before it builds or publishes anything,
-so push a stale pin and no image is released — and the test's error text says
-the manifest image "is not the pinned release image", which points at the YAML
-even when the stale string lives in `main_test.go`.
+what `TestManifestsPinVersionedReleaseImage` accepts. Two gates run before the
+release workflow builds or publishes anything: `go test -count=1 ./...` (so a
+stale pin releases no image, with an error text saying the manifest image "is
+not the pinned release image", which points at the YAML even when the stale
+string lives in `main_test.go`), and a tag-versus-pin step that stops a tag
+whose version differs from `releaseImage` or that no manifest references. A tag
+pushed from a commit that is not on `main` is refused too, so only merged work
+can be released. `workflow_check.go` fails the pull request when either gate is
+dropped from the workflow or moved after the build.
 
 1. Bump the new `ghcr.io/redis-master-label/redis-master-label:vX.Y.Z`
    reference in every one of these files:
    - `main_test.go` — `const releaseImage = "..."`
    - `manifests/deployment-example.yaml`
    - `manifests/redis-leader.yaml`
-2. Commit the bumps, verify the gate locally, then tag that commit:
+2. Merge the bumps to `main`, verify the gate locally, then tag that commit:
    ```bash
    go test -count=1 ./...
    git tag v0.2.0 && git push origin v0.2.0
    ```
-   The tag push starts the release workflow (vet + tests, then build and push
-   `ghcr.io/<owner>/redis-master-label:<tag>`).
+   The tag push starts the release workflow (tag checks, vet + tests, then build
+   and push `ghcr.io/<owner>/redis-master-label:<tag>`). Tagging any commit that
+   is not on `main`, or tagging a version the pin does not name, fails the run.
 3. Apply the updated manifests; the pinned tag rolls out the new image.
 
 Rollback: redeploy the previous release's full image reference

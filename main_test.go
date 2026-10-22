@@ -2462,6 +2462,158 @@ jobs:
 	}
 }
 
+// The reviewed release_hygiene finding: release.yml published whatever vX.Y.Z
+// tag was pushed. `version="${GITHUB_REF_NAME}"` was the only source of the tag,
+// nothing compared it with `releaseImage` in main_test.go or with manifests/, so
+// pushing v0.2.0 while the pin was still v0.1.0 passed vet and the whole test
+// suite (TestManifestsPinVersionedReleaseImage only compares the pin with the
+// manifests) and published an image no manifest references; the README's
+// three-file bump was the only thing keeping them aligned, and a tag pushed from
+// a commit that never merged bypassed CI entirely. The workflow must compare the
+// tag with the pin and refuse a tag whose commit main does not hold, both before
+// it builds or pushes anything.
+func TestReleaseWorkflowGatesTagOnPinnedReleaseImage(t *testing.T) {
+	problems, releaseWorkflows, err := releaseTagGateProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releaseWorkflows == 0 {
+		t.Fatalf("no workflow in %s triggers on %q: the tag gate has nothing to guard, so a tag push publishes unreviewed", ciWorkflowDir, releaseTagTrigger)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The fixture steps the release tag gate scan reads: the pin gate, the
+// main-reachability gate, and the image build the gates must precede.
+const (
+	releaseFixturePinGate = "      - name: Verify tag matches the pinned release image\n" +
+		"        shell: bash\n" +
+		"        run: |\n" +
+		"          tag=\"${GITHUB_REF_NAME}\"\n" +
+		"          pinned=$(sed -n 's/^const " + releaseImageConstName + " = \"\\(.*\\)\"$/\\1/p' " + releasePinFile + ")\n" +
+		"          [ -n \"$pinned\" ] || exit 1\n" +
+		"          [ \"${pinned##*:}\" = \"$tag\" ] || exit 1\n"
+
+	releaseFixtureAncestryGate = "      - name: Verify tag is reachable from main\n" +
+		"        shell: bash\n" +
+		"        run: |\n" +
+		"          git fetch --no-tags origin main\n" +
+		"          git merge-base --is-ancestor \"$GITHUB_SHA\" FETCH_HEAD || exit 1\n"
+
+	releaseFixtureBuild = "      - name: Build image\n" +
+		"        run: |\n" +
+		"          docker build --build-arg VERSION=\"${GITHUB_REF_NAME}\" .\n"
+)
+
+// releaseWorkflowFixture wraps release steps in a tag-triggered workflow whose
+// checkout carries the given fetch-depth, so each fixture differs from the
+// shipped shape in exactly one place.
+func releaseWorkflowFixture(fetchDepth string, steps ...string) string {
+	var b strings.Builder
+	b.WriteString("name: Release\non:\n  push:\n    tags:\n      - '" + releaseTagTrigger + "'\n\njobs:\n  build-and-publish:\n    runs-on: ubuntu-latest\n    steps:\n")
+	b.WriteString("      - uses: actions/checkout@v7\n        with:\n          " + fetchDepth + "\n")
+	for _, step := range steps {
+		b.WriteString(step)
+	}
+	return b.String()
+}
+
+// The failure modes the release tag gate has to see: the reviewed pre-fix shape
+// with no gate at all, a gate the build runs before, a gate that reads the pin
+// without comparing it, no main-reachability gate, and a shallow checkout that
+// cannot answer the ancestry question. The shipped order must pass, and a
+// workflow that triggers on no release tag is not flagged.
+func TestReleaseTagGateProblems_RegressionFixtures(t *testing.T) {
+	tests := []struct {
+		name        string
+		workflow    string
+		wantRelease bool
+		wantProblem string
+	}{
+		{
+			name:        "both gates before the build",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixturePinGate, releaseFixtureAncestryGate, releaseFixtureBuild),
+			wantRelease: true,
+		},
+		{
+			name:        "reviewed pre-fix shape: tag triggers, nothing compares it",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild),
+			wantRelease: true,
+			wantProblem: releaseImageConstName,
+		},
+		{
+			name:        "gates after the build",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixturePinGate, releaseFixtureAncestryGate),
+			wantRelease: true,
+			wantProblem: "after the image is built",
+		},
+		{
+			name: "gate that reads the pin without comparing it",
+			workflow: releaseWorkflowFixture("fetch-depth: 0",
+				"      - name: Show the pin\n        run: |\n          grep -n "+releaseImageConstName+" "+releasePinFile+"\n",
+				releaseFixtureAncestryGate, releaseFixtureBuild),
+			wantRelease: true,
+			wantProblem: releaseImageConstName,
+		},
+		{
+			name:        "no main-reachability gate",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixturePinGate, releaseFixtureBuild),
+			wantRelease: true,
+			wantProblem: "reachable from main",
+		},
+		{
+			name:        "shallow checkout",
+			workflow:    releaseWorkflowFixture("fetch-depth: 1", releaseFixturePinGate, releaseFixtureAncestryGate, releaseFixtureBuild),
+			wantRelease: true,
+			wantProblem: releaseGateFetchDepth,
+		},
+		{
+			name:        "no release tag trigger",
+			workflow:    "name: CI\non:\n  pull_request:\n\njobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n" + releaseFixtureBuild,
+			wantRelease: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "release.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, releaseWorkflows, err := releaseTagGateProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReleaseWorkflows := 0
+			if tt.wantRelease {
+				wantReleaseWorkflows = 1
+			}
+			if releaseWorkflows != wantReleaseWorkflows {
+				t.Fatalf("release workflows = %d, want %d", releaseWorkflows, wantReleaseWorkflows)
+			}
+			if tt.wantProblem == "" {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("release workflow without the gate accepted, want a problem reported")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+		})
+	}
+
+	if _, _, err := releaseTagGateProblems(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("missing workflow directory accepted, want a read error")
+	}
+}
+
 // GitHub keys a required status check on the name of the job that reported it,
 // not on the steps that did the work, and branch protection requires the
 // `update-go_modules-graph` check here. The module-graph gate must therefore
