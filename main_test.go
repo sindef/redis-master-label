@@ -23,7 +23,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -2200,6 +2202,215 @@ func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
 	updateHealthStatus(context.Background(), rdbOk)
 	if healthy, _ := healthSnapshot(); healthy != true {
 		t.Error("isHealthy stays false after one successful ROLE, want true")
+	}
+}
+
+// blockingRedis models a Redis that accepts ROLE and never answers: the call
+// returns only when the caller's deadline expires, like a stalled socket or a
+// client that ignores cancellation. It needs a context with a deadline.
+type blockingRedis struct{}
+
+func (blockingRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	done := ctx.Done()
+	if done == nil {
+		return redis.NewCmdResult(nil, errors.New("blockingRedis requires a context with a deadline"))
+	}
+	<-done
+	return redis.NewCmdResult(nil, ctx.Err())
+}
+
+// The reported defect: the poll loop called ROLE and the Kubernetes API on an
+// unbounded context, so a stalled backend froze the iteration and /healthz kept
+// answering 200 from the last successful check — no ROLE ran, no label was
+// applied or removed, and neither probe could react. A stub that blocks until
+// the deadline must now end the iteration and turn the endpoint into 503.
+func TestPollIteration_StalledRedisTurnsHealthz503(t *testing.T) {
+	defer configureTestFlags()()
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, false)
+
+	cs := newPodClientset(testPod("test-pod", map[string]string{testKey: testValue}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := runPollIteration(ctx, blockingRedis{}, cs)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a stalled ROLE reported a successful iteration, want an error")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("iteration took %v, want it bounded by the %v deadline", elapsed, 200*time.Millisecond)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("iteration returned before its deadline expired, so the deadline was not what ended it")
+	}
+
+	if healthy, failures := healthSnapshot(); healthy {
+		t.Fatalf("isHealthy = true after a stalled ROLE (failures = %d), want false", failures)
+	}
+
+	// The stale label is still there (the check never got a reply), so the pod
+	// must leave Service endpoints: 503, not the stale 200.
+	server := httptest.NewServer(healthHandler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d: a stalled Redis must not leave /healthz at 200", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+// The same bound covers the label phase: a Kubernetes API server that accepts
+// the request and never answers (the half-open connection from the finding) is
+// cut off by rest.Config.Timeout and the iteration deadline, and the health
+// probe that runs after it records the failure instead of reporting the ROLE
+// success from the start of the iteration.
+func TestPollIteration_StalledAPIServerIsBounded(t *testing.T) {
+	defer configureTestFlags()()
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, false)
+
+	// The handler answers only once the client gives up and the request
+	// context is cancelled.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 2 * minBackendTimeout // backendTimeout() == minBackendTimeout
+
+	clientset, err := kubernetes.NewForConfig(boundRestConfig(&rest.Config{Host: server.URL}))
+	if err != nil {
+		t.Fatalf("kubernetes.NewForConfig: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), backendTimeout())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runPollIteration(ctx, stubRedis{reply: masterReply()}, clientset)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled Kubernetes API call blocked the iteration past its deadline")
+	}
+
+	if healthy, failures := healthSnapshot(); healthy {
+		t.Fatalf("isHealthy = true after a stalled Pods.Get (failures = %d), want false", failures)
+	}
+}
+
+// Health accounting must fire even when the timeout was spent in the label
+// phase, i.e. after a ROLE that would have succeeded. An already-expired
+// iteration reproduces "the budget is gone" without a clientset that ignores
+// cancellation.
+func TestRunPollIteration_ExpiredDeadlineMarksUnhealthy(t *testing.T) {
+	defer configureTestFlags()()
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-ctx.Done()
+
+	cs := newPodClientset(testPod("test-pod", nil))
+	if err := runPollIteration(ctx, stubRedis{reply: masterReply()}, cs); err == nil {
+		t.Fatal("iteration with an expired deadline reported success")
+	}
+
+	healthy, failures := healthSnapshot()
+	if healthy || failures == 0 {
+		t.Fatalf("health after an expired iteration: isHealthy = %v, failures = %d, want unhealthy with the failure recorded", healthy, failures)
+	}
+}
+
+// The iteration deadline has to be shorter than the poll cadence, otherwise a
+// stalled iteration still delays every following one, and it must stay usable
+// for a deliberately small --check-interval.
+func TestBackendTimeoutBoundedByCheckInterval(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	*checkInterval = 10 * time.Second
+	if got, want := backendTimeout(), 5*time.Second; got != want {
+		t.Fatalf("backendTimeout() = %v, want %v (half of --check-interval)", got, want)
+	}
+
+	*checkInterval = 2 * minBackendTimeout
+	if got := backendTimeout(); got != minBackendTimeout {
+		t.Fatalf("backendTimeout() = %v at the floor boundary, want %v", got, minBackendTimeout)
+	}
+
+	*checkInterval = time.Millisecond
+	if got := backendTimeout(); got != minBackendTimeout {
+		t.Fatalf("backendTimeout() = %v for a tiny interval, want the %v floor", got, minBackendTimeout)
+	}
+}
+
+// client-go installs no request timeout of its own, so the in-cluster config
+// must carry one or a half-open API connection blocks the call indefinitely.
+func TestBoundRestConfigSetsRequestTimeout(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 10 * time.Second
+
+	config := boundRestConfig(&rest.Config{Host: "https://kubernetes.default.svc"})
+	if config.Timeout != backendTimeout() {
+		t.Fatalf("rest.Config.Timeout = %v, want the iteration deadline %v", config.Timeout, backendTimeout())
+	}
+	if config.Timeout <= 0 {
+		t.Fatalf("rest.Config.Timeout = %v, want a finite request timeout", config.Timeout)
+	}
+	if config.Host != "https://kubernetes.default.svc" {
+		t.Fatalf("rest.Config.Host = %q, the timeout must not touch the rest of the config", config.Host)
+	}
+}
+
+// The Redis client's own dial/read/write timeouts must be finite and tied to
+// the same deadline: a reply that never arrives is bounded by them alone.
+func TestRedisOptionsBoundSocketTimeouts(t *testing.T) {
+	origInterval, origTLS, origSkipVerify := *checkInterval, *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*checkInterval = origInterval
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkipVerify
+	}()
+
+	*checkInterval = 10 * time.Second
+	*redisTLS, *redisTLSSkipVerify = false, false
+
+	opts, err := redisOptionsFromFlags()
+	if err != nil {
+		t.Fatalf("redisOptionsFromFlags: %v", err)
+	}
+
+	for name, got := range map[string]time.Duration{
+		"DialTimeout":  opts.DialTimeout,
+		"ReadTimeout":  opts.ReadTimeout,
+		"WriteTimeout": opts.WriteTimeout,
+	} {
+		if got <= 0 {
+			t.Errorf("%s = %v, want a finite timeout", name, got)
+			continue
+		}
+		if got > *checkInterval {
+			t.Errorf("%s = %v, want it no longer than --check-interval %v", name, got, *checkInterval)
+		}
+		if want := backendTimeout(); got != want {
+			t.Errorf("%s = %v, want the iteration deadline %v", name, got, want)
+		}
 	}
 }
 
