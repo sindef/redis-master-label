@@ -19,6 +19,18 @@ spec:
         image: redis:7-alpine
         ports:
         - containerPort: 6379
+        # Same as deployment-example.yaml: requests size the pod for the
+        # scheduler and limits cap what the single leader can take from the
+        # node, so the pod is Burstable instead of BestEffort. Size these from
+        # real usage (kubectl top pod) and the dataset Redis holds.
+        # TestManifestContainersDeclareResources fails when either half is lost.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
         command:
         - redis-server
       - name: redis-master-label
@@ -55,6 +67,18 @@ spec:
         # restarted instead of staying Running with a stale redis-role label.
         # TestManifestSidecarsDeclareHealthProbes fails when the health port is
         # declared without a probe polling /healthz on it.
+        # Same as deployment-example.yaml: a request gives the scheduler a size
+        # to pack the pod by (Burstable, not BestEffort, so it is not evicted
+        # first under node pressure) and the limit keeps the 10s poll loop from
+        # taking the whole node when Redis stalls.
+        # TestManifestContainersDeclareResources fails when either half is lost.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
         ports:
         - name: health
           containerPort: 8080

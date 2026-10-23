@@ -75,10 +75,12 @@ type containerProbe struct {
 	HTTPGet *httpGetAction `json:"httpGet"`
 }
 
-// podSpecManifest holds just the container command/args, ports, probes and
-// securityContext. Only fields present in the example manifests are decoded;
-// manifests without a Pod spec (like Services) simply have no containers.
+// podSpecManifest holds just the document kind and the container
+// command/args, ports, probes, resources and securityContext. Only fields
+// present in the example manifests are decoded; manifests without a Pod spec
+// (like Services) simply have no containers.
 type podSpecManifest struct {
+	Kind string `json:"kind"`
 	Spec struct {
 		Template struct {
 			Spec struct {
@@ -88,6 +90,7 @@ type podSpecManifest struct {
 					Command         []string
 					Args            []string
 					Ports           []containerPort           `json:"ports"`
+					Resources       *containerResources       `json:"resources"`
 					LivenessProbe   *containerProbe           `json:"livenessProbe"`
 					ReadinessProbe  *containerProbe           `json:"readinessProbe"`
 					StartupProbe    *containerProbe           `json:"startupProbe"`

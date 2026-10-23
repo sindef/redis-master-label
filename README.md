@@ -166,12 +166,45 @@ Key points for the deployment:
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
 - Expose the health port the labeler is told to listen on and poll `/healthz` from a liveness and a readiness probe (see "Health Check Endpoint"); both example deployments do.
+- Size every container with `resources.requests` and `resources.limits` (see
+  "Resource sizing" below); both example deployments do, so their pods are
+  `Burstable` instead of `BestEffort`.
 - Run the labeler unprivileged (see "Running unprivileged" below); the caveat
   at the end of that section covers the co-located `redis` container.
 - A namespace enforcing the restricted Pod Security Standard rejects the two
   example manifests as shipped: their `redis` containers carry no
   `securityContext`. See the caveat at the end of "Running unprivileged"
   before applying them into such a namespace.
+
+### Resource sizing
+Both example deployments declare a `resources` block on every container — the
+`redis` master or replica and the `redis-master-label` sidecar:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+```
+
+The sidecar uses smaller values (`10m`/`32Mi` requested, `100m`/`64Mi` limited)
+because it only polls Redis every `--check-interval` and patches one pod. The
+requests are what the scheduler packs and scores pods by, so a container without
+one makes its pod `BestEffort` and the first eviction candidate under node
+pressure; the limits cap what a single replica's Redis or the labeler's poll
+loop can take from the node. Requests below limits keep the pods `Burstable`,
+which lets an idle example pod use spare capacity without reserving it. The
+example numbers are deliberately small demo sizes: size your own from
+`kubectl top pod` and the dataset Redis holds, and note that a `redis-server`
+with no `maxmemory` set can grow up to its memory limit. A limit below its
+request is rejected by the API server, so raise the limit instead.
+`TestManifestContainersDeclareResources` fails the pull request when any
+container in either example deployment loses a cpu or memory request or limit,
+or declares a limit below its request; kubeconform only checks the schema, where
+`resources` is optional, which is how the blocks went missing.
 
 ### Running unprivileged
 The labeler only reads Redis and calls the Kubernetes API with its mounted
