@@ -19,6 +19,20 @@ spec:
         image: redis:7-alpine
         ports:
         - containerPort: 6379
+        # Requests size the pod for the scheduler, limits cap what one replica
+        # can take from the node. Without either block the pod runs BestEffort:
+        # any node accepts it, it is evicted first under node pressure, and a
+        # replica with no maxmemory set can grow until it fills the node.
+        # These are small demo sizes; set your own from `kubectl top pod` and
+        # the dataset Redis holds. TestManifestContainersDeclareResources fails
+        # when a container loses a request or a limit.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
         command:
         - redis-server
         - --replicaof
@@ -66,6 +80,19 @@ spec:
         # TestManifestSidecarsDeclareHealthProbes fails when the health port is
         # declared without a probe polling /healthz on it. Move the containerPort
         # and both probe ports with --health-port if you change it.
+        # Sized like the redis container beside it: a request gives the
+        # scheduler a size to pack the pod by, so the pod is Burstable instead
+        # of BestEffort and is not the first eviction candidate under node
+        # pressure, while the limit stops a stalled Redis from letting the 10s
+        # poll loop take the whole node. TestManifestContainersDeclareResources
+        # fails when either half is lost.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
         ports:
         - name: health
           containerPort: 8080
