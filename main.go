@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -78,7 +79,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(boundRestConfig(config))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create Kubernetes client: %v\n", err)
 		os.Exit(1)
@@ -92,8 +93,6 @@ func main() {
 
 	rdb := redis.NewClient(redisOptions)
 	defer rdb.Close()
-
-	ctx := context.Background()
 
 	// Bind the health check HTTP server before entering the main loop so a
 	// bind failure (port taken, invalid --health-port) aborts startup instead
@@ -121,14 +120,63 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
+		// Every iteration runs under its own deadline. A Redis socket or a
+		// Kubernetes API server that stops answering must end the iteration
+		// instead of freezing the loop: while the loop is blocked no ROLE runs,
+		// no label is applied or removed, and /healthz keeps answering 200 from
+		// the last successful check, so neither probe can react.
+		ctx, cancel := context.WithTimeout(context.Background(), backendTimeout())
+		runPollIteration(ctx, rdb, clientset)
+		cancel()
 
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
-			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
-		}
 		time.Sleep(*checkInterval)
 	}
+}
+
+// minBackendTimeout is the floor for an iteration deadline. --check-interval
+// only has to be positive, so a very small interval would otherwise produce a
+// deadline that expires before a request could leave the pod.
+const minBackendTimeout = 100 * time.Millisecond
+
+// backendTimeout is the deadline for one poll iteration (the Redis ROLE calls
+// and the Kubernetes get/update share it) and the request timeout of both
+// clients. Half the check interval keeps an iteration from outlasting the poll
+// cadence when a backend stalls; the floor keeps a small --check-interval
+// usable.
+func backendTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < minBackendTimeout {
+		return minBackendTimeout
+	}
+	return timeout
+}
+
+// boundRestConfig caps every Kubernetes API request with the iteration
+// deadline. client-go sets no request timeout of its own, so a connection that
+// goes half-open - a dropped route, a proxy that accepts and never answers -
+// leaves Pods.Get or Pods.Update blocked until the OS gives up on the TCP
+// connection, which is minutes or never. rest.Config.Timeout is the http.Client
+// timeout, so the request is abandoned at the deadline even when nothing
+// cancels the context.
+func boundRestConfig(config *rest.Config) *rest.Config {
+	config.Timeout = backendTimeout()
+	return config
+}
+
+// runPollIteration performs one bounded poll: it reads ROLE, applies or removes
+// the pod label, then records the iteration's health outcome. The health probe
+// runs last and inside the same deadline on purpose: when the label work ate
+// the budget (a stalled Pods.Get or Pods.Update), the probe finds an expired
+// context and records a failure, so a stuck API call turns /healthz into 503
+// instead of leaving the last successful check in place.
+func runPollIteration(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	labelErr := checkAndLabel(ctx, rdb, clientset)
+	if labelErr != nil {
+		fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", labelErr)
+	}
+
+	updateHealthStatus(ctx, rdb)
+	return labelErr
 }
 
 // validateRedisTLSFlags rejects a nonsensical TLS flag combination:
@@ -164,6 +212,13 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 	options := &redis.Options{
 		Addr:     *redisAddr,
 		Password: resolveRedisPassword(),
+		// The socket-level timeouts are the iteration deadline as well: a
+		// connection attempt or a reply that never arrives must not outlive
+		// the poll iteration that issued it. Leaving them at the client
+		// defaults decoupled them from --check-interval.
+		DialTimeout:  backendTimeout(),
+		ReadTimeout:  backendTimeout(),
+		WriteTimeout: backendTimeout(),
 	}
 
 	if *redisTLS {
@@ -204,9 +259,40 @@ type roleQuerier interface {
 	Do(ctx context.Context, args ...interface{}) *redis.Cmd
 }
 
+// roleCommand runs ROLE under ctx and returns as soon as ctx is done, even
+// when the client ignores cancellation. go-redis honours the context while it
+// waits for a pooled connection, but a reply that never arrives is bounded
+// only by the socket read deadline, and a client that never returns would block
+// the health path for good. Racing the command against the deadline keeps every
+// iteration bounded whatever the client does; the result channel is buffered so
+// the goroutine of an abandoned call can deliver its reply and exit.
+func roleCommand(ctx context.Context, rdb roleQuerier) (interface{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("deadline expired before the ROLE command started: %w", err)
+	}
+
+	type roleReply struct {
+		role interface{}
+		err  error
+	}
+
+	done := make(chan roleReply, 1)
+	go func() {
+		role, err := rdb.Do(ctx, "ROLE").Result()
+		done <- roleReply{role: role, err: err}
+	}()
+
+	select {
+	case reply := <-done:
+		return reply.role, reply.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("deadline expired while the ROLE command was in flight: %w", ctx.Err())
+	}
+}
+
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
-	role, err := rdb.Do(ctx, "ROLE").Result()
+	role, err := roleCommand(ctx, rdb)
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
 	}
@@ -321,11 +407,16 @@ func serveHealth(listener net.Listener) <-chan error {
 }
 
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
+	_, err := roleCommand(ctx, rdb)
 	if err != nil {
 		healthStatus.mu.Lock()
 		healthStatus.consecutiveFailures++
-		if healthStatus.consecutiveFailures >= 3 {
+		// An expired iteration deadline is not a transient ROLE error: the
+		// check itself could not run inside the budget, so the cached status
+		// is stale rather than healthy. Report unhealthy at once, otherwise a
+		// stalled Redis or API call would keep /healthz at 200 for as long as
+		// the failure counter needs to fill up while the label goes stale.
+		if healthStatus.consecutiveFailures >= 3 || errors.Is(err, context.DeadlineExceeded) {
 			healthStatus.isHealthy = false
 		}
 		healthStatus.mu.Unlock()
