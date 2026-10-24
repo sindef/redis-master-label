@@ -54,6 +54,18 @@ must be a `golang` base image on the same MAJOR.MINOR line
 matches go.mod" step enforce. Bump the `go` directive and that image tag in the
 same change.
 
+The module path in `go.mod` is the repository the project is published from, not
+a folder label: `module github.com/redis-master-label/redis-master-label` is what
+`go get` and the module proxy resolve and what module-derived SBOM/purl metadata
+records, and it must be the repository the image's
+`org.opencontainers.image.source` label, `releaseImage` in `main_test.go` and the
+example manifests name. A declaration that stops one segment short
+(`github.com/redis-master-label`) names a different repository, so module lookups
+and module-derived metadata never point at the released project; nothing else in
+the suite reads that line.
+`TestGoModModulePathMatchesPublishedRepository` fails the pull request when the
+module path and those surfaces disagree.
+
 CI reports the module-graph gate as a job of its own: `update-go_modules-graph`
 rebuilds the graph from `go.mod`/`go.sum` (`go mod graph`, then a non-empty
 check) and fails when the graph cannot be produced, for example when `go.sum` is
