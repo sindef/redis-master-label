@@ -76,6 +76,15 @@ reporting, and every pull request then waits on a check that can no longer
 arrive. `TestWorkflowsReportModuleGraphCheck` fails when the job is dropped,
 renamed, commented out, or left without its graph commands.
 
+The graph file is generated output, not source. The job writes it to
+`$RUNNER_TEMP/go_modules_graph.txt` (outside the checkout), so `git status` never
+shows it and `git add -A` cannot commit a dependency graph as if it were code;
+`.gitignore` also lists `go_modules_graph.txt`, so replaying the older in-tree
+`go mod graph > go_modules_graph.txt` locally stays uncommittable.
+`TestModuleGraphOutputStaysOutOfWorkingTree` fails when a workflow redirects the
+graph into the working tree without that `.gitignore` entry, or when the entry is
+dropped.
+
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
 ## Container build

@@ -581,6 +581,177 @@ func moduleGraphJobProblemsIn(path, text string) ([]string, bool) {
 	return nil, false
 }
 
+// Module-graph output location: `go mod graph > go_modules_graph.txt` writes
+// the generated dependency graph into the checkout root, where `git status`
+// reports it as an untracked file and `git add -A` sweeps it into a commit as if
+// the large graph were source. The reviewed defect was exactly that shape: the
+// `update-go_modules-graph` job redirected the graph into the working tree and
+// .gitignore did not cover the name. CI now writes it into `$RUNNER_TEMP`, and
+// .gitignore lists the name so a local replay of the older command is
+// uncommittable too. No compiler sees a workflow file or a .gitignore, so the
+// check lives here (main_test.go:
+// TestModuleGraphOutputStaysOutOfWorkingTree).
+
+// moduleGraphFileName is the name `go mod graph` is redirected to.
+const moduleGraphFileName = "go_modules_graph.txt"
+
+// moduleGraphOutputProblems returns one message per `go mod graph` redirect in
+// the workflows under dir whose target lands inside the repository working tree
+// while the repository's .gitignore does not ignore it, plus the number of
+// redirect targets it read, so a caller can tell "no problems" apart from "no
+// redirect found, so nothing was checked". A shell-expanded target
+// (`$RUNNER_TEMP/...`), an absolute path and a path .gitignore covers are all
+// accepted: none of them can reach a commit from the checkout.
+func moduleGraphOutputProblems(dir string) ([]string, int, error) {
+	root := filepath.Dir(dir)
+	// The workflows live in <repo>/.github/workflows, so the repository root -
+	// and its .gitignore - is two levels up from the workflow directory.
+	if filepath.Base(root) == ".github" {
+		root = filepath.Dir(root)
+	}
+	ignored, err := loadGitignore(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	targets := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			target, ok := moduleGraphRedirectTarget(line)
+			if !ok {
+				continue
+			}
+			targets++
+			if strings.HasPrefix(target, "$") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "/") {
+				continue
+			}
+			if ignored(target) {
+				continue
+			}
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: writes the module graph to %q inside the repository working tree and .gitignore does not ignore it, so `git status` reports a generated file and `git add -A` commits the graph as source; redirect it outside the checkout (for example $RUNNER_TEMP) or list %q in .gitignore",
+				path, i+1, target, moduleGraphFileName))
+		}
+	}
+	sort.Strings(problems)
+	return problems, targets, nil
+}
+
+// moduleGraphRedirectTarget returns the file a `go mod graph` command line
+// redirects to. Comment lines are skipped: a commented-out command is not run,
+// so it writes nothing. A command that writes no file (a pipe, a bare print)
+// reports no target.
+func moduleGraphRedirectTarget(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, "go mod graph") {
+		return "", false
+	}
+	after := trimmed[strings.Index(trimmed, "go mod graph")+len("go mod graph"):]
+	tokens := strings.Fields(after)
+	for i, token := range tokens {
+		if !strings.HasPrefix(token, ">") {
+			continue
+		}
+		target := strings.TrimLeft(token, ">")
+		if target == "" {
+			// A separate `>` token: the target is the next word.
+			if i+1 < len(tokens) {
+				return strings.Trim(tokens[i+1], `"'`), true
+			}
+			return "", false
+		}
+		if strings.HasPrefix(target, "&") {
+			// File-descriptor duplication such as `2>&1` writes no file.
+			continue
+		}
+		return strings.Trim(target, `"'`), true
+	}
+	return "", false
+}
+
+// loadGitignore returns a matcher for the repository's .gitignore rules: a path
+// is ignored when the last rule matching it (by relative path, basename or glob)
+// is not a `!` negation. A repository without .gitignore ignores nothing.
+func loadGitignore(path string) (func(rel string) bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return func(string) bool { return false }, nil
+		}
+		return nil, err
+	}
+
+	type rule struct {
+		pattern string
+		negate  bool
+	}
+	var rules []rule
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		negate := strings.HasPrefix(trimmed, "!")
+		if negate {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "!"))
+		}
+		trimmed = strings.TrimSuffix(strings.TrimPrefix(trimmed, "/"), "/")
+		if trimmed == "" {
+			continue
+		}
+		rules = append(rules, rule{pattern: trimmed, negate: negate})
+	}
+
+	return func(rel string) bool {
+		rel = strings.TrimPrefix(filepath.ToSlash(rel), "./")
+		ignored := false
+		for _, r := range rules {
+			if !gitignoreRuleMatches(r.pattern, rel) {
+				continue
+			}
+			ignored = !r.negate
+		}
+		return ignored
+	}, nil
+}
+
+// gitignoreRuleMatches reports whether one .gitignore pattern matches rel, a
+// slash-separated path relative to the repository root. The patterns this
+// repository uses are plain names, so a pattern matches its own path, a basename
+// on any level and - with a wildcard - the same two shapes through filepath.Match.
+func gitignoreRuleMatches(pattern, rel string) bool {
+	if pattern == rel || pattern == filepath.Base(rel) {
+		return true
+	}
+	if !strings.ContainsAny(pattern, "*?[") {
+		return false
+	}
+	if ok, err := filepath.Match(pattern, rel); err == nil && ok {
+		return true
+	}
+	if ok, err := filepath.Match(pattern, filepath.Base(rel)); err == nil && ok {
+		return true
+	}
+	return false
+}
+
 // isJobDeclaration reports whether a line is the YAML job key of the named job:
 // an indented `name:` line, not a comment and not a top-level key (a top-level
 // key is a workflow input, and a commented-out job reports nothing).
