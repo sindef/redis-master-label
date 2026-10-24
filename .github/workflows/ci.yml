@@ -262,7 +262,16 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The graph is generated output, not source: it is written to the job's
+      # scratch directory ($RUNNER_TEMP) instead of the checkout root, so
+      # `git status` never shows it and `git add -A` cannot commit a large
+      # dependency graph as if it were code. .gitignore lists the file name as
+      # well, so replaying the older in-tree command locally stays uncommittable,
+      # and TestModuleGraphOutputStaysOutOfWorkingTree fails the pull request
+      # when a workflow redirects the graph into the tree without that entry.
       - name: Update go_modules graph
         run: |
-          go mod graph > go_modules_graph.txt
-          test -s go_modules_graph.txt
+          graph="${RUNNER_TEMP:-/tmp}/go_modules_graph.txt"
+          go mod graph > "$graph"
+          test -s "$graph"
+          echo "wrote $(wc -l < "$graph") graph lines to $graph"

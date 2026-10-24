@@ -2845,3 +2845,152 @@ func TestModuleGraphJobProblems_RegressionFixtures(t *testing.T) {
 		})
 	}
 }
+
+// The `update-go_modules-graph` job generates a dependency graph file. It must
+// not land in the checkout: `go mod graph > go_modules_graph.txt` in the working
+// tree leaves an untracked artifact that `git status` reports and `git add -A`
+// commits as if the graph were source (the reviewed defect: the job wrote it
+// into the checkout root and .gitignore did not cover the name). The job now
+// writes it into $RUNNER_TEMP, and .gitignore lists the name so a local replay
+// of the older command stays uncommittable. No compiler or `go test` invocation
+// sees a workflow or a .gitignore, so both halves are asserted here.
+func TestModuleGraphOutputStaysOutOfWorkingTree(t *testing.T) {
+	problems, redirects, err := moduleGraphOutputProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redirects == 0 {
+		t.Fatalf("%s: no `go mod graph` redirect found, so the generated graph's location was never checked", ciWorkflowDir)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+
+	data, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatalf("read .gitignore: %v", err)
+	}
+	if !strings.Contains(string(data), moduleGraphFileName) {
+		t.Errorf(".gitignore does not list %q, so replaying `go mod graph > %s` locally leaves a generated file that `git add -A` commits as source", moduleGraphFileName, moduleGraphFileName)
+	}
+}
+
+// The failure modes of the graph output location: the reviewed in-tree redirect
+// without a .gitignore entry must be reported, while a shell-expanded scratch
+// path, an absolute path and a path .gitignore covers must pass. A commented-out
+// command writes nothing and must not be counted as a redirect.
+func TestModuleGraphOutputProblems_RegressionFixtures(t *testing.T) {
+	const inTreeSteps = "      - name: Update go_modules graph\n        run: |\n          go mod graph > go_modules_graph.txt\n          test -s go_modules_graph.txt\n"
+	const scratchSteps = "      - name: Update go_modules graph\n        run: |\n          graph=\"${RUNNER_TEMP:-/tmp}/go_modules_graph.txt\"\n          go mod graph > \"$graph\"\n          test -s \"$graph\"\n"
+
+	tests := []struct {
+		name           string
+		steps          string
+		gitignore      string
+		writeGitignore bool
+		wantRedirects  int
+		wantProblem    string
+	}{
+		{
+			name:           "reviewed shape: graph redirected into the checkout, not ignored",
+			steps:          inTreeSteps,
+			gitignore:      "# Build artifacts\nredis-master-label\n*.out\n",
+			writeGitignore: true,
+			wantRedirects:  1,
+			wantProblem:    "inside the repository working tree",
+		},
+		{
+			name:           "graph redirected into the checkout but ignored",
+			steps:          inTreeSteps,
+			gitignore:      "redis-master-label\n" + moduleGraphFileName + "\n",
+			writeGitignore: true,
+			wantRedirects:  1,
+		},
+		{
+			name:           "leading-slash pattern still covers the file",
+			steps:          inTreeSteps,
+			gitignore:      "/" + moduleGraphFileName + "\n",
+			writeGitignore: true,
+			wantRedirects:  1,
+		},
+		{
+			name:           "negated pattern re-exposes the file",
+			steps:          inTreeSteps,
+			gitignore:      moduleGraphFileName + "\n!" + moduleGraphFileName + "\n",
+			writeGitignore: true,
+			wantRedirects:  1,
+			wantProblem:    "inside the repository working tree",
+		},
+		{
+			name:          "no .gitignore at all",
+			steps:         inTreeSteps,
+			wantRedirects: 1,
+			wantProblem:   "inside the repository working tree",
+		},
+		{
+			name:           "graph written to the job scratch directory",
+			steps:          scratchSteps,
+			gitignore:      "redis-master-label\n",
+			writeGitignore: true,
+			wantRedirects:  1,
+		},
+		{
+			name:          "graph written to an absolute path",
+			steps:         "      - run: go mod graph > /tmp/graphs/go_modules_graph.txt\n",
+			wantRedirects: 1,
+		},
+		{
+			name:          "graph piped instead of redirected",
+			steps:         "      - run: go mod graph | wc -l\n",
+			wantRedirects: 0,
+		},
+		{
+			name:          "commented-out redirect writes nothing",
+			steps:         "      # go mod graph > go_modules_graph.txt\n",
+			wantRedirects: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, ".github", "workflows")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			workflow := "jobs:\n  " + moduleGraphJobName + ":\n    runs-on: ubuntu-latest\n    steps:\n" + tt.steps
+			if err := os.WriteFile(filepath.Join(dir, "ci.yml"), []byte(workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tt.writeGitignore {
+				if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(tt.gitignore), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			problems, redirects, err := moduleGraphOutputProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if redirects != tt.wantRedirects {
+				t.Errorf("redirects = %d, want %d", redirects, tt.wantRedirects)
+			}
+			if tt.wantProblem == "" {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("workflow that leaves the generated graph committable accepted, want a problem")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+		})
+	}
+
+	if _, _, err := moduleGraphOutputProblems(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("missing workflow directory accepted, want a read error")
+	}
+}

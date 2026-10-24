@@ -12,3 +12,7 @@ coverage*.txt
 # Go workspace files (never commit local overrides)
 go.work
 go.work.sum
+
+# Generated dependency graph: CI writes it to $RUNNER_TEMP, and this entry keeps
+# a local `go mod graph > go_modules_graph.txt` from being committed as source.
+go_modules_graph.txt
