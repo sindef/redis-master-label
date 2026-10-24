@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -2200,6 +2201,132 @@ func TestUpdateHealthStatus_RecoveryAfterUnhealthy(t *testing.T) {
 	updateHealthStatus(context.Background(), rdbOk)
 	if healthy, _ := healthSnapshot(); healthy != true {
 		t.Error("isHealthy stays false after one successful ROLE, want true")
+	}
+}
+
+// A stalled backend must not outlive a poll iteration: every backend call gets
+// a deadline derived from --check-interval, with a floor for tiny intervals so
+// the deadline stays achievable.
+func TestBackendCallTimeout_DerivedFromCheckInterval(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	tests := []struct {
+		interval time.Duration
+		want     time.Duration
+	}{
+		{10 * time.Second, 5 * time.Second},
+		{time.Second, 500 * time.Millisecond},
+		{400 * time.Millisecond, 200 * time.Millisecond},
+		{10 * time.Millisecond, minBackendCallTimeout},
+		{time.Nanosecond, minBackendCallTimeout},
+	}
+	for _, tt := range tests {
+		*checkInterval = tt.interval
+		if got := backendCallTimeout(); got != tt.want {
+			t.Errorf("backendCallTimeout() with --check-interval=%v = %v, want %v", tt.interval, got, tt.want)
+		}
+	}
+}
+
+// The reviewed defect: redisOptionsFromFlags set only Addr/Password/TLSConfig,
+// so DialTimeout, ReadTimeout and WriteTimeout stayed at the library defaults.
+// They must be finite and derived from --check-interval so a stalled Redis
+// returns a ROLE error instead of blocking the loop while /healthz answers 200.
+func TestRedisOptionsFromFlags_FiniteTimeouts(t *testing.T) {
+	origInterval := *checkInterval
+	origTLS, origSkip := *redisTLS, *redisTLSSkipVerify
+	defer func() {
+		*checkInterval = origInterval
+		*redisTLS, *redisTLSSkipVerify = origTLS, origSkip
+	}()
+
+	*checkInterval = 10 * time.Second
+	*redisTLS, *redisTLSSkipVerify = false, false
+
+	opts, err := redisOptionsFromFlags()
+	if err != nil {
+		t.Fatalf("redisOptionsFromFlags: %v", err)
+	}
+	want := backendCallTimeout()
+	timeouts := map[string]time.Duration{
+		"DialTimeout":  opts.DialTimeout,
+		"ReadTimeout":  opts.ReadTimeout,
+		"WriteTimeout": opts.WriteTimeout,
+	}
+	for name, got := range timeouts {
+		if got != want {
+			t.Errorf("%s = %v, want %v (half --check-interval)", name, got, want)
+		}
+		if got <= 0 {
+			t.Errorf("%s = %v, want a finite positive timeout", name, got)
+		}
+	}
+}
+
+// rest.Config.Timeout defaults to 0, meaning no client-side timeout. The
+// Kubernetes client must be bounded too, or a half-open API server connection
+// freezes the poll loop the same way a stalled Redis does.
+func TestBoundClientConfigSetsFiniteTimeout(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+
+	*checkInterval = 10 * time.Second
+	config := &rest.Config{}
+	boundClientConfig(config)
+	if want := backendCallTimeout(); config.Timeout != want {
+		t.Fatalf("rest.Config.Timeout = %v, want %v", config.Timeout, want)
+	}
+	if config.Timeout <= 0 {
+		t.Fatal("rest.Config.Timeout is not positive: Kubernetes calls keep no client-side deadline")
+	}
+}
+
+// neverAnsweringRedis models a peer that accepts ROLE and never answers, even
+// after the context deadline: it ignores cancellation entirely, the worst case
+// a timeout helper must survive.
+type neverAnsweringRedis struct{ release chan struct{} }
+
+func (r neverAnsweringRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	<-r.release
+	return redis.NewCmdResult(nil, errors.New("released"))
+}
+
+// The reviewed defect read through the health path: a hanging ROLE must not
+// freeze updateHealthStatus. Three bounded checks must increment the failure
+// counter and leave /healthz unhealthy, exactly as the liveness and readiness
+// probes expect.
+func TestUpdateHealthStatus_HangingRoleQueryGoesUnhealthyAfterThreeIntervals(t *testing.T) {
+	orig := *checkInterval
+	defer func() { *checkInterval = orig }()
+	*checkInterval = 10 * time.Millisecond
+
+	rdb := neverAnsweringRedis{release: make(chan struct{})}
+	defer close(rdb.release)
+
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, true)
+
+	for i := 1; i <= 3; i++ {
+		done := make(chan struct{})
+		go func() {
+			updateHealthStatus(context.Background(), rdb)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("check %d did not return: a hanging ROLE must be bounded by --check-interval instead of freezing the health loop", i)
+		}
+
+		healthy, failures := healthSnapshot()
+		if failures != i {
+			t.Errorf("after %d hanging checks, consecutiveFailures = %d, want %d", i, failures, i)
+		}
+		if want := i < 3; healthy != want {
+			t.Errorf("after %d hanging checks, isHealthy = %v, want %v", i, healthy, want)
+		}
 	}
 }
 
