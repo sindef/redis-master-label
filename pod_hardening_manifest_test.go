@@ -15,13 +15,11 @@ import (
 // Pod-level hardening check: the restricted Pod Security Standard is enforced
 // against every container of a pod, but the manifest checks in main_test.go and
 // sidecar_hardening_manifest_test.go select containers by the sidecar image.
-// Both example deployments therefore ship an unhardened `redis` container next to
-// the labeler: it declares no securityContext, so it runs as the image's uid 0
-// user, can gain privileges, keeps every capability and carries no
-// seccompProfile. A namespace enforcing the restricted standard rejects those
-// pods while `go test ./...` stayed green, because kubeconform only validates the
-// schema (where a securityContext is optional) and no test ever looked at a
-// container that is not the sidecar.
+// That filter is how both example deployments once shipped an unhardened
+// `redis` container next to the labeler - no securityContext, uid 0, every
+// capability kept, no seccompProfile - while `go test ./...` stayed green:
+// kubeconform only validates the schema (where a securityContext is optional)
+// and no test ever looked at a container that is not the sidecar.
 //
 // This file closes that gap at pod level. It decodes every container of every
 // Deployment under manifests/ - not only the one matching sidecarImage - and
@@ -32,13 +30,11 @@ import (
 // filesystem, because redis-server writes its RDB snapshot there and the mount
 // is the difference between an admissible pod and one that CrashLoops.
 //
-// The example manifests themselves are reviewed deployment content and are not
-// rewritten here. Their two redis containers are recorded in
-// knownUnhardenedContainers instead, so the gap is pinned and visible: the list
-// is shrink-only, a container that is unhardened and not listed fails the build,
-// and a listed container that was hardened fails the build until its entry is
-// deleted. Hardening the redis containers (and deleting their entries) is what
-// closes the reviewed finding.
+// Both example manifests now declare the full restricted profile on every
+// container and the /data emptyDir the redis containers need.
+// knownUnhardenedContainers is empty and stays shrink-only: a container that
+// loses its profile fails the build, and any entry left behind after a fix
+// fails until it is deleted.
 
 // restrictedSeccompProfile is a securityContext.seccompProfile block, decoded at
 // container level and at pod level (the two levels the standard accepts).
@@ -289,15 +285,14 @@ func redisSnapshotStorageProblem(c restrictedContainer, volumes []restrictedVolu
 }
 
 // knownUnhardenedContainers records the example containers that still do not
-// satisfy the restricted Pod Security Standard, keyed by containerKey. The list
-// is shrink-only: it exists so the reviewed gap fails the build the moment it
-// grows, while the manifests themselves stay untouched by this change. Delete an
-// entry in the same change that hardens its container; the test fails on a stale
-// entry so the list cannot outlive the gap it records.
-var knownUnhardenedContainers = map[string]string{
-	"deployment-example.yaml/redis-with-labeler/redis": "no securityContext: uid 0, privilege escalation allowed, every capability kept, writable root filesystem, no seccompProfile",
-	"redis-leader.yaml/redis-leader/redis":             "no securityContext: uid 0, privilege escalation allowed, every capability kept, writable root filesystem, no seccompProfile",
-}
+// satisfy the restricted Pod Security Standard, keyed by containerKey. No
+// container is recorded now: both example manifests declare the restricted
+// profile on every container. The list stays because it is shrink-only and
+// guards the fix - it fails the build the moment a container loses its
+// hardening while still listed, and a listed container that becomes hardened
+// fails until its entry is deleted, so an entry cannot outlive the gap it
+// records.
+var knownUnhardenedContainers = map[string]string{}
 
 // unhardenedContainerProblems returns one message per container of the given pods
 // that does not satisfy the restricted Pod Security Standard and is not recorded
@@ -341,11 +336,10 @@ func unhardenedContainerProblems(pods []restrictedPod, baseline map[string]strin
 }
 
 // Every container of every example pod must satisfy the restricted Pod Security
-// Standard, not only the labeler. The co-located redis containers are the
-// recorded exception: they declare no securityContext, which the standard
-// rejects per container, so the pods are refused by a namespace enforcing it
-// even though the labeler passes every existing check. A newly unhardened
-// container, or a stray baseline entry, fails here.
+// Standard, not only the labeler. Both example manifests declare the full
+// restricted profile on the co-located redis containers as well, so a namespace
+// enforcing the standard accepts the pods. A newly unhardened container, or a
+// stray baseline entry, fails here.
 func TestExampleManifestsEveryContainerMeetsRestrictedStandard(t *testing.T) {
 	pods, err := restrictedExamplePods(manifestDir)
 	if err != nil {
@@ -541,10 +535,9 @@ func TestRestrictedContainerProblem_RegressionFixtures(t *testing.T) {
 	}
 }
 
-// The baseline guard is what lets the hardened pods be required while two
-// manifests are still unhardened: it must report an unhardened container that is
-// not listed, accept a listed one, and refuse to keep an entry that no longer
-// describes a gap.
+// The baseline guard is what lets the hardened pods be required: it must report
+// an unhardened container that is not listed, accept a listed one, and refuse to
+// keep an entry that no longer describes a gap.
 func TestKnownUnhardenedBaseline_RegressionFixtures(t *testing.T) {
 	const manifest, pod = "deployment-example.yaml", "redis-with-labeler"
 	key := manifest + "/" + pod + "/redis"
@@ -697,10 +690,11 @@ func TestRedisSnapshotStorageProblem_RegressionFixtures(t *testing.T) {
 	}
 }
 
-// The reader must return every container of the pod, not only the sidecar: the
-// reviewed manifests pair the hardened labeler with a redis container that
-// declares no securityContext, and a reader that filtered by image reported
-// nothing for it. This is the regression the reviewed finding describes.
+// The reader must return every container of the pod, not only the sidecar. This
+// fixture recreates the reviewed pre-fix shape - a hardened labeler beside a
+// redis container that declares no securityContext - and a reader that filtered
+// by image reported nothing for the redis container. This is the regression the
+// reviewed finding describes.
 func TestRestrictedExamplePods_ReportsEveryContainerOfThePod(t *testing.T) {
 	dir := t.TempDir()
 	writeRestrictedFixtureManifest(t, dir, "deployment.yaml",
