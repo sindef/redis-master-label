@@ -950,3 +950,110 @@ func jobBody(lines []string) string {
 	}
 	return strings.Join(body, "\n")
 }
+
+// The workflow checker's unittest suite (test_workflow_checks.py) asserts
+// ci_check_comments.py's own rules - the setup-go version source, tab
+// characters, leftover GC tokens - against fixture text and then re-runs the
+// checker over the workflows this repository ships. Two gates run it, and each
+// must fail when the suite stops collecting cases: unittest exits 0 after "Ran
+// 0 tests" on Python older than 3.12, so a step that runs the suite without
+// reading its summary keeps reporting green while every rule loses its
+// fixtures. The reviewed ci_gap: ci.yml carried that summary guard, but the
+// dedicated python-checks.yml job ran `python3 test_workflow_checks.py` and had
+// none, so deleting or renaming the cases (or leaving only skipped ones) left
+// that job green. No compiler sees a workflow file, so the check lives here
+// (main_test.go: TestWorkflowCheckerSuiteStepsProveTheirCasesRan) and both
+// steps keep the guarded shape at run time.
+
+const (
+	// pythonSuiteModule is the unittest module holding the checker's cases.
+	pythonSuiteModule = "test_workflow_checks"
+
+	// pythonSuiteZeroCaseGuard is the summary assertion every step that runs the
+	// suite must carry: the pattern unittest prints for a run with at least one
+	// case, singular form included.
+	pythonSuiteZeroCaseGuard = "^Ran [1-9][0-9]* tests?"
+
+	// pythonSuiteCombinedOutput is what folds unittest's summary - written to
+	// stderr - into the captured log the guard reads.
+	pythonSuiteCombinedOutput = "2>&1"
+)
+
+// pythonSuiteGuardProblems returns one message per workflow step under dir that
+// runs the workflow checker's unittest suite without proving its cases ran, plus
+// the number of such steps, so a caller can tell "no problems" apart from "no
+// step runs the suite, so nothing was checked".
+func pythonSuiteGuardProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	steps := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, step := range workflowSteps(string(data)) {
+			text := executableStepText(step.body)
+			if !runsPythonSuite(text) {
+				continue
+			}
+			steps++
+			problems = append(problems, pythonSuiteStepProblems(path, step.line, text)...)
+		}
+	}
+
+	if steps == 0 {
+		problems = append(problems, fmt.Sprintf(
+			"%s: no workflow step runs the %s unittest suite, so the checker's setup-go, tab and GC-token rules are asserted nowhere and a shipped workflow that violates one passes unnoticed",
+			dir, pythonSuiteModule))
+	}
+	sort.Strings(problems)
+	return problems, steps, nil
+}
+
+// runsPythonSuite reports whether a step's executable text invokes the unittest
+// suite: it must name the module and a Python interpreter, so a step that only
+// mentions the name in prose or in a comment is not counted as a run.
+func runsPythonSuite(text string) bool {
+	return strings.Contains(text, pythonSuiteModule) &&
+		(strings.Contains(text, "python3") || strings.Contains(text, "python "))
+}
+
+// pythonSuiteStepProblems returns one message per way a step that runs the
+// unittest suite can pass without proving its cases ran.
+func pythonSuiteStepProblems(path string, line int, text string) []string {
+	var problems []string
+	at := fmt.Sprintf("%s:%d", path, line)
+	if !strings.Contains(text, "-m unittest") {
+		problems = append(problems, fmt.Sprintf(
+			"%s: runs %s as a bare script instead of `python3 -m unittest ...`, so a suite left without cases prints \"Ran 0 tests\" and exits 0 on Python older than 3.12 while the job stays green",
+			at, pythonSuiteModule))
+	}
+	if !strings.Contains(text, pythonSuiteCombinedOutput) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: does not capture the suite's combined output (%q): unittest writes the \"Ran N tests\" summary to stderr, so the step cannot assert that any case ran",
+			at, pythonSuiteCombinedOutput))
+	}
+	if !strings.Contains(text, pythonSuiteZeroCaseGuard) {
+		problems = append(problems, fmt.Sprintf(
+			"%s: does not assert the unittest summary reports at least one case (`grep -Eq '%s'`), so a suite whose cases were deleted, renamed or left skipped keeps the job green; Python 3.12+'s exit status 5 for \"NO TESTS RAN\" must fail the step as well",
+			at, pythonSuiteZeroCaseGuard))
+	}
+	if !strings.Contains(text, "exit 1") {
+		problems = append(problems, fmt.Sprintf(
+			"%s: never fails the job (`exit 1`), so both a suite with no cases and a suite with a broken case report the check passed",
+			at))
+	}
+	return problems
+}
