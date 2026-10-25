@@ -2614,6 +2614,160 @@ func TestReleaseTagGateProblems_RegressionFixtures(t *testing.T) {
 	}
 }
 
+// The reviewed release_hygiene finding: release.yml built the image and the next
+// image step rebuilt and pushed it, while the image-level checks that keep the
+// VERSION stamp and the OCI labels honest lived only in ci.yml - which a tag push
+// never runs. No Go test can see a built image (the build-file readers in
+// dockerfile_check.go read the file), so a build file that stripped the stamp or
+// left a LABEL in the discarded builder stage passed every pull request and only
+// surfaced on the tag push: as a published image reporting no version and
+// carrying no metadata, or as a release that failed mid-release. The release job
+// must therefore run the built image with --version and inspect its labels before
+// it pushes.
+func TestReleaseWorkflowVerifiesImageBeforePush(t *testing.T) {
+	problems, releaseWorkflows, err := releaseImageVerificationProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releaseWorkflows == 0 {
+		t.Fatalf("no workflow in %s triggers on %q: the image verification has nothing to guard, so a tag push publishes an unverified image", ciWorkflowDir, releaseTagTrigger)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The fixture steps the release image verification scan reads: the step that
+// publishes the image, and the two checks that must precede it.
+const (
+	releaseFixtureVersionCheck = "      - name: Verify image version output\n" +
+		"        shell: bash\n" +
+		"        run: |\n" +
+		"          image=\"example:${GITHUB_REF_NAME}\"\n" +
+		"          got=$(docker run --rm \"$image\" --version)\n" +
+		"          [ \"$got\" = \"redis-master-label ${GITHUB_REF_NAME}\" ] || exit 1\n"
+
+	releaseFixtureLabelCheck = "      - name: Verify image OCI labels\n" +
+		"        shell: bash\n" +
+		"        run: |\n" +
+		"          labels=$(docker inspect --format '{{json .Config.Labels}}' \"example:${GITHUB_REF_NAME}\")\n" +
+		"          echo \"$labels\"\n" +
+		"          got=$(docker inspect --format '{{ index .Config.Labels \"" + imageVersionLabelKey + "\" }}' example)\n" +
+		"          [ \"$got\" = \"${GITHUB_REF_NAME}\" ] || exit 1\n"
+
+	releaseFixturePush = "      - name: Publish image with provenance and SBOM attestations\n" +
+		"        uses: docker/build-push-action@v7\n" +
+		"        with:\n" +
+		"          context: .\n" +
+		"          " + imagePushMarker + "\n" +
+		"          build-args: VERSION=${{ github.ref_name }}\n"
+)
+
+// The failure modes the release image verification has to see: the reviewed
+// shape (build, then push, nothing runs or inspects the image), either check
+// dropped, both checks moved after the push, and checks that exist only as
+// comments - a commented-out command is not run. The verified order must pass,
+// and a workflow that never triggers on a release tag publishes no release image
+// and is not flagged.
+func TestReleaseImageVerificationProblems_RegressionFixtures(t *testing.T) {
+	commentedVersion := "      - name: Verify image version output\n" +
+		"        # docker run --rm \"$image\" --version || exit 1\n"
+	commentedLabels := "      - name: Verify image OCI labels\n" +
+		"        # docker inspect --format '{{json .Config.Labels}}' \"$image\"\n" +
+		"        # [ \"$(docker inspect \"$image\")\" = \"${GITHUB_REF_NAME}\" ] || exit 1\n"
+
+	tests := []struct {
+		name        string
+		workflow    string
+		wantRelease bool
+		wantProblem string
+	}{
+		{
+			name:        "version and labels verified before the push",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureVersionCheck, releaseFixtureLabelCheck, releaseFixtureBuild, releaseFixturePush),
+			wantRelease: true,
+		},
+		{
+			name:        "reviewed pre-fix shape: image pushed without being run or inspected",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixturePush),
+			wantRelease: true,
+			wantProblem: imageVersionFlag,
+		},
+		{
+			name:        "version check dropped",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureLabelCheck, releaseFixtureBuild, releaseFixturePush),
+			wantRelease: true,
+			wantProblem: imageVersionFlag,
+		},
+		{
+			name:        "label check dropped",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureVersionCheck, releaseFixtureBuild, releaseFixturePush),
+			wantRelease: true,
+			wantProblem: imageLabelsFormatFragment,
+		},
+		{
+			name:        "checks moved after the push",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixturePush, releaseFixtureVersionCheck, releaseFixtureLabelCheck),
+			wantRelease: true,
+			wantProblem: "after the image is pushed",
+		},
+		{
+			name:        "checks present only as comments",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", commentedVersion, commentedLabels, releaseFixtureBuild, releaseFixturePush),
+			wantRelease: true,
+			wantProblem: imageVersionFlag,
+		},
+		{
+			name:        "tag-triggered workflow that publishes nothing",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureVersionCheck, releaseFixtureLabelCheck),
+			wantRelease: true,
+			wantProblem: "no step publishes the image",
+		},
+		{
+			name:        "no release tag trigger",
+			workflow:    "name: CI\non:\n  pull_request:\n\njobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n" + releaseFixtureBuild + releaseFixturePush,
+			wantRelease: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "release.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, releaseWorkflows, err := releaseImageVerificationProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReleaseWorkflows := 0
+			if tt.wantRelease {
+				wantReleaseWorkflows = 1
+			}
+			if releaseWorkflows != wantReleaseWorkflows {
+				t.Fatalf("release workflows = %d, want %d", releaseWorkflows, wantReleaseWorkflows)
+			}
+			if tt.wantProblem == "" {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatal("release workflow publishing an unverified image accepted, want a problem reported")
+			}
+			if !strings.Contains(strings.Join(problems, "\n"), tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+		})
+	}
+
+	if _, _, err := releaseImageVerificationProblems(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("missing workflow directory accepted, want a read error")
+	}
+}
+
 // GitHub keys a required status check on the name of the job that reported it,
 // not on the steps that did the work, and branch protection requires the
 // `update-go_modules-graph` check here. The module-graph gate must therefore
