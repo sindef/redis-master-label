@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2310,6 +2311,39 @@ func TestPollIteration_StalledAPIServerIsBounded(t *testing.T) {
 
 	if healthy, failures := healthSnapshot(); healthy {
 		t.Fatalf("isHealthy = true after a stalled Pods.Get (failures = %d), want false", failures)
+	}
+}
+
+// timeoutTestError is a net.Error with Timeout true, the shape the HTTP client
+// returns when rest.Config.Timeout fires.
+type timeoutTestError struct{}
+
+func (timeoutTestError) Error() string   { return "client timeout" }
+func (timeoutTestError) Timeout() bool   { return true }
+func (timeoutTestError) Temporary() bool { return true }
+
+// A Kubernetes call stopped by the HTTP client timeout can return a moment
+// before the iteration context expires. The label-phase failure must still be
+// recorded: probing ROLE again with the remaining budget used to reset health
+// to healthy, which made the stalled-API test depend on timer ordering.
+func TestRunPollIteration_LabelPhaseTimeoutMarksUnhealthy(t *testing.T) {
+	defer configureTestFlags()()
+	setHealthStatus(0, true)
+	defer setHealthStatus(0, false)
+
+	cs := newPodClientset(testPod("test-pod", nil))
+	cs.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, &url.Error{Op: "Get", URL: "http://api", Err: timeoutTestError{}}
+	})
+
+	err := runPollIteration(context.Background(), stubRedis{reply: masterReply()}, cs)
+	if err == nil {
+		t.Fatal("iteration with a timed-out Pods.Get reported success")
+	}
+
+	healthy, failures := healthSnapshot()
+	if healthy || failures == 0 {
+		t.Fatalf("health after a label-phase timeout: isHealthy = %v, failures = %d, want unhealthy with the failure recorded", healthy, failures)
 	}
 }
 

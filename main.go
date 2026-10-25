@@ -164,19 +164,39 @@ func boundRestConfig(config *rest.Config) *rest.Config {
 }
 
 // runPollIteration performs one bounded poll: it reads ROLE, applies or removes
-// the pod label, then records the iteration's health outcome. The health probe
-// runs last and inside the same deadline on purpose: when the label work ate
-// the budget (a stalled Pods.Get or Pods.Update), the probe finds an expired
-// context and records a failure, so a stuck API call turns /healthz into 503
-// instead of leaving the last successful check in place.
+// the pod label, then records the iteration's health outcome. When the label
+// work hit its deadline (a stalled Pods.Get or Pods.Update), the iteration
+// records that failure directly instead of probing ROLE again: the HTTP client
+// timeout can fire a moment before the context expires, and a ROLE answer that
+// arrives in that gap would reset /healthz to healthy even though no label was
+// applied. A stuck API call therefore turns the endpoint into 503 instead of
+// leaving the last successful check in place.
 func runPollIteration(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
 	labelErr := checkAndLabel(ctx, rdb, clientset)
 	if labelErr != nil {
 		fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", labelErr)
 	}
 
-	updateHealthStatus(ctx, rdb)
+	if isTimeoutError(labelErr) {
+		recordHealthFailure(true)
+	} else {
+		updateHealthStatus(ctx, rdb)
+	}
 	return labelErr
+}
+
+// isTimeoutError reports whether err is a call that ran out of time rather
+// than an answer from a backend: a context deadline or the HTTP client timeout
+// installed by boundRestConfig. Both mean the iteration budget was spent.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // validateRedisTLSFlags rejects a nonsensical TLS flag combination:
@@ -409,17 +429,7 @@ func serveHealth(listener net.Listener) <-chan error {
 func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
 	_, err := roleCommand(ctx, rdb)
 	if err != nil {
-		healthStatus.mu.Lock()
-		healthStatus.consecutiveFailures++
-		// An expired iteration deadline is not a transient ROLE error: the
-		// check itself could not run inside the budget, so the cached status
-		// is stale rather than healthy. Report unhealthy at once, otherwise a
-		// stalled Redis or API call would keep /healthz at 200 for as long as
-		// the failure counter needs to fill up while the label goes stale.
-		if healthStatus.consecutiveFailures >= 3 || errors.Is(err, context.DeadlineExceeded) {
-			healthStatus.isHealthy = false
-		}
-		healthStatus.mu.Unlock()
+		recordHealthFailure(errors.Is(err, context.DeadlineExceeded))
 		return
 	}
 
@@ -427,5 +437,18 @@ func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
 	healthStatus.mu.Lock()
 	healthStatus.consecutiveFailures = 0
 	healthStatus.isHealthy = true
+	healthStatus.mu.Unlock()
+}
+
+// recordHealthFailure counts a check that did not complete. timedOut marks a
+// check that exhausted its iteration budget: that is not a transient backend
+// error, so the cached status is stale rather than healthy and /healthz must
+// report 503 at once instead of waiting for the failure threshold.
+func recordHealthFailure(timedOut bool) {
+	healthStatus.mu.Lock()
+	healthStatus.consecutiveFailures++
+	if healthStatus.consecutiveFailures >= 3 || timedOut {
+		healthStatus.isHealthy = false
+	}
 	healthStatus.mu.Unlock()
 }
