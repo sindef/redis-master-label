@@ -424,17 +424,7 @@ func releaseTagGateProblems(dir string) ([]string, int, error) {
 // releaseTagGateProblemsIn scans one workflow's text. A workflow that never
 // triggers on release tags is not flagged: it publishes nothing on a tag push.
 func releaseTagGateProblemsIn(path, text string) ([]string, bool) {
-	triggers := 0
-	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if strings.Contains(trimmed, releaseTagTrigger) {
-			triggers++
-		}
-	}
-	if triggers == 0 {
+	if !triggersOnReleaseTag(text) {
 		return nil, false
 	}
 
@@ -489,6 +479,190 @@ func releaseTagGateProblemsIn(path, text string) ([]string, bool) {
 		problems = append(problems, fmt.Sprintf(
 			"%s: checkout does not request %q, so `git merge-base --is-ancestor` cannot tell whether the tagged commit is on main",
 			path, releaseGateFetchDepth))
+	}
+	return problems, true
+}
+
+// triggersOnReleaseTag reports whether a workflow selects on the release tag
+// pattern. Comment lines are skipped: a commented-out trigger starts no run, so
+// a workflow whose only mention of the pattern is in prose is not a release
+// workflow.
+func triggersOnReleaseTag(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, releaseTagTrigger) {
+			return true
+		}
+	}
+	return false
+}
+
+// Release image verification: release.yml is the only path that publishes an
+// image, and the image-level checks that keep the VERSION stamp and the OCI
+// LABELs honest live in .github/workflows/ci.yml, which a tag push never runs.
+// No Go test can see a built image - the build-file readers in
+// dockerfile_check.go read the file, not the image - so a build file that strips
+// the stamp or leaves a LABEL in the discarded builder stage passed every pull
+// request and only surfaced on the tag push: either as a published image that
+// reports no version and carries no metadata, or as a release that failed while
+// releasing. The reviewed shape: the job ran `go vet` and `go test`, built the
+// image with --build-arg VERSION, and the next image step rebuilt and pushed it;
+// nothing ran the image or inspected its labels. The workflow must therefore run
+// the built image with --version and inspect its labels before the push, and
+// this scan (main_test.go: TestReleaseWorkflowVerifiesImageBeforePush) fails the
+// pull request when either check is dropped, commented out, or moved after the
+// push.
+
+const (
+	// imageVersionFlag is the argument that makes the built binary print the
+	// version the linker stamp put in it.
+	imageVersionFlag = "--version"
+
+	// imageLabelsFormatFragment is the docker inspect format text that reads the
+	// image's labels: the only place a LABEL discarded with a build stage shows
+	// up as absent.
+	imageLabelsFormatFragment = ".Config.Labels"
+
+	// imageVersionLabelKey is the OCI label whose value must be the build arg.
+	imageVersionLabelKey = "org.opencontainers.image.version"
+
+	// imagePushMarker is the build-push-action input that publishes the image.
+	imagePushMarker = "push: true"
+)
+
+// stepPushesImage reports whether a step publishes the image: either the
+// build-push-action push input or an explicit `docker push`.
+func stepPushesImage(body string) bool {
+	text := executableStepText(body)
+	return strings.Contains(text, imagePushMarker) || strings.Contains(text, "docker push")
+}
+
+// stepRunsImageVersion reports whether a step runs the built image and fails the
+// run when its --version output is not the stamped version.
+func stepRunsImageVersion(body string) bool {
+	text := executableStepText(body)
+	return strings.Contains(text, "docker run") &&
+		strings.Contains(text, imageVersionFlag) &&
+		strings.Contains(text, "exit 1")
+}
+
+// stepInspectsImageLabels reports whether a step reads the built image's labels
+// and fails the run when the version label is absent or disagrees with the tag.
+func stepInspectsImageLabels(body string) bool {
+	text := executableStepText(body)
+	return strings.Contains(text, "docker inspect") &&
+		strings.Contains(text, imageLabelsFormatFragment) &&
+		strings.Contains(text, imageVersionLabelKey) &&
+		strings.Contains(text, "exit 1")
+}
+
+// executableStepText returns a step's text without its blank and comment lines:
+// a commented-out command is not run, so it cannot be the verification a release
+// depends on.
+func executableStepText(body string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		b.WriteString(trimmed)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// releaseImageVerificationProblems returns one message per workflow under dir
+// that triggers on release tags but does not verify the image it publishes - run
+// it with --version, inspect its labels - before pushing it, plus the number of
+// such workflows, so a caller can tell "no problems" apart from "no release
+// workflow found, so nothing was checked".
+func releaseImageVerificationProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	releaseWorkflows := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		found, release := releaseImageVerificationProblemsIn(path, string(data))
+		problems = append(problems, found...)
+		if release {
+			releaseWorkflows++
+		}
+	}
+	sort.Strings(problems)
+	return problems, releaseWorkflows, nil
+}
+
+// releaseImageVerificationProblemsIn scans one workflow's text. A workflow that
+// never triggers on release tags publishes no release image and is not flagged.
+func releaseImageVerificationProblemsIn(path, text string) ([]string, bool) {
+	if !triggersOnReleaseTag(text) {
+		return nil, false
+	}
+
+	steps := workflowSteps(text)
+	pushLine := 0
+	for _, step := range steps {
+		if stepPushesImage(step.body) {
+			pushLine = step.line
+			break
+		}
+	}
+	if pushLine == 0 {
+		return []string{fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step publishes the image (%q or `docker push`), so the scan cannot tell whether what leaves the runner was verified",
+			path, releaseTagTrigger, imagePushMarker)}, true
+	}
+
+	versionLine := 0
+	labelsLine := 0
+	for _, step := range steps {
+		if versionLine == 0 && stepRunsImageVersion(step.body) {
+			versionLine = step.line
+		}
+		if labelsLine == 0 && stepInspectsImageLabels(step.body) {
+			labelsLine = step.line
+		}
+	}
+
+	var problems []string
+	switch {
+	case versionLine == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step runs the built image with %s and fails on a mismatched version, so a build file that strips the VERSION stamp is published instead of failing the tag push (CI's \"Verify image version output\" step never runs on a tag push)",
+			path, releaseTagTrigger, imageVersionFlag))
+	case versionLine > pushLine:
+		problems = append(problems, fmt.Sprintf(
+			"%s:%d: the image version check runs after the image is pushed at line %d, so the release is published before it is run",
+			path, versionLine, pushLine))
+	}
+
+	switch {
+	case labelsLine == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step inspects the built image's %s and fails when %s is absent or disagrees with the tag, so a LABEL left in the discarded builder stage reaches GHCR (CI's \"Verify image OCI labels\" step never runs on a tag push)",
+			path, releaseTagTrigger, imageLabelsFormatFragment, imageVersionLabelKey))
+	case labelsLine > pushLine:
+		problems = append(problems, fmt.Sprintf(
+			"%s:%d: the image label check runs after the image is pushed at line %d, so the release is published before its metadata is inspected",
+			path, labelsLine, pushLine))
 	}
 	return problems, true
 }

@@ -25,6 +25,18 @@ name: Release
 # references. workflow_check.go's release tag gate check
 # (main_test.go: TestReleaseWorkflowGatesTagOnPinnedReleaseImage) fails the
 # pull request when either gate is dropped or moved after the build.
+#
+# The built image is verified before it is published: the release job runs the
+# image with --version and inspects its OCI labels, the same assertions CI's
+# "Verify image version output", "Verify image OCI labels" and "Verify image
+# license metadata" steps make on a pull request. Those checks live in CI only,
+# and no Go test can see a built image (the build-file readers in
+# dockerfile_check.go read the file, not the image), so without these steps a
+# build file that strips the VERSION stamp or moves a LABEL into the discarded
+# builder stage would pass review and reach GHCR on the tag push.
+# workflow_check.go's release image verification check (main_test.go:
+# TestReleaseWorkflowVerifiesImageBeforePush) fails the pull request when they
+# are dropped or moved after the push.
 on:
   push:
     tags:
@@ -122,6 +134,63 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME}"
           docker build --build-arg VERSION="$version" -t "${{ steps.image.outputs.image }}:$version" .
+
+      # A tag push is the only trigger, so a release-file regression is
+      # discovered mid-release unless the built image is checked first. These
+      # three steps make the same assertions CI makes on a pull request, on the
+      # image this run is about to publish: the binary must report the tag, the
+      # five OCI labels must be present and non-empty on the shipping image, the
+      # version label must be the tag, and the license label must match LICENSE.
+      # They run before anything is pushed, so a build file that strips the
+      # VERSION stamp or keeps a LABEL in the discarded builder stage fails the
+      # tag push instead of reaching GHCR.
+      - name: Verify image version output
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          got=$(docker run --rm "$image" --version)
+          want="redis-master-label $version"
+          if [ "$got" != "$want" ]; then
+            echo "release image $image must report '$want', got '$got': --build-arg VERSION=$version must reach the linker stamp, so the build step has to pass it to -X main.version" >&2
+            exit 1
+          fi
+          echo "$image reports '$got'"
+
+      - name: Verify image OCI labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          labels=$(docker inspect --format '{{json .Config.Labels}}' "$image")
+          for key in title description source licenses version; do
+            if ! printf '%s' "$labels" | grep -q "\"org.opencontainers.image.$key\":\"[^\"]"; then
+              echo "release image $image declares no non-empty org.opencontainers.image.$key label (is the LABEL in the final stage?): $labels" >&2
+              exit 1
+            fi
+          done
+          got=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")
+          if [ "$got" != "$version" ]; then
+            echo "org.opencontainers.image.version = '$got' on $image, want '$version': --build-arg VERSION must reach the label, which needs ARG VERSION in the final stage" >&2
+            exit 1
+          fi
+          echo "$image carries the five OCI labels, version $got"
+
+      - name: Verify image license metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          test -f LICENSE || { echo "LICENSE missing: the image advertises a license the repository does not grant" >&2; exit 1; }
+          grep -q 'Permission is hereby granted, free of charge' LICENSE || { echo "LICENSE does not contain the MIT permission text" >&2; exit 1; }
+          got=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' "$image")
+          if [ "$got" != MIT ]; then
+            echo "org.opencontainers.image.licenses = '$got' on $image, want MIT (is the LABEL in the final stage?)" >&2
+            exit 1
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
