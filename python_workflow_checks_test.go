@@ -26,8 +26,9 @@ import (
 //
 // Two gates run it now, so neither a removed command nor a changed gate can
 // retire it silently: a CI job of its own (.github/workflows/python-checks.yml,
-// which runs `python3 test_workflow_checks.py` on every push and pull request),
-// and the Go tests below, because `go test -count=1 ./...` is what the
+// which runs `python3 -m unittest -v test_workflow_checks` on every push and
+// pull request and fails unless the summary reports at least one case), and the
+// Go tests below, because `go test -count=1 ./...` is what the
 // build-and-test job runs before the build and what release.yml runs before
 // publishing. A failing case exits non-zero, Python reports a missing entry point
 // as an error, and an entry point left without cases is caught by its own "Ran 0
