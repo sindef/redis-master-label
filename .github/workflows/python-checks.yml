@@ -20,4 +20,23 @@ jobs:
       # the build-and-test job's Python step ran ci_check_comments.py and
       # harness.py only.
       - name: Run the workflow checker's unittest suite
-        run: python3 test_workflow_checks.py
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/test_workflow_checks.log"
+          # unittest writes its "Ran N tests" summary to stderr, so the run and
+          # the summary are captured together. A non-zero exit fails the job:
+          # Python 3.12+ reports a suite with no cases as "NO TESTS RAN" and
+          # exit status 5.
+          if ! python3 -m unittest -v test_workflow_checks > "$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          # Python older than 3.12 exits 0 after "Ran 0 tests", so a suite whose
+          # cases were deleted, renamed or left skipped would keep this job green
+          # while the checker's setup-go, tab and GC-token rules went unasserted.
+          # Require the summary to report at least one case - the same guard the
+          # "Verify workflow scans and checker fixtures" step in ci.yml applies.
+          if ! grep -Eq '^Ran [1-9][0-9]* tests?' "$log"; then
+            echo "test_workflow_checks reported no test case: the checker's setup-go, tab and GC-token rules lost their fixtures" >&2
+            exit 1
+          fi
