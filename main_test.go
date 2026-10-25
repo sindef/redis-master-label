@@ -2654,6 +2654,129 @@ func TestCIWorkflowRunsWorkflowCheckerTests(t *testing.T) {
 	}
 }
 
+// The workflow checker's unittest suite has to prove it ran its cases wherever
+// CI runs it, not only in ci.yml. The reviewed ci_gap: the dedicated
+// python-checks job ran `python3 test_workflow_checks.py`, and unittest exits 0
+// after "Ran 0 tests" on Python older than 3.12, so deleting or renaming the
+// cases (or leaving only skipped ones) kept that job green while the setup-go,
+// tab and GC-token rules were no longer asserted. Both steps must capture the
+// summary and fail unless it reports at least one case.
+func TestWorkflowCheckerSuiteStepsProveTheirCasesRan(t *testing.T) {
+	problems, steps, err := pythonSuiteGuardProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatalf("pythonSuiteGuardProblems: %v", err)
+	}
+	// ci.yml's "Verify workflow scans and checker fixtures" step and the
+	// python-checks job both run the suite; losing either one leaves the count
+	// low enough to notice here as well as in the scan output.
+	if steps < 2 {
+		t.Fatalf("workflow steps running %s = %d, want ci.yml's Python step and the dedicated python-checks job", pythonSuiteModule, steps)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The failure modes the zero-case guard scan has to see: the reviewed pre-fix
+// job (a bare script run, and the same script named only in a comment), and each
+// part of the guard dropped in turn - the combined output capture, the "at least
+// one case" summary assertion, and the non-zero exit that also fails Python
+// 3.12+'s exit status 5 for "NO TESTS RAN".
+func TestPythonSuiteGuardProblems_RegressionFixtures(t *testing.T) {
+	const guarded = "      - name: Run the workflow checker's unittest suite\n" +
+		"        run: |\n" +
+		"          log=\"${RUNNER_TEMP:-/tmp}/test_workflow_checks.log\"\n" +
+		"          if ! python3 -m unittest -v test_workflow_checks > \"$log\" 2>&1; then\n" +
+		"            cat \"$log\"\n" +
+		"            exit 1\n" +
+		"          fi\n" +
+		"          cat \"$log\"\n" +
+		"          if ! grep -Eq '^Ran [1-9][0-9]* tests?' \"$log\"; then\n" +
+		"            echo \"no test case\" >&2\n" +
+		"            exit 1\n" +
+		"          fi\n"
+
+	tests := []struct {
+		name        string
+		step        string
+		wantSteps   int
+		wantProblem string
+	}{
+		{
+			name:      "guarded step",
+			step:      guarded,
+			wantSteps: 1,
+		},
+		{
+			name: "reviewed pre-fix shape: the suite run as a bare script",
+			step: "      - name: Run the workflow checker's unittest suite\n" +
+				"        run: python3 test_workflow_checks.py\n",
+			wantSteps:   1,
+			wantProblem: "bare script",
+		},
+		{
+			name:        "summary never captured (unittest writes it to stderr)",
+			step:        strings.Replace(guarded, " > \"$log\" 2>&1", "", 1),
+			wantSteps:   1,
+			wantProblem: "combined output",
+		},
+		{
+			name: "no at-least-one-case assertion",
+			step: strings.Replace(guarded,
+				"          if ! grep -Eq '^Ran [1-9][0-9]* tests?' \"$log\"; then\n"+
+					"            echo \"no test case\" >&2\n"+
+					"            exit 1\n"+
+					"          fi\n", "", 1),
+			wantSteps:   1,
+			wantProblem: "at least one case",
+		},
+		{
+			name:        "guard that never fails the job",
+			step:        strings.ReplaceAll(guarded, "exit 1", "true"),
+			wantSteps:   1,
+			wantProblem: "never fails the job",
+		},
+		{
+			name: "suite named only in a comment",
+			step: "      - name: Show the suite\n" +
+				"        run: |\n" +
+				"          # python3 -m unittest -v test_workflow_checks\n" +
+				"          true\n",
+			wantProblem: "no workflow step runs",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			workflow := "name: Python checks\non: [push, pull_request]\n\njobs:\n  python-checks:\n" +
+				"    runs-on: ubuntu-latest\n    steps:\n" +
+				"      - uses: actions/checkout@v7\n" + tt.step
+			if err := os.WriteFile(filepath.Join(dir, "python-checks.yml"), []byte(workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, steps, err := pythonSuiteGuardProblems(dir)
+			if err != nil {
+				t.Fatalf("pythonSuiteGuardProblems: %v", err)
+			}
+			if steps != tt.wantSteps {
+				t.Fatalf("suite steps = %d, want %d (problems: %v)", steps, tt.wantSteps, problems)
+			}
+			joined := strings.Join(problems, "\n")
+			if tt.wantProblem == "" {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if !strings.Contains(joined, tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+		})
+	}
+}
+
 // A workflow that pushes images with provenance/SBOM attestations needs the
 // permissions docker/build-push-action documents for that push: id-token: write
 // (keyless signing via the workflow's OIDC identity) and attestations: write
