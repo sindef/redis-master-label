@@ -33,6 +33,30 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+        # redis-server writes its RDB snapshot under /data, so the read-only
+        # root filesystem below needs one writable volume. An emptyDir is
+        # writable by the container's uid, so persistence does not need a
+        # writable root filesystem.
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        # The restricted Pod Security Standard is evaluated per container, not
+        # per pod: the labeler's securityContext cannot cover this container,
+        # so without this block a namespace enforcing the standard rejected the
+        # whole pod even though the sidecar passed. Same profile as the sidecar
+        # below. TestManifestEveryContainerMeetsRestrictedStandard fails when
+        # any container of either example deployment loses a field.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
         command:
         - redis-server
         - --replicaof
@@ -126,3 +150,10 @@ spec:
             - ALL
           seccompProfile:
             type: RuntimeDefault
+      volumes:
+      - name: redis-data
+        # Holds redis-server's RDB snapshot. emptyDir is writable by the
+        # container's uid, so the container keeps a read-only root filesystem.
+        # Swap in a PersistentVolumeClaim if the replica must keep its data
+        # across a pod restart.
+        emptyDir: {}

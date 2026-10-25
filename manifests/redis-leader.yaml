@@ -31,6 +31,28 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+        # Same as deployment-example.yaml: redis-server persists its RDB
+        # snapshot under /data, and the read-only root filesystem below makes
+        # the emptyDir mount the only place it can write.
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        # Same as deployment-example.yaml: the restricted Pod Security Standard
+        # is evaluated per container, so this container needs its own profile
+        # even though the labeler beside it declares one.
+        # TestManifestEveryContainerMeetsRestrictedStandard fails when any
+        # container of either example deployment loses a field.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
         command:
         - redis-server
       - name: redis-master-label
@@ -113,3 +135,10 @@ spec:
             - ALL
           seccompProfile:
             type: RuntimeDefault
+      volumes:
+      - name: redis-data
+        # Holds redis-server's RDB snapshot. emptyDir is writable by the
+        # container's uid, so the container keeps a read-only root filesystem.
+        # Swap in a PersistentVolumeClaim if the leader must keep its data
+        # across a pod restart.
+        emptyDir: {}
