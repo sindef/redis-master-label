@@ -181,7 +181,7 @@ every published tag stays available in GHCR.
 ## Kubernetes deployment
 Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.
 
-Apply them (edit image and args as needed). The labeler sidecar reads its Redis password from a `redis-secret` Secret, so create it first if your Redis requires authentication (see "Example usage in a pod"):
+Apply them (edit image and args as needed). Both the labeler sidecar and the co-located `redis` container read their password from the same `redis-secret` Secret and the same `password` key, so create it first (see "Example usage in a pod"). Without it both pods stay `CreateContainerConfigError`, because the `secretKeyRef` is not optional:
 ```bash
 kubectl apply -f manifests/serviceaccount.yaml
 kubectl apply -f manifests/role.yaml
@@ -190,6 +190,8 @@ kubectl apply -f manifests/redis-leader.yaml
 kubectl apply -f manifests/redis-leader-service.yaml
 kubectl apply -f manifests/deployment-example.yaml
 ```
+
+Both example `redis` containers start `redis-server` with `--requirepass $(REDIS_PASSWORD)`, and the replica also passes `--masterauth $(REDIS_PASSWORD)`. The `$(REDIS_PASSWORD)` reference is expanded by the kubelet from the container's own env entry, which reads Secret `redis-secret` key `password`, so the example Redis and the sidecar that AUTHs to it agree. The credential never lands in the pod spec; like any `--requirepass` argument it is visible in the `redis` container's own argv inside the pod (and to nothing outside it). Creating the Secret with a real value therefore gives a labeler that answers `200` on `/healthz` and applies `redis-role=master`. `TestManifestRedisAuthMatchesSidecarCredential` fails the pull request when the redis container's credential and the sidecar's diverge.
 
 `manifests/redis-leader.yaml` and `manifests/redis-leader-service.yaml` run a single Redis master (one replica, no `--replicaof`) and expose it in the `default` namespace as a Service named `redis-leader`, so the DNS name used by the replicas resolves inside the example itself. That leader pod also runs the labeler sidecar, so you can see `redis-role=master` get applied and stay on the master; the replica deployment points its Redis containers at `redis-leader.default.svc.cluster.local:6379`, so all three replicas replicate from it, and their labeler sidecars remove the `redis-role` label if a pod is ever demoted or promoted back to a replica.
 
@@ -320,7 +322,7 @@ Create the Secret referenced by the examples before applying them:
 kubectl create secret generic redis-secret --from-literal=password=<your-redis-password>
 ```
 
-If your Redis has no password, create the Secret with an empty value (`--from-literal=password=''`) or remove the `REDIS_PASSWORD` env entry from the manifests; the sidecar then connects unauthenticated.
+The example manifests expect an authenticated Redis: the `redis` containers and the labeler sidecars both read this Secret, and the servers start with `--requirepass` (plus `--masterauth` on the replica). To run the examples unauthenticated instead, remove the `REDIS_PASSWORD` env entry from **both** containers of each Deployment and drop `--requirepass`/`--masterauth` from the `redis` command; the sidecar then connects without AUTH. Doing only half of that restores the original failure: Redis answers `ERR Client sent AUTH, but no password is set`, `ROLE` never succeeds, `/healthz` answers `503` and the liveness probe restarts the sidecar. For your own passwordless Redis outside the examples, create the Secret with an empty value (`--from-literal=password=''`) so the sidecar also connects unauthenticated.
 
 ## RBAC requirements
 - Needs `get` and `update` on the Pod resource in its namespace.
