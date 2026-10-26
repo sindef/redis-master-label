@@ -181,7 +181,7 @@ every published tag stays available in GHCR.
 ## Kubernetes deployment
 Manifests in `manifests/` provide an example service account, role, rolebinding, a Redis leader deployment and its Service, and a Redis replica deployment.
 
-Apply them (edit image and args as needed). The labeler sidecar reads its Redis password from a `redis-secret` Secret, so create it first if your Redis requires authentication (see "Example usage in a pod"):
+Apply them (edit image and args as needed). Both example Deployments start their Redis container with `--requirepass $(REDIS_PASSWORD)` (and the replica adds `--masterauth $(REDIS_PASSWORD)`) from the `redis-secret` Secret, and the labeler sidecar beside it reads the same Secret and key, so the AUTH the sidecar sends is the credential Redis accepts. Create the Secret first (see "Example usage in a pod"), otherwise both pods stay in `CreateContainerConfigError`. The Secret value never lands in the pod spec: Kubernetes expands `$(REDIS_PASSWORD)` from the container's env at start. `TestManifestRedisAuthMatchesSidecarCredential` fails when a sidecar reads a credential its Redis container does not require, or when the two read different Secrets; to run Redis unauthenticated instead, remove `REDIS_PASSWORD` from both containers of the pod.
 ```bash
 kubectl apply -f manifests/serviceaccount.yaml
 kubectl apply -f manifests/role.yaml

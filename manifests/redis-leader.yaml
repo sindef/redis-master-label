@@ -53,8 +53,24 @@ spec:
             - ALL
           seccompProfile:
             type: RuntimeDefault
+        # Start Redis with the same credential the labeler reads, so the AUTH
+        # the sidecar sends is accepted. A plain `redis-server` with no
+        # --requirepass answers AUTH with "ERR Client sent AUTH, but no
+        # password is set", so every ROLE call failed, /healthz answered 503
+        # and the liveness probe restarted the sidecar. The value stays out of
+        # the pod spec: Kubernetes expands $(REDIS_PASSWORD) from this env var
+        # at container start. TestManifestRedisAuthMatchesSidecarCredential
+        # fails when the two containers stop reading the same Secret and key.
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
         command:
         - redis-server
+        - --requirepass
+        - $(REDIS_PASSWORD)
       - name: redis-master-label
         # Same as deployment-example.yaml: pinned versioned release image,
         # never a floating :latest reference.

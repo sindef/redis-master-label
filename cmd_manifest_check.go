@@ -75,8 +75,24 @@ type containerProbe struct {
 	HTTPGet *httpGetAction `json:"httpGet"`
 }
 
+// containerEnvVar is one entry of a container's env list, reduced to the
+// secret-backed value the manifests use. A plain `value:` entry has no
+// SecretKeyRef and reads back as an empty reference.
+type containerEnvVar struct {
+	Name      string `json:"name"`
+	ValueFrom struct {
+		SecretKeyRef *containerSecretKeyRef `json:"secretKeyRef"`
+	} `json:"valueFrom"`
+}
+
+// containerSecretKeyRef is the Secret name and key one env var is read from.
+type containerSecretKeyRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
 // podSpecManifest holds just the document kind and the container
-// command/args, ports, probes, resources and securityContext. Only fields
+// command/args, env, ports, probes, resources and securityContext. Only fields
 // present in the example manifests are decoded; manifests without a Pod spec
 // (like Services) simply have no containers.
 type podSpecManifest struct {
@@ -89,6 +105,7 @@ type podSpecManifest struct {
 					Image           string
 					Command         []string
 					Args            []string
+					Env             []containerEnvVar        `json:"env"`
 					Ports           []containerPort           `json:"ports"`
 					Resources       *containerResources       `json:"resources"`
 					LivenessProbe   *containerProbe           `json:"livenessProbe"`
