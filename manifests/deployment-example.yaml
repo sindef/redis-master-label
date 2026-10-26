@@ -57,11 +57,32 @@ spec:
             - ALL
           seccompProfile:
             type: RuntimeDefault
+        # The labeler sidecar below reads REDIS_PASSWORD from the redis-secret
+        # Secret and sends it with AUTH. redis-server used to start without a
+        # password, so Redis replied "ERR Client sent AUTH, but no password is
+        # set", ROLE never succeeded and the sidecar was restarted by its
+        # liveness probe. The replica requires the same value from clients
+        # (--requirepass) and uses it to authenticate to the leader
+        # (--masterauth), so replication does not stop with NOAUTH.
+        # TestManifestRedisAuthMatchesSidecarCredential fails when the redis
+        # container's credential and the sidecar's disagree.
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
+        # $(REDIS_PASSWORD) is expanded by the kubelet from the env entry above,
+        # so the credential itself never lands in the pod spec.
         command:
         - redis-server
         - --replicaof
         - "redis-leader.default.svc.cluster.local"
         - "6379"
+        - --requirepass
+        - $(REDIS_PASSWORD)
+        - --masterauth
+        - $(REDIS_PASSWORD)
       - name: redis-master-label
         # Pinned to a registry-qualified versioned release, never :latest:
         # a floating tag makes every deployment's image depend on the newest

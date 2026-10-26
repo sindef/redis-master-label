@@ -53,8 +53,26 @@ spec:
             - ALL
           seccompProfile:
             type: RuntimeDefault
+        # The labeler sidecar below reads REDIS_PASSWORD from the redis-secret
+        # Secret and sends it with AUTH. redis-server used to start with no
+        # arguments, so it listened without a password while the sidecar sent
+        # one: Redis replied "ERR Client sent AUTH, but no password is set",
+        # ROLE never succeeded, /healthz answered 503 and the liveness probe
+        # restarted the sidecar. The server now requires the same Secret value.
+        # TestManifestRedisAuthMatchesSidecarCredential fails when the redis
+        # container's credential and the sidecar's disagree.
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: password
+        # $(REDIS_PASSWORD) is expanded by the kubelet from the env entry above,
+        # so the credential itself never lands in the pod spec.
         command:
         - redis-server
+        - --requirepass
+        - $(REDIS_PASSWORD)
       - name: redis-master-label
         # Same as deployment-example.yaml: pinned versioned release image,
         # never a floating :latest reference.
