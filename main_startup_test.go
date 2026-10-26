@@ -212,6 +212,8 @@ func TestMainAcceptsExplicitPodNameAndStopsAtInClusterConfig(t *testing.T) {
 // startup. Without it, deleting `if err := validateCheckInterval();`,
 // reverting the TLS rejection to a warning or dropping the loop's
 // updateHealthStatus/checkAndLabel/sleep calls would keep `go test ./...` green.
+// The poll-loop pins track the iteration's own deadline (checkCtx), so the
+// bounded-iteration change keeps this contract instead of bypassing it.
 func TestMainWiresStartupValidationAndPollLoop(t *testing.T) {
 	body := mainFunctionSource(t)
 
@@ -229,14 +231,16 @@ func TestMainWiresStartupValidationAndPollLoop(t *testing.T) {
 		{"POD_NAMESPACE defaulting", `*podNamespace = os.Getenv("POD_NAMESPACE")`},
 		{"namespace falls back to default", `*podNamespace = "default"`},
 		{"in-cluster config built", "rest.InClusterConfig()"},
+		{"Kubernetes client config bounded", "boundClientConfig(config)"},
 		{"Kubernetes client built", "kubernetes.NewForConfig(config)"},
 		{"Redis options built from flags", "redisOptionsFromFlags()"},
 		{"Redis client built", "redis.NewClient(redisOptions)"},
 		{"health server bound before the loop", "startHealthServer(*healthPort)"},
 		{"poll loop entered", "for {"},
 		{"health server death surfaced in the loop", "case err := <-errCh:"},
-		{"health updated each iteration", "updateHealthStatus(ctx, rdb)"},
-		{"role checked and label applied each iteration", "checkAndLabel(ctx, rdb, clientset)"},
+		{"iteration bounded by the check interval", "context.WithTimeout(ctx, *checkInterval)"},
+		{"health updated each iteration", "updateHealthStatus(checkCtx, rdb)"},
+		{"role checked and label applied each iteration", "checkAndLabel(checkCtx, rdb, clientset)"},
 		{"iteration sleeps for the check interval", "time.Sleep(*checkInterval)"},
 	}
 
