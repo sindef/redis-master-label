@@ -22,8 +22,9 @@ import (
 // and no test ever looked at a container that is not the sidecar.
 //
 // This file closes that gap at pod level. It decodes every container of every
-// Deployment under manifests/ - not only the one matching sidecarImage - and
-// holds each to the restricted shape: a non-root user, no privilege escalation,
+// Deployment under manifests/ - both `containers` and `initContainers`, not
+// only the one matching sidecarImage - and holds each to the restricted shape:
+// a non-root user, no privilege escalation,
 // a read-only root filesystem, every capability dropped and a RuntimeDefault (or
 // Localhost) seccompProfile at container or pod level. It also requires a
 // writable volume at /data once a redis container has a read-only root
@@ -79,12 +80,15 @@ type restrictedVolume struct {
 }
 
 // restrictedContainer is one container of an example pod, with the manifest and
-// pod it belongs to so a failure names the file that has to be edited.
+// pod it belongs to so a failure names the file that has to be edited. Init is
+// true for an initContainer: the restricted Pod Security Standard is enforced
+// on those too, so they are checked with the same rule.
 type restrictedContainer struct {
 	Manifest        string
 	Pod             string
 	Name            string
 	Image           string
+	Init            bool
 	SecurityContext *restrictedContainerSecurity
 	VolumeMounts    []restrictedVolumeMount
 }
@@ -99,6 +103,15 @@ type restrictedPod struct {
 	Volumes        []restrictedVolume
 }
 
+// restrictedContainerSpec is one entry of a pod spec's `containers` or
+// `initContainers` list, reduced to the fields the check decides on.
+type restrictedContainerSpec struct {
+	Name            string                       `json:"name"`
+	Image           string                       `json:"image"`
+	SecurityContext *restrictedContainerSecurity `json:"securityContext"`
+	VolumeMounts    []restrictedVolumeMount      `json:"volumeMounts"`
+}
+
 // restrictedPodDocument is the manifest subset restrictedExamplePods decodes.
 type restrictedPodDocument struct {
 	Kind     string `json:"kind"`
@@ -111,22 +124,19 @@ type restrictedPodDocument struct {
 				SecurityContext *struct {
 					SeccompProfile *restrictedSeccompProfile `json:"seccompProfile"`
 				} `json:"securityContext"`
-				Containers []struct {
-					Name            string                       `json:"name"`
-					Image           string                       `json:"image"`
-					SecurityContext *restrictedContainerSecurity `json:"securityContext"`
-					VolumeMounts    []restrictedVolumeMount      `json:"volumeMounts"`
-				} `json:"containers"`
-				Volumes []restrictedVolume `json:"volumes"`
+				InitContainers []restrictedContainerSpec `json:"initContainers"`
+				Containers     []restrictedContainerSpec `json:"containers"`
+				Volumes        []restrictedVolume        `json:"volumes"`
 			} `json:"spec"`
 		} `json:"template"`
 	} `json:"spec"`
 }
 
 // restrictedExamplePods returns every Deployment document across manifests/*.yaml
-// with all of its containers, walking the same manifest set (and tolerating the
-// same non-Pod-spec documents) as sidecarContainers. Unlike that reader it does
-// not filter by image, which is exactly the gap this check exists to close.
+// with all of its containers - init containers first, then the regular ones -
+// walking the same manifest set (and tolerating the same non-Pod-spec
+// documents) as sidecarContainers. Unlike that reader it does not filter by
+// image, which is exactly the gap this check exists to close.
 func restrictedExamplePods(dir string) ([]restrictedPod, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -165,15 +175,24 @@ func restrictedExamplePods(dir string) ([]restrictedPod, error) {
 		if sc := doc.Spec.Template.Spec.SecurityContext; sc != nil {
 			pod.SeccompProfile = sc.SeccompProfile
 		}
-		for _, c := range doc.Spec.Template.Spec.Containers {
-			pod.Containers = append(pod.Containers, restrictedContainer{
-				Manifest:        entry.Name(),
-				Pod:             doc.Metadata.Name,
-				Name:            c.Name,
-				Image:           c.Image,
-				SecurityContext: c.SecurityContext,
-				VolumeMounts:    c.VolumeMounts,
-			})
+		for _, list := range []struct {
+			init       bool
+			containers []restrictedContainerSpec
+		}{
+			{init: true, containers: doc.Spec.Template.Spec.InitContainers},
+			{init: false, containers: doc.Spec.Template.Spec.Containers},
+		} {
+			for _, c := range list.containers {
+				pod.Containers = append(pod.Containers, restrictedContainer{
+					Manifest:        entry.Name(),
+					Pod:             doc.Metadata.Name,
+					Name:            c.Name,
+					Image:           c.Image,
+					Init:            list.init,
+					SecurityContext: c.SecurityContext,
+					VolumeMounts:    c.VolumeMounts,
+				})
+			}
 		}
 		pods = append(pods, pod)
 	}
@@ -181,8 +200,13 @@ func restrictedExamplePods(dir string) ([]restrictedPod, error) {
 }
 
 // containerKey names one container across the manifest set, uniquely enough for
-// a baseline entry: file, pod and container.
+// a baseline entry: file, pod, container and, for an init container, its list.
+// Kubernetes lets an init container and an app container share a name, so the
+// list has to be part of the key or one could hide behind the other.
 func containerKey(c restrictedContainer) string {
+	if c.Init {
+		return fmt.Sprintf("%s/%s/init:%s", c.Manifest, c.Pod, c.Name)
+	}
 	return fmt.Sprintf("%s/%s/%s", c.Manifest, c.Pod, c.Name)
 }
 
@@ -723,6 +747,51 @@ func TestRestrictedExamplePods_ReportsEveryContainerOfThePod(t *testing.T) {
 		if problem != nil {
 			t.Errorf("the hardened %s container = %v, want it accepted", c.Name, problem)
 		}
+	}
+}
+
+// Init containers are containers to the restricted Pod Security Standard, so a
+// pod whose app containers are hardened but whose init container is not is
+// rejected. The reader has to return them or the guard misses that container the
+// same way the image-filtered sidecar checks missed the redis container.
+func TestRestrictedExamplePods_ChecksInitContainers(t *testing.T) {
+	dir := t.TempDir()
+	writeRestrictedFixtureManifest(t, dir, "deployment.yaml",
+		"apiVersion: apps/v1\n"+
+			"kind: Deployment\n"+
+			"metadata:\n"+
+			"  name: with-init\n"+
+			"spec:\n"+
+			"  template:\n"+
+			"    spec:\n"+
+			"      initContainers:\n"+
+			"      - name: setup\n"+
+			"        image: busybox:1.36\n"+
+			"      containers:\n"+
+			restrictedFixtureLabelerContainer)
+
+	pods, err := restrictedExamplePods(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || len(pods[0].Containers) != 2 {
+		t.Fatalf("pods = %d, containers = %d, want the one Deployment and its init plus app container", len(pods), len(pods[0].Containers))
+	}
+	if !pods[0].Containers[0].Init || pods[0].Containers[0].Name != "setup" {
+		t.Fatalf("first container = %+v, want the init container setup read before the app containers", pods[0].Containers[0])
+	}
+	problem := restrictedContainerProblem(pods[0].Containers[0], pods[0].SeccompProfile)
+	if problem == nil {
+		t.Fatal("an init container without a securityContext was accepted, want the pod-level check to report it")
+	}
+	if !strings.Contains(problem.Error(), "declares no securityContext") {
+		t.Fatalf("problem = %q, want it to name the missing securityContext", problem)
+	}
+	if !strings.Contains(problem.Error(), "init:setup") {
+		t.Fatalf("problem = %q, want it to name the init container so the failing list is unambiguous", problem)
+	}
+	if problem := restrictedContainerProblem(pods[0].Containers[1], pods[0].SeccompProfile); problem != nil {
+		t.Errorf("the hardened %s container = %v, want it accepted", pods[0].Containers[1].Name, problem)
 	}
 }
 
