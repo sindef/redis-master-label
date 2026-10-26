@@ -105,7 +105,7 @@ type podSpecManifest struct {
 					Image           string
 					Command         []string
 					Args            []string
-					Env             []containerEnvVar        `json:"env"`
+					Env             []containerEnvVar         `json:"env"`
 					Ports           []containerPort           `json:"ports"`
 					Resources       *containerResources       `json:"resources"`
 					LivenessProbe   *containerProbe           `json:"livenessProbe"`
