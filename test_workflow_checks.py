@@ -15,16 +15,22 @@ scans and checker fixtures" step and fails when it reports zero tests, so
 deleting the file or emptying it cannot retire the coverage.
 """
 
+import contextlib
+import io
 import os
+import tempfile
 import unittest
+from unittest import mock
 
 import ci_check_comments
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+WORKFLOW_DIR = os.path.join(REPO_ROOT, ".github", "workflows")
 
-SHIPPED_WORKFLOWS = tuple(
-    os.path.join(REPO_ROOT, relative) for relative in ci_check_comments.WORKFLOWS
-)
+# The workflows the checker scans when CI runs it with no arguments. It is the
+# checker's own globbed set, not a copy of it: a set narrowed back to two named
+# files fails test_shipped_workflow_set_covers_every_yaml_workflow.
+SHIPPED_WORKFLOWS = ci_check_comments.WORKFLOWS
 
 
 def check(text):
@@ -142,6 +148,117 @@ class StructuralScanTests(unittest.TestCase):
             "        run: go build ./...\n"
         )
         self.assertEqual(check(text), [])
+
+
+class WorkflowCoverageTests(unittest.TestCase):
+    """The scan covers every YAML workflow in .github/workflows, not a named pair.
+
+    The reviewed defect: the checker's workflow set named ci.yml and
+    release.yml, so python-checks.yml was never read and a tab character or a
+    bare `go-version:` setup-go step in it passed `python3 ci_check_comments.py`
+    - the only step CI runs for this rule - because an explicit argument list
+    was required to reach that file.
+    """
+
+    def test_shipped_workflow_set_covers_every_yaml_workflow(self):
+        on_disk = sorted(
+            name
+            for name in os.listdir(WORKFLOW_DIR)
+            if name.endswith((".yml", ".yaml"))
+            and os.path.isfile(os.path.join(WORKFLOW_DIR, name))
+        )
+        self.assertTrue(
+            on_disk,
+            "no workflow file found under %s, so the scan would cover nothing"
+            % WORKFLOW_DIR,
+        )
+        self.assertEqual(
+            sorted(os.path.basename(path) for path in SHIPPED_WORKFLOWS),
+            on_disk,
+            "the checker scans a subset of the workflows this repository ships, so"
+            " the rules for setup-go version sources, tabs and gc tokens do not"
+            " cover the missing files",
+        )
+
+    def test_workflow_paths_reads_every_yaml_file(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            for name in ("first.yml", "second.yaml", "notes.txt", "README.md"):
+                with open(os.path.join(workspace, name), "w", encoding="utf-8") as handle:
+                    handle.write("on: [push]\n")
+            os.mkdir(os.path.join(workspace, "directory.yml"))
+            self.assertEqual(
+                [
+                    os.path.basename(path)
+                    for path in ci_check_comments.workflow_paths(workspace)
+                ],
+                ["first.yml", "second.yaml"],
+                "workflow_paths must glob both YAML extensions and skip anything"
+                " that is not a YAML file",
+            )
+
+    def test_workflow_paths_reports_an_empty_directory_as_empty(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            self.assertEqual(ci_check_comments.workflow_paths(workspace), ())
+
+    def test_default_run_fails_when_no_workflow_is_found(self):
+        out = io.StringIO()
+        with mock.patch.object(ci_check_comments, "WORKFLOWS", ()):
+            with contextlib.redirect_stdout(out):
+                rc = ci_check_comments.main(["ci_check_comments.py"])
+        self.assertEqual(
+            rc, 1, "a scan that found no workflow must not report success"
+        )
+        self.assertIn("no workflow file found", out.getvalue())
+
+    def test_default_run_fails_for_a_violation_in_any_globbed_workflow(self):
+        """The reviewed gap: a violating workflow the hardcoded pair skipped.
+
+        python-checks.yml is mutated the way the finding describes and the
+        checker is run as CI runs it, with no arguments, so only a set that
+        includes the file can fail here.
+        """
+        with open(
+            os.path.join(WORKFLOW_DIR, "python-checks.yml"), encoding="utf-8"
+        ) as handle:
+            shipped = handle.read()
+        mutations = (
+            (
+                "tab character",
+                shipped.replace(
+                    "on: [push, pull_request]", "on: [push, pull_request]\n\t# tab", 1
+                ),
+                "tab character present",
+            ),
+            (
+                "setup-go step without go-version-file",
+                shipped
+                + "\n      - uses: actions/setup-go@v7\n"
+                + "        with:\n"
+                + '          go-version: "1.23"\n',
+                "missing go-version-file: go.mod",
+            ),
+        )
+        for name, text, want in mutations:
+            with self.subTest(mutation=name):
+                with tempfile.TemporaryDirectory() as workspace:
+                    path = os.path.join(workspace, "python-checks.yml")
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write(text)
+                    out = io.StringIO()
+                    with mock.patch.object(
+                        ci_check_comments,
+                        "WORKFLOWS",
+                        ci_check_comments.workflow_paths(workspace),
+                    ):
+                        with contextlib.redirect_stdout(out):
+                            rc = ci_check_comments.main(["ci_check_comments.py"])
+                    self.assertEqual(
+                        rc,
+                        1,
+                        "the default run passed a workflow it must scan (%s):\n%s"
+                        % (name, out.getvalue()),
+                    )
+                    self.assertIn(want, out.getvalue())
 
 
 class ShippedWorkflowTests(unittest.TestCase):
