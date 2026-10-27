@@ -3018,6 +3018,139 @@ func TestReleaseImageVerificationProblems_RegressionFixtures(t *testing.T) {
 	}
 }
 
+// The reviewed release_hygiene finding: release.yml ran `docker build
+// --build-arg VERSION=<tag> -t <ref> .` and then published the image with
+// docker/build-push-action, which built it a second time from the same context.
+// The locally tagged image was never pushed, inspected or reused, so the release
+// paid for two builds and any per-build nondeterminism (base-image digest,
+// module download) could publish an artifact the run never verified. The release
+// path must build the image once and publish that build - a plain `docker push`
+// of the loaded build, or one build-push-action that owns the push - and still
+// report the pushed digest in the step summary.
+func TestReleaseWorkflowBuildsImageOnce(t *testing.T) {
+	problems, builds, err := releaseSingleBuildProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builds != 1 {
+		t.Fatalf("image build steps in %s = %d, want exactly 1: the release job must build the image it publishes, and build it only once", ciWorkflowDir, builds)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The fixture steps the release single-build scan reads: the loaded build, the
+// plain push of that build, and the step summary that names the pushed digest.
+const (
+	releaseFixtureLoadedBuild = "      - name: Build image\n" +
+		"        uses: docker/build-push-action@v7\n" +
+		"        with:\n" +
+		"          context: .\n" +
+		"          push: false\n" +
+		"          load: true\n" +
+		"          build-args: VERSION=${{ github.ref_name }}\n" +
+		"          tags: |\n" +
+		"            example:${GITHUB_REF_NAME}\n"
+
+	releaseFixtureDockerPush = "      - name: Publish the built image\n" +
+		"        shell: bash\n" +
+		"        run: |\n" +
+		"          docker push \"example:${GITHUB_REF_NAME}\"\n"
+
+	releaseFixtureDigestSummary = "      - name: Report pushed digest in step summary\n" +
+		"        run: |\n" +
+		"          echo \"${{ steps.push.outputs.digest }}\" >> \"$GITHUB_STEP_SUMMARY\"\n"
+)
+
+// The failure modes the release single-build scan has to see: the reviewed
+// shape (a Docker CLI build followed by a build-push-action that rebuilds), no
+// build at all, and a push whose digest is never reported. The loaded build
+// pushed as-is, a single build-push-action that owns build and push, and a
+// second build that exists only as a comment must pass; a workflow that never
+// triggers on a release tag builds no release image and is not flagged.
+func TestReleaseSingleBuildProblems_RegressionFixtures(t *testing.T) {
+	commentedBuild := "      - name: Rebuild image\n" +
+		"        # docker build --build-arg VERSION=\"${GITHUB_REF_NAME}\" .\n"
+
+	tests := []struct {
+		name        string
+		workflow    string
+		wantBuilds  int
+		wantProblem string
+	}{
+		{
+			name:       "loaded build pushed as-is",
+			workflow:   releaseWorkflowFixture("fetch-depth: 0", releaseFixtureLoadedBuild, releaseFixtureDockerPush, releaseFixtureDigestSummary),
+			wantBuilds: 1,
+		},
+		{
+			name:        "reviewed pre-fix shape: built, then rebuilt by the push step",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixturePush, releaseFixtureDigestSummary),
+			wantBuilds:  2,
+			wantProblem: "builds the release image again",
+		},
+		{
+			name:       "one build-push-action that builds and pushes",
+			workflow:   releaseWorkflowFixture("fetch-depth: 0", releaseFixturePush, releaseFixtureDigestSummary),
+			wantBuilds: 1,
+		},
+		{
+			name:        "no build at all",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureDockerPush, releaseFixtureDigestSummary),
+			wantBuilds:  0,
+			wantProblem: "no step builds",
+		},
+		{
+			name:        "pushed digest not reported",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureLoadedBuild, releaseFixtureDockerPush),
+			wantBuilds:  1,
+			wantProblem: stepSummarySink,
+		},
+		{
+			name:       "second build present only as a comment",
+			workflow:   releaseWorkflowFixture("fetch-depth: 0", releaseFixtureLoadedBuild, commentedBuild, releaseFixtureDockerPush, releaseFixtureDigestSummary),
+			wantBuilds: 1,
+		},
+		{
+			name:       "no release tag trigger",
+			workflow:   "name: CI\non:\n  pull_request:\n\njobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n" + releaseFixtureBuild + releaseFixturePush,
+			wantBuilds: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "release.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, builds, err := releaseSingleBuildProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if builds != tt.wantBuilds {
+				t.Fatalf("image build steps = %d, want %d (problems: %v)", builds, tt.wantBuilds, problems)
+			}
+			joined := strings.Join(problems, "\n")
+			if tt.wantProblem == "" {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if !strings.Contains(joined, tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+		})
+	}
+
+	if _, _, err := releaseSingleBuildProblems(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("missing workflow directory accepted, want a read error")
+	}
+}
+
 // GitHub keys a required status check on the name of the job that reported it,
 // not on the steps that did the work, and branch protection requires the
 // `update-go_modules-graph` check here. The module-graph gate must therefore

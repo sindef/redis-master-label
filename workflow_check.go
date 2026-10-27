@@ -667,6 +667,128 @@ func releaseImageVerificationProblemsIn(path, text string) ([]string, bool) {
 	return problems, true
 }
 
+// Release single-build check: a release job that builds the image twice pays for
+// a duplicate build and publishes an artifact the job never ran or inspected.
+// The reviewed shape: release.yml ran `docker build --build-arg VERSION=<tag> -t
+// <ref> .` and then published the image with docker/build-push-action, which
+// builds again from the same context. The locally tagged image was never pushed,
+// never inspected and never reused, so the tag, the version stamp and the
+// image-level checks all applied to an image that was discarded, and any
+// per-build nondeterminism (base image digest, Go module download) made the
+// published image a different artifact from the one the run verified. The
+// release path must therefore have exactly one image build whose output is the
+// pushed reference - either a plain `docker push` of the built tag, or a single
+// build-push-action that owns both the build and the push - and the tag push must
+// still report the pushed digest in the step summary. No compiler sees a
+// workflow file, so the check lives here (main_test.go:
+// TestReleaseWorkflowBuildsImageOnce).
+
+const (
+	// dockerBuildCommand is the Docker CLI build invocation. The trailing space
+	// keeps `docker buildx imagetools inspect` - which builds nothing - from
+	// reading as a second build.
+	dockerBuildCommand = "docker build "
+
+	// dockerBuildxBuildCommand is buildx's build verb, which builds like the
+	// classic command does.
+	dockerBuildxBuildCommand = "docker buildx build"
+
+	// dockerPushCommand publishes an already-built image without building it.
+	dockerPushCommand = "docker push"
+
+	// stepSummarySink is the per-run summary file the pushed digest is reported
+	// in.
+	stepSummarySink = "GITHUB_STEP_SUMMARY"
+
+	// digestMarker names the value the step summary must carry: which image the
+	// run published is only readable from the digest.
+	digestMarker = "digest"
+)
+
+// stepImageBuilds reports whether a step's executable text builds an image:
+// the Docker CLI build command, buildx's build verb, or
+// docker/build-push-action, which always builds from the context it is given.
+// Comment lines are skipped: a commented-out command builds nothing.
+func stepImageBuilds(body string) bool {
+	text := executableStepText(body)
+	return strings.Contains(text, attestationActionStr) ||
+		strings.Contains(text, dockerBuildCommand) ||
+		strings.Contains(text, dockerBuildxBuildCommand)
+}
+
+// releaseSingleBuildProblems returns one message per release-triggering workflow
+// under dir that builds the release image more than once, builds none at all, or
+// never reports the pushed digest in the step summary, plus the number of image
+// build steps found across those workflows, so a caller can tell "no problems"
+// apart from "no build found, so nothing was checked".
+func releaseSingleBuildProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	builds := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		found, count := releaseSingleBuildProblemsIn(path, string(data))
+		problems = append(problems, found...)
+		builds += count
+	}
+	sort.Strings(problems)
+	return problems, builds, nil
+}
+
+// releaseSingleBuildProblemsIn scans one workflow's text. A workflow that never
+// triggers on release tags publishes no release image and is not flagged.
+func releaseSingleBuildProblemsIn(path, text string) ([]string, int) {
+	if !triggersOnReleaseTag(text) {
+		return nil, 0
+	}
+
+	var buildLines []int
+	reportsDigest := false
+	for _, step := range workflowSteps(text) {
+		if stepImageBuilds(step.body) {
+			buildLines = append(buildLines, step.line)
+		}
+		body := executableStepText(step.body)
+		if strings.Contains(body, stepSummarySink) && strings.Contains(strings.ToLower(body), digestMarker) {
+			reportsDigest = true
+		}
+	}
+
+	var problems []string
+	switch {
+	case len(buildLines) == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step builds the release image (`%s` or `%s`), so the published reference comes from no build this job can name",
+			path, releaseTagTrigger, strings.TrimSpace(dockerBuildCommand), attestationActionStr))
+	case len(buildLines) > 1:
+		for _, line := range buildLines[1:] {
+			problems = append(problems, fmt.Sprintf(
+				"%s:%d: builds the release image again although it is already built at line %d, so the earlier image is discarded and the pushed reference is not the artifact this job ran or inspected; build the image once and publish that image (a plain `%s` of the built tag, or one `%s` that builds and pushes)",
+				path, line, buildLines[0], dockerPushCommand, attestationActionStr))
+		}
+	}
+	if !reportsDigest {
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) but no step reports the pushed digest in the step summary ($%s), so a release run leaves no record of which image it published",
+			path, releaseTagTrigger, stepSummarySink))
+	}
+	return problems, len(buildLines)
+}
+
 // Module-graph status check: GitHub keys a required status check on the name of
 // the job that reported it, not on the steps that did the work. Branch
 // protection on this repository requires the `update-go_modules-graph` check, so
