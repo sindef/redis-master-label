@@ -5,6 +5,21 @@ metadata:
   namespace: default
 spec:
   replicas: 1
+  # A single Redis master must never have two pods. Master election here is by
+  # label, not by a leader-election loop: whichever pod's redis-server reports
+  # role:master gets redis-role=master from its sidecar, and the redis-leader
+  # Service selects every pod carrying app: redis-leader, which is also the DNS
+  # name the replica deployment replicates from. RollingUpdate (the default when
+  # no strategy is set) creates the replacement pod before terminating the old
+  # one, and a fresh redis-server starts with no --replicaof, so both pods would
+  # be masters: the Service would route the replicas across two divergent
+  # datasets and both sidecars would label their own pod master. Recreate
+  # terminates the old pod before the replacement starts, so at most one
+  # redis-leader pod exists at any moment (expect a short write outage while the
+  # new pod starts). TestLeaderDeploymentUsesRecreateStrategy fails when this
+  # strategy is lost.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: redis-leader
