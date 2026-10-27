@@ -5,6 +5,17 @@ metadata:
   namespace: default
 spec:
   replicas: 1
+  # Master election in this example is the redis-role=master label the sidecar
+  # below applies, and the Service selector and the replica's --replicaof
+  # target both resolve `app: redis-leader`. The default RollingUpdate strategy
+  # starts the replacement pod before the old one terminates; its redis-server
+  # has no --replicaof, so it becomes a master too and both pods label
+  # themselves redis-role=master. Recreate terminates the old pod first, so one
+  # master exists at a time at the cost of a brief write outage.
+  # TestManifestLeaderDeploymentPinsRecreateStrategy fails when the strategy or
+  # the single replica is dropped.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: redis-leader
