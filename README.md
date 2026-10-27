@@ -122,15 +122,20 @@ it reads `releaseImage` from `main_test.go` and requires that reference to end i
 the tag and to appear in `manifests/`. A tag that disagrees with the pin, or a
 tag on a commit `main` never held, fails the run instead of publishing an image
 no manifest references. The workflow then runs `go vet` and the full test suite,
-builds the image with `--build-arg VERSION=<tag>`, verifies that built image, and
-pushes exactly
-`ghcr.io/redis-master-label/redis-master-label:<tag>` to GHCR (lowercase repo
-name, `GITHUB_TOKEN` with `packages: write`, plus the `id-token: write` and
-`attestations: write` permissions attestations need). The image carries provenance
-and SBOM attestations, and the workflow's step summary reports the pushed digest
-plus the `docker buildx imagetools inspect` output for it, so the attestation
-manifests are visible on every release run.
+builds the image once with `--build-arg VERSION=<tag>` (`docker/build-push-action`
+with `load: true`, so the build lands in the runner's Docker daemon), verifies
+that built image before anything is pushed, and publishes exactly that image with
+`docker push` to `ghcr.io/redis-master-label/redis-master-label:<tag>` (lowercase
+repo name, `GITHUB_TOKEN` with `packages: write`). The push does not rebuild the
+image: what leaves the runner is the artifact the run just verified, so a
+nondeterministic base-image or module download cannot swap in a different one.
+The workflow's step summary reports the pushed digest plus the
+`docker buildx imagetools inspect` output for it.
 Nothing floating (`:latest`) is ever published.
+
+`TestReleaseWorkflowBuildsImageOnce` fails the pull request when the release
+workflow builds the image a second time instead of pushing the build it
+verified, and when the tag push stops reporting the pushed digest.
 
 Before anything is pushed, the release job runs the image it just built and
 inspects its metadata, making the same assertions CI makes on a pull request: the
