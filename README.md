@@ -195,6 +195,26 @@ Both example `redis` containers start `redis-server` with `--requirepass $(REDIS
 
 `manifests/redis-leader.yaml` and `manifests/redis-leader-service.yaml` run a single Redis master (one replica, no `--replicaof`) and expose it in the `default` namespace as a Service named `redis-leader`, so the DNS name used by the replicas resolves inside the example itself. That leader pod also runs the labeler sidecar, so you can see `redis-role=master` get applied and stay on the master; the replica deployment points its Redis containers at `redis-leader.default.svc.cluster.local:6379`, so all three replicas replicate from it, and their labeler sidecars remove the `redis-role` label if a pod is ever demoted or promoted back to a replica.
 
+That leader Deployment is pinned to `strategy: {type: Recreate}`, because master
+election here is label-based rather than a leader-election loop: whichever pod's
+`redis-server` reports `role:master` gets `redis-role=master` from its sidecar,
+and the `redis-leader` Service — the DNS name every replica's `--replicaof`
+points at — selects every pod carrying `app: redis-leader`. With the default
+strategy (`RollingUpdate`) a rollout, `kubectl rollout restart redis-leader`
+included, creates the replacement pod before terminating the old one, and a
+fresh `redis-server` starts with no `--replicaof`, so it becomes a master too:
+two pods would be labelled `app: redis-leader` and `redis-role=master` at the
+same time, the Service would route the replicas across two divergent datasets,
+and there would be two writers. `Recreate` terminates the old pod before the
+replacement starts, so at most one `redis-leader` pod exists at any moment;
+expect a short write outage while the new pod starts, and a brief replication
+interruption for the `redis-with-labeler` replicas until they reconnect through
+the Service. `TestLeaderDeploymentUsesRecreateStrategy` fails the pull request
+when a Deployment whose `redis-server` starts without `--replicaof` keeps the
+default or an explicit `RollingUpdate` strategy, declares more than one replica,
+or combines `Recreate` with `rollingUpdate` parameters, which the API server
+rejects; kubeconform only validates the schema, where `strategy` is optional.
+
 If you prefer to run Redis replication against your own Redis leader, apply `serviceaccount.yaml`, `role.yaml`, `rolebinding.yaml`, and `deployment-example.yaml`, change `--replicaof` in `deployment-example.yaml` to point at your leader's Service DNS name, and provide that Service (or a headless Service with a stable DNS name for a Redis master, e.g. a StatefulSet headless Service) yourself — the example deployment expects a `redis-leader` Service (or your own equivalent) to exist.
 
 Key points for the deployment:
@@ -205,6 +225,9 @@ Key points for the deployment:
 - Size every container with `resources.requests` and `resources.limits` (see
   "Resource sizing" below); both example deployments do, so their pods are
   `Burstable` instead of `BestEffort`.
+- Keep a single-master Redis Deployment on `strategy: {type: Recreate}` so a
+  rollout never runs two masters at once (see above); the example leader
+  Deployment does.
 - Run every container unprivileged (see "Running unprivileged" below). Both
   example deployments declare the full restricted profile on the labeler
   sidecar and on the co-located `redis` container, plus the writable `/data`
