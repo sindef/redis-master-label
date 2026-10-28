@@ -35,6 +35,16 @@ name: Release
 # TestReleaseWorkflowBuildsImageOnce) fails the pull request when a release
 # workflow builds the image again instead of pushing the build it verified.
 #
+# The published tag is immutable: after logging in and before pushing, the job
+# asks the registry for the manifest of <image>:<tag> and fails when one already
+# exists. Re-running a release, or force-pushing the same tag after a build-file
+# change, therefore cannot replace the digest the manifests pin: the run stops
+# with the tag that already exists instead of silently publishing different code
+# under a reference reviewers already approved. workflow_check.go's release
+# immutable-tag check (main_test.go:
+# TestReleaseWorkflowRefusesToOverwritePublishedTag) fails the pull request when
+# that guard is dropped or moved after the push.
+#
 # The built image is verified before it is published: the release job runs the
 # image with --version and inspects its OCI labels, the same assertions CI's
 # "Verify image version output", "Verify image OCI labels" and "Verify image
@@ -210,6 +220,36 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A published tag is the immutable reference the manifests pin, so nothing
+      # may move it. Ask the registry - not the local daemon - for the manifest
+      # that <image>:<tag> currently points at and fail when one exists: a
+      # re-run of this release, or a force-push of the same tag, would otherwise
+      # replace the digest silently and every pod that re-pulls the tag runs
+      # code no reviewer saw. A failed lookup is only trusted when the registry
+      # says the tag is absent; any other error (auth, network) fails closed.
+      # `imagetools inspect` reads the manifest without `--raw`, and it never
+      # builds, so the release still has exactly one image build.
+      - name: Refuse to overwrite an already-published tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          image="${{ steps.image.outputs.image }}:$version"
+          if output=$(docker buildx imagetools inspect "$image" 2>&1); then
+            printf '%s\n' "$output" >&2
+            echo "$image already exists in the registry: published tags are immutable, because a second push would replace the digest the manifests pin and pods re-pulling the tag would run code this run never verified. Bump the release version and tag that commit instead of reusing $version." >&2
+            exit 1
+          fi
+          case "$output" in
+            *"not found"*|*"manifest unknown"*|*"no such manifest"*|*"name unknown"*)
+              echo "$image is not published yet, so this release cannot replace an existing tag"
+              ;;
+            *)
+              echo "cannot tell whether $image already exists in the registry, so refusing to publish over it: $output" >&2
+              exit 1
+              ;;
+          esac
 
       # Publish the image this job built and verified. `docker push` uploads
       # that image as-is: there is no second build here, so the pushed
