@@ -29,6 +29,17 @@ spec:
         app: redis-leader
     spec:
       serviceAccountName: redis-master-label
+      # The redis container below is forced to runAsUser 10001, but the
+      # redis:7-alpine image's own user is redis (uid 999), so the kubelet has no
+      # owner to give the redis-data emptyDir: without this pod-level fsGroup it
+      # creates /data owned by root:root with mode 0755, redis-server runs as
+      # uid 10001 and every background RDB save fails with EACCES, so the leader
+      # silently loses persistence. fsGroup 10001 gives the volume to that group
+      # and adds it to the container's supplementary groups, which is what makes
+      # the mount writable for the declared user. Keep it equal to the redis
+      # container's runAsUser/runAsGroup; the manifest test fails otherwise.
+      securityContext:
+        fsGroup: 10001
       containers:
       - name: redis
         image: redis:7-alpine
