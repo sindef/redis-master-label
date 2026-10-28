@@ -109,9 +109,18 @@ jobs:
       - name: Export Go modules graph
         run: go list -m -json -e all > /dev/null
 
+      # The schema series is declared, not whatever the validator release happens
+      # to bundle: kubeconform validates against its own default schema set when
+      # -kubernetes-version is absent, and that default drifts from the
+      # Kubernetes API this binary is compiled against (go.mod's k8s.io/api).
+      # 1.37.1 is kubeconformSchemaVersion in kubeconform_pin_test.go;
+      # TestKubeconformSchemaVersionMatchesKubernetesAPI fails the pull request
+      # when the declared value's MAJOR.MINOR differs from the k8s.io/api
+      # requirement, so a k8s.io/* bump and a schema bump have to land together.
       - name: Validate manifests
         run: |
           docker run --rm -v "$PWD":/workdir ghcr.io/yannh/kubeconform:v0.6.7 \
+            -kubernetes-version=1.37.1 \
             -strict -summary /workdir/manifests
 
       # The builder stage compiles the binary the published image runs, so its
