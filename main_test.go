@@ -1174,9 +1174,33 @@ func TestManifestSidecarsDeclareHealthProbes(t *testing.T) {
 		t.Fatalf("sidecar containers = %d, want the two example deployments", len(wiring))
 	}
 
+	// The livenessProbe is required of every labeler: it restarts a wedged
+	// labeler without changing pod readiness. A readinessProbe is only safe while
+	// the pod backs no Service, because pod readiness is the AND of every
+	// container's readiness. The leader pod is the only endpoint of the
+	// redis-leader Service, so its labeler must declare none; a 503 from
+	// /healthz there would remove that endpoint and stall every replica.
+	// TestManifestServiceBackedLabelerKeepsReadinessOutOfPodEndpoint asserts the
+	// same rule from the Service selectors, with the regression fixtures.
+	labelers, err := serviceBackedLabelers(manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backed := make(map[string]bool, len(labelers))
+	for _, labeler := range labelers {
+		backed[labeler.key()] = true
+	}
+
 	for _, h := range wiring {
-		if h.LivenessProbe == nil || h.ReadinessProbe == nil {
-			t.Errorf("%s/%s: want both a livenessProbe and a readinessProbe on %s (port %s)", h.Manifest, h.Name, healthPath, h.HealthPort)
+		if h.LivenessProbe == nil {
+			t.Errorf("%s/%s: want a livenessProbe on %s (port %s): without it a wedged labeler keeps Running with a stale label", h.Manifest, h.Name, healthPath, h.HealthPort)
+		}
+		if backed[h.Manifest+"/"+h.Name] {
+			if h.ReadinessProbe != nil {
+				t.Errorf("%s/%s: the pod backs a Service, so a readinessProbe makes a labeler 503 remove that Service's endpoints: drop it and keep the livenessProbe", h.Manifest, h.Name)
+			}
+		} else if h.ReadinessProbe == nil {
+			t.Errorf("%s/%s: want a readinessProbe on %s (port %s) while the pod backs no Service", h.Manifest, h.Name, healthPath, h.HealthPort)
 		}
 		if err := healthProbeProblem(h); err != nil {
 			t.Errorf("%s/%s: %v", h.Manifest, h.Name, err)

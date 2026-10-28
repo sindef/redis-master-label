@@ -127,12 +127,24 @@ spec:
         - --label-key=redis-role
         - --label-value=master
         - --check-interval=10s
-        # Same as deployment-example.yaml: the documented /healthz endpoint
-        # (main.go binds --health-port 8080) is polled by a liveness and a
-        # readiness probe, so a labeler whose Redis became unreachable is
-        # restarted instead of staying Running with a stale redis-role label.
+        # Unlike deployment-example.yaml, only a livenessProbe polls the
+        # documented /healthz endpoint (main.go binds --health-port 8080): a
+        # labeler whose Redis became unreachable, or whose health listener died,
+        # is restarted instead of staying Running with a stale redis-role label.
+        # There is deliberately NO readinessProbe here. Pod readiness is the AND
+        # of every container's readiness, and this pod is the only endpoint of
+        # the redis-leader Service that every replica replicates from
+        # (--replicaof redis-leader.default.svc.cluster.local in
+        # deployment-example.yaml). A labeler readinessProbe on /healthz answers
+        # 503 after three consecutive ROLE failures (main.go updateHealthStatus),
+        # which would mark the whole pod NotReady, remove the Service's only
+        # endpoint and stall all three replicas while redis-server is healthy.
+        # The livenessProbe below restarts a wedged labeler without gating
+        # readiness, so the master stays an endpoint. Tests:
         # TestManifestSidecarsDeclareHealthProbes fails when the health port is
-        # declared without a probe polling /healthz on it.
+        # declared without a probe polling /healthz on it, and
+        # TestManifestServiceBackedLabelerKeepsReadinessOutOfPodEndpoint fails
+        # when a readinessProbe is added back to this pod.
         # Same as deployment-example.yaml: a request gives the scheduler a size
         # to pack the pod by (Burstable, not BestEffort, so it is not evicted
         # first under node pressure) and the limit keeps the 10s poll loop from
@@ -156,12 +168,6 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 10
           failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /healthz
-            port: health
-          initialDelaySeconds: 5
-          periodSeconds: 10
         # Same as deployment-example.yaml: the labeler needs no privileges
         # (it only reads Redis and calls the Kubernetes API with its mounted
         # credentials), so it runs as the image's non-root uid, cannot write
