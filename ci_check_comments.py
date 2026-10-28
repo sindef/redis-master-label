@@ -9,7 +9,12 @@ with no arguments. A globbed set that comes back empty fails the check, so a
 renamed directory or a broken pattern cannot pass by scanning nothing.
 
 - Verify no GC-related token left over from an earlier tool appears in any
-  "run:" block.
+  "run:" step, whether it is a block scalar (`run: |` plus an indented block)
+  or an inline step (`run: go build ./...`). Both shapes are read because the
+  earlier scan required a newline straight after `run:`, so every inline step
+  was invisible: a leftover token moved onto the inline form stopped being
+  reported while every test stayed green. Comments, step names and other keys
+  outside a run step are not counted.
 - Verify every setup-go step declares go-version-file: go.mod and no other
   Go version source. The scan is version-agnostic because actions/setup-go
   majors move underneath (v5 -> v7) with no change in the guarded inputs,
@@ -77,6 +82,69 @@ GARBAGE_TOKENS = ("gc-strace", "gcDirty", "getExportsFile", "GC dirty pages")
 def line_indent(line):
     """Return the length of a line's leading whitespace run (spaces and tabs)."""
     return len(line) - len(line.lstrip(" \t"))
+
+
+# A step whose command is written on the `run:` line itself, with or without
+# the leading `- ` of the step list item. The reviewed defect: the earlier scan
+# was `run: \|?\n(?:[ \t]+...)*`, which needs a newline straight after `run:`,
+# so it matched block scalars only and every inline step escaped unreported.
+RUN_KEY = re.compile(r"^[ \t]*(?:-[ \t]+)?run:[ \t]*(.*)$")
+
+# A block scalar header carries no command of its own: `|`, `|-`, `>+`, `|2-`.
+BLOCK_SCALAR_HEADER = re.compile(r"^[|>][-+0-9]*$")
+
+
+def run_steps(text):
+    """Yield (line_number, command_text) for every `run:` step in a workflow.
+
+    Both step shapes are returned: an inline command (`run: go build ./...`,
+    including the `- run:` list-item form) and a block scalar whose command
+    lines are indented below the `run: |` header. A block ends at the first
+    content line at or above the `run:` key's indentation; blank lines inside
+    the block are part of it. Comment-only lines never open a step, so a
+    commented-out history note (`# gc-strace used to run here`) and a step's
+    `name:` are not scanned.
+    """
+    steps = []
+    lines = text.split("\n")
+    total = len(lines)
+    index = 0
+    while index < total:
+        line = lines[index]
+        index += 1
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = RUN_KEY.match(line)
+        if not match:
+            continue
+        line_number = index
+        value = match.group(1).strip()
+        header = value.split(" #", 1)[0].strip()
+        if header and not BLOCK_SCALAR_HEADER.match(header):
+            # Inline step: the command is this line's value.
+            steps.append((line_number, value))
+            continue
+        # Block scalar (or a bare `run:` with the command below it): read the
+        # indented body. Trailing blank lines are dropped; blanks between
+        # command lines are kept.
+        key_indent = line_indent(line)
+        body = []
+        pending_blank = 0
+        while index < total:
+            candidate = lines[index]
+            if not candidate.strip():
+                pending_blank += 1
+                index += 1
+                continue
+            if line_indent(candidate) <= key_indent:
+                break
+            body.extend([""] * pending_blank)
+            pending_blank = 0
+            body.append(candidate)
+            index += 1
+        steps.append((line_number, "\n".join(body)))
+    return steps
 
 
 def workflow_key_value(line):
@@ -181,11 +249,17 @@ def check_workflow(path, text):
                 + inputs
             )
 
-    # No GC inspection tokens in any run block.
-    for blob in re.findall(r"run: \|?\n((?:[ \t]+[^\n]*\n)*)", text):
+    # No GC inspection tokens in any run step, inline or block scalar. Both
+    # shapes are scanned because the earlier regex reached only block scalars,
+    # so a token moved onto an inline `run: <command>` step was silent.
+    for line_number, command in run_steps(text):
+        if not command:
+            continue
         for needle in GARBAGE_TOKENS:
-            if needle in blob:
-                messages.append("FAIL: gc-related step text: " + needle)
+            if needle in command:
+                messages.append(
+                    "FAIL: %s:%d gc-related step text: %s" % (path, line_number, needle)
+                )
     return messages
 
 
