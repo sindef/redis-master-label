@@ -133,9 +133,21 @@ The workflow's step summary reports the pushed digest plus the
 `docker buildx imagetools inspect` output for it.
 Nothing floating (`:latest`) is ever published.
 
+The tag is also not movable: after logging in and before `docker push`, the job
+asks the registry for the manifest `<image>:<tag>` already points at
+(`docker buildx imagetools inspect`) and fails when one exists. Re-running the
+workflow, or force-pushing the same tag after a build-file change, therefore
+cannot replace the digest the manifests pin — bump the version and tag that
+commit instead. Only the registry's "not found" answer lets the release
+continue; any other lookup error fails closed, so an auth or network failure
+cannot bypass the guard.
+
 `TestReleaseWorkflowBuildsImageOnce` fails the pull request when the release
 workflow builds the image a second time instead of pushing the build it
 verified, and when the tag push stops reporting the pushed digest.
+`TestReleaseWorkflowRefusesToOverwritePublishedTag` fails it when the
+already-published-tag guard is dropped, moved after the push, or no longer fails
+on an existing tag.
 
 Before anything is pushed, the release job runs the image it just built and
 inspects its metadata, making the same assertions CI makes on a pull request: the
