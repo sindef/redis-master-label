@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -78,6 +79,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	config = boundRestConfig(config)
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create Kubernetes client: %v\n", err)
@@ -121,12 +123,24 @@ func main() {
 		default:
 		}
 
-		// Update health status based on Redis connectivity
-		updateHealthStatus(ctx, rdb)
+		// Bound the whole iteration so a stalled Redis or Kubernetes API call
+		// turns /healthz into 503 instead of freezing the loop at a stale 200.
+		// Half the check interval leaves room for the sleep between iterations.
+		iterCtx, cancel := context.WithTimeout(ctx, backendTimeout())
 
-		if err := checkAndLabel(ctx, rdb, clientset); err != nil {
+		// Update health status based on Redis connectivity
+		updateHealthStatus(iterCtx, rdb)
+
+		if err := checkAndLabel(iterCtx, rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
+			// A label-phase timeout is recorded directly. Probing ROLE again
+			// could succeed a moment after the deadline and reset health to
+			// healthy while the backend is still stalled.
+			if isTimeoutError(err) {
+				recordHealthTimeout()
+			}
 		}
+		cancel()
 		time.Sleep(*checkInterval)
 	}
 }
@@ -162,8 +176,11 @@ func redisOptionsFromFlags() (*redis.Options, error) {
 	}
 
 	options := &redis.Options{
-		Addr:     *redisAddr,
-		Password: resolveRedisPassword(),
+		Addr:         *redisAddr,
+		Password:     resolveRedisPassword(),
+		DialTimeout:  backendTimeout(),
+		ReadTimeout:  backendTimeout(),
+		WriteTimeout: backendTimeout(),
 	}
 
 	if *redisTLS {
@@ -206,7 +223,7 @@ type roleQuerier interface {
 
 // checkAndLabel reads the Redis ROLE reply and applies or removes the label.
 func checkAndLabel(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
-	role, err := rdb.Do(ctx, "ROLE").Result()
+	role, err := queryRole(ctx, rdb)
 	if err != nil {
 		return fmt.Errorf("failed to execute ROLE command: %w", err)
 	}
@@ -320,21 +337,103 @@ func serveHealth(listener net.Listener) <-chan error {
 	return errCh
 }
 
-func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
-	_, err := rdb.Do(ctx, "ROLE").Result()
-	if err != nil {
-		healthStatus.mu.Lock()
-		healthStatus.consecutiveFailures++
-		if healthStatus.consecutiveFailures >= 3 {
-			healthStatus.isHealthy = false
-		}
-		healthStatus.mu.Unlock()
-		return
+// backendTimeout is the per-call budget for backend work. Half the check
+// interval keeps each bounded call inside one iteration and leaves room for
+// the sleep between iterations; 100ms is the floor for tiny intervals so a
+// healthy local Redis is not misreported.
+func backendTimeout() time.Duration {
+	timeout := *checkInterval / 2
+	if timeout < 100*time.Millisecond {
+		timeout = 100 * time.Millisecond
+	}
+	return timeout
+}
+
+// boundRestConfig sets a request timeout on the in-cluster client config.
+// rest.InClusterConfig leaves Timeout unset (no limit), so a half-open API
+// connection would otherwise block the poll loop forever.
+func boundRestConfig(config *rest.Config) *rest.Config {
+	config.Timeout = backendTimeout()
+	return config
+}
+
+// isTimeoutError reports whether err came from the iteration deadline or from
+// the Kubernetes client's own request timeout. Both mean the backend stalled,
+// rather than answering with a role.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// queryRole runs ROLE under ctx and races it against the deadline, so even a
+// client that ignores cancellation cannot block the health path.
+func queryRole(ctx context.Context, rdb roleQuerier) (interface{}, error) {
+	type roleResult struct {
+		role interface{}
+		err  error
 	}
 
-	// Success - reset failure counter and mark as healthy
+	done := make(chan roleResult, 1)
+	go func() {
+		role, err := rdb.Do(ctx, "ROLE").Result()
+		done <- roleResult{role: role, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.role, res.err
+	case <-ctx.Done():
+		// Prefer a reply that already arrived over the expired deadline.
+		select {
+		case res := <-done:
+			return res.role, res.err
+		default:
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func recordHealthFailure() {
+	healthStatus.mu.Lock()
+	healthStatus.consecutiveFailures++
+	if healthStatus.consecutiveFailures >= 3 {
+		healthStatus.isHealthy = false
+	}
+	healthStatus.mu.Unlock()
+}
+
+// recordHealthTimeout marks the labeler unhealthy on the first stalled
+// backend call: the deadline already proves the backend did not answer.
+func recordHealthTimeout() {
+	healthStatus.mu.Lock()
+	healthStatus.consecutiveFailures++
+	healthStatus.isHealthy = false
+	healthStatus.mu.Unlock()
+}
+
+func recordHealthSuccess() {
 	healthStatus.mu.Lock()
 	healthStatus.consecutiveFailures = 0
 	healthStatus.isHealthy = true
 	healthStatus.mu.Unlock()
+}
+
+func updateHealthStatus(ctx context.Context, rdb roleQuerier) {
+	_, err := queryRole(ctx, rdb)
+	if err != nil {
+		if isTimeoutError(err) {
+			recordHealthTimeout()
+			return
+		}
+		recordHealthFailure()
+		return
+	}
+
+	recordHealthSuccess()
 }
