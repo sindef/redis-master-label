@@ -85,6 +85,21 @@ shows it and `git add -A` cannot commit a dependency graph as if it were code;
 graph into the working tree without that `.gitignore` entry, or when the entry is
 dropped.
 
+The manifest gate is declared on both sides. CI validates `manifests/` with
+`ghcr.io/yannh/kubeconform:v0.6.7 -kubernetes-version=1.37.1 -strict`, so the
+Kubernetes schema series is a declared value (`kubeconformSchemaVersion` in
+`kubeconform_pin_test.go`) instead of whatever schema set that validator release
+bundles by default. Its MAJOR.MINOR must equal the `k8s.io/api` requirement in
+`go.mod` (`v0.37.1` is Kubernetes 1.37):
+`TestKubeconformSchemaVersionMatchesKubernetesAPI` fails the pull request when the
+two disagree, and `TestKubeconformWorkflowDeclaresSchemaVersion` fails when the
+workflow's `-kubernetes-version` flag is dropped or edited alone. A Dependabot
+bump of `k8s.io/*` and a schema bump therefore have to land together; landing
+either alone would validate the manifests against a schema older than the API the
+binary compiles against, so fields added since then would be reported as unknown
+under `-strict`, or a relaxed validator would pass manifests the newer API
+rejects.
+
 Note: running the binary outside a cluster is not supported. It builds its Kubernetes client exclusively from in-cluster config (`rest.InClusterConfig()`), so it exits with `failed to get in-cluster config` unless the environment provides the pod's service-account credentials (`KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, and the mounted service-account token). There is no kubeconfig fallback. Build locally to verify the code, then run the binary in-cluster via the manifests in `manifests/` (see "Kubernetes deployment" below).
 
 ## Container build
