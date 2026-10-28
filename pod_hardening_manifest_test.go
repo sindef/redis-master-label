@@ -29,7 +29,11 @@ import (
 // Localhost) seccompProfile at container or pod level. It also requires a
 // writable volume at /data once a redis container has a read-only root
 // filesystem, because redis-server writes its RDB snapshot there and the mount
-// is the difference between an admissible pod and one that CrashLoops.
+// is the difference between an admissible pod and one that CrashLoops. The
+// mount must also be writable by the uid the container is forced to run as: the
+// kubelet creates an emptyDir owned by root:root unless the pod declares
+// fsGroup, and redis:7-alpine's own user is uid 999, not the 10001 the example
+// pins.
 //
 // Both example manifests now declare the full restricted profile on every
 // container and the /data emptyDir the redis containers need.
@@ -94,13 +98,28 @@ type restrictedContainer struct {
 }
 
 // restrictedPod is one Deployment's pod template, reduced to the fields the
-// restricted standard decides on.
+// restricted standard decides on plus the pod-level user/group and fsGroup that
+// decide who may write a mounted emptyDir.
 type restrictedPod struct {
 	Manifest       string
 	Name           string
 	SeccompProfile *restrictedSeccompProfile
+	RunAsUser      *int64
+	RunAsGroup     *int64
+	FsGroup        *int64
 	Containers     []restrictedContainer
 	Volumes        []restrictedVolume
+}
+
+// restrictedPodSecurity is the pod-level securityContext subset these checks
+// read: the seccompProfile a container may inherit, the user and group the
+// kubelet applies to containers that declare none, and the fsGroup the kubelet
+// uses to change ownership of mounted volumes.
+type restrictedPodSecurity struct {
+	SeccompProfile *restrictedSeccompProfile `json:"seccompProfile"`
+	RunAsUser      *int64                    `json:"runAsUser"`
+	RunAsGroup     *int64                    `json:"runAsGroup"`
+	FsGroup        *int64                    `json:"fsGroup"`
 }
 
 // restrictedContainerSpec is one entry of a pod spec's `containers` or
@@ -121,12 +140,10 @@ type restrictedPodDocument struct {
 	Spec struct {
 		Template struct {
 			Spec struct {
-				SecurityContext *struct {
-					SeccompProfile *restrictedSeccompProfile `json:"seccompProfile"`
-				} `json:"securityContext"`
-				InitContainers []restrictedContainerSpec `json:"initContainers"`
-				Containers     []restrictedContainerSpec `json:"containers"`
-				Volumes        []restrictedVolume        `json:"volumes"`
+				SecurityContext *restrictedPodSecurity    `json:"securityContext"`
+				InitContainers  []restrictedContainerSpec `json:"initContainers"`
+				Containers      []restrictedContainerSpec `json:"containers"`
+				Volumes         []restrictedVolume        `json:"volumes"`
 			} `json:"spec"`
 		} `json:"template"`
 	} `json:"spec"`
@@ -174,6 +191,9 @@ func restrictedExamplePods(dir string) ([]restrictedPod, error) {
 		}
 		if sc := doc.Spec.Template.Spec.SecurityContext; sc != nil {
 			pod.SeccompProfile = sc.SeccompProfile
+			pod.RunAsUser = sc.RunAsUser
+			pod.RunAsGroup = sc.RunAsGroup
+			pod.FsGroup = sc.FsGroup
 		}
 		for _, list := range []struct {
 			init       bool
@@ -272,6 +292,25 @@ func isRedisServerContainer(c restrictedContainer) bool {
 	return strings.Contains(c.Image, "redis:")
 }
 
+// effectiveUserID returns the uid a container runs as: the container-level
+// runAsUser wins over the pod-level one, which is how the kubelet resolves it.
+// nil means the manifest does not say and the image's own user applies.
+func effectiveUserID(c restrictedContainer, pod restrictedPod) *int64 {
+	if c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil {
+		return c.SecurityContext.RunAsUser
+	}
+	return pod.RunAsUser
+}
+
+// effectiveGroupID returns the gid a container runs as, resolved the same way as
+// effectiveUserID.
+func effectiveGroupID(c restrictedContainer, pod restrictedPod) *int64 {
+	if c.SecurityContext != nil && c.SecurityContext.RunAsGroup != nil {
+		return c.SecurityContext.RunAsGroup
+	}
+	return pod.RunAsGroup
+}
+
 // redisSnapshotStorageProblem returns why a redis container cannot persist its
 // snapshot despite a read-only root filesystem, or nil when it can. redis-server
 // writes under /data, so readOnlyRootFilesystem: true must be paired with a
@@ -279,7 +318,16 @@ func isRedisServerContainer(c restrictedContainer) bool {
 // filesystem error and the pod that the hardening block made admissible
 // CrashLoops. A container whose root filesystem is still writable needs no
 // mount, so this rule only bites once the hardening is in place.
-func redisSnapshotStorageProblem(c restrictedContainer, volumes []restrictedVolume) error {
+//
+// A mount alone is not writability. The kubelet creates an emptyDir owned by
+// root:root with mode 0755 unless the pod declares securityContext.fsGroup, so a
+// redis container forced to runAsUser 10001 cannot write even though the mount
+// exists: redis:7-alpine runs its own redis user (uid 999), so the declared uid
+// was never the mount's owner and the background RDB save failed with EACCES.
+// An fsGroup equal to the declared user (or its group) makes the kubelet give
+// the volume to that group and add it to the container's supplementary groups,
+// which is the only writability the manifest can prove.
+func redisSnapshotStorageProblem(c restrictedContainer, pod restrictedPod) error {
 	if !isRedisServerContainer(c) {
 		return nil
 	}
@@ -300,12 +348,39 @@ func redisSnapshotStorageProblem(c restrictedContainer, volumes []restrictedVolu
 	if mount.ReadOnly {
 		return fmt.Errorf("%s: the %s volumeMount is read-only, but redis-server writes its snapshot there: remove readOnly: true from the mount", where, redisSnapshotDir)
 	}
-	for _, volume := range volumes {
+	declared := false
+	for _, volume := range pod.Volumes {
 		if volume.Name == mount.Name {
-			return nil
+			declared = true
+			break
 		}
 	}
-	return fmt.Errorf("%s: volumeMount %q at %s names no volume in the pod spec: declare the volume (an emptyDir for a demo, a PersistentVolumeClaim for durable data) or the pod fails to be admitted", where, mount.Name, redisSnapshotDir)
+	if !declared {
+		return fmt.Errorf("%s: volumeMount %q at %s names no volume in the pod spec: declare the volume (an emptyDir for a demo, a PersistentVolumeClaim for durable data) or the pod fails to be admitted", where, mount.Name, redisSnapshotDir)
+	}
+
+	uid, gid := effectiveUserID(c, pod), effectiveGroupID(c, pod)
+	if uid != nil && *uid == 0 {
+		return nil
+	}
+	if pod.FsGroup != nil && ((uid != nil && *uid == *pod.FsGroup) || (gid != nil && *gid == *pod.FsGroup)) {
+		return nil
+	}
+	if uid == nil && gid == nil {
+		return fmt.Errorf("%s: declares no runAsUser/runAsGroup and its pod declares neither, so the check cannot prove %s is writable by the user redis-server runs as: declare the uid and a pod-level securityContext.fsGroup equal to it", where, redisSnapshotDir)
+	}
+	suggest := uid
+	if suggest == nil {
+		suggest = gid
+	}
+	runAs := "runs with no declared uid"
+	if uid != nil {
+		runAs = fmt.Sprintf("runs as uid %d", *uid)
+	}
+	if gid != nil {
+		runAs += fmt.Sprintf(" and gid %d", *gid)
+	}
+	return fmt.Errorf("%s: %s, but the pod declares no securityContext.fsGroup equal to that user or group, so the kubelet creates the %s emptyDir owned by root:root with mode 0755 and redis-server cannot write its RDB snapshot (the redis:7-alpine image's own user is redis, uid 999, so runAsUser alone does not make the mount writable): declare spec.securityContext.fsGroup: %d, or run the container as the image's own uid", where, runAs, redisSnapshotDir, *suggest)
 }
 
 // knownUnhardenedContainers records the example containers that still do not
@@ -387,7 +462,9 @@ func TestExampleManifestsEveryContainerMeetsRestrictedStandard(t *testing.T) {
 
 // Both redis containers keep a writable mount for their snapshots once their
 // root filesystem is read-only, so the hardening the standard requires does not
-// stop redis-server from writing its RDB file.
+// stop redis-server from writing its RDB file. The mount must also be writable
+// by the declared uid: a mount that the kubelet leaves owned by root:root is
+// present but useless to a container forced to runAsUser 10001.
 func TestExampleManifestsMountWritableRedisData(t *testing.T) {
 	pods, err := restrictedExamplePods(manifestDir)
 	if err != nil {
@@ -400,7 +477,7 @@ func TestExampleManifestsMountWritableRedisData(t *testing.T) {
 				continue
 			}
 			redisContainers++
-			if problem := redisSnapshotStorageProblem(c, pod.Volumes); problem != nil {
+			if problem := redisSnapshotStorageProblem(c, pod); problem != nil {
 				t.Errorf("%s", problem)
 			}
 		}
@@ -642,7 +719,9 @@ func TestKnownUnhardenedBaseline_RegressionFixtures(t *testing.T) {
 }
 
 // redisSnapshotStorageProblem decides whether a read-only redis container can
-// still write its RDB file.
+// still write its RDB file. A mount is not enough: the kubelet leaves the
+// emptyDir owned by root:root unless the pod declares fsGroup, and the reviewed
+// manifests forced uid 10001 while the redis image's own user is uid 999.
 func TestRedisSnapshotStorageProblem_RegressionFixtures(t *testing.T) {
 	const manifest, pod = "deployment-example.yaml", "redis-with-labeler"
 	writableRoot := func() restrictedContainer {
@@ -657,47 +736,108 @@ func TestRedisSnapshotStorageProblem_RegressionFixtures(t *testing.T) {
 		c.VolumeMounts = []restrictedVolumeMount{mount}
 		return c
 	}
+	snapshotMount := restrictedVolumeMount{Name: "redis-data", MountPath: redisSnapshotDir}
+	// podWith returns a pod that declares the redis-data volume and the given
+	// pod-level fsGroup; nil leaves fsGroup undeclared, the reviewed pre-fix
+	// shape.
+	podWith := func(fsGroup *int64) restrictedPod {
+		return restrictedPod{
+			Manifest: manifest,
+			Name:     pod,
+			Volumes:  []restrictedVolume{{Name: "redis-data"}},
+			FsGroup:  fsGroup,
+		}
+	}
+	podLevelUser := podWith(restrictedInt64Ptr(10001))
+	podLevelUser.RunAsUser = restrictedInt64Ptr(10001)
+	podLevelUser.RunAsGroup = restrictedInt64Ptr(10001)
+	withoutUser := func(c restrictedContainer) restrictedContainer {
+		c.SecurityContext.RunAsUser = nil
+		c.SecurityContext.RunAsGroup = nil
+		return c
+	}
 
 	tests := []struct {
 		name        string
 		container   restrictedContainer
-		volumes     []restrictedVolume
+		pod         restrictedPod
 		wantProblem string
 	}{
 		{
 			name:      "writable root filesystem needs no mount",
 			container: writableRoot(),
+			pod:       podWith(nil),
 		},
 		{
 			name:        "read-only root filesystem without a mount",
 			container:   readOnlyRoot(),
+			pod:         podWith(nil),
 			wantProblem: "no volumeMount at /data",
 		},
 		{
 			name:        "read-only snapshot mount",
 			container:   withMount(readOnlyRoot(), restrictedVolumeMount{Name: "redis-data", MountPath: redisSnapshotDir, ReadOnly: true}),
-			volumes:     []restrictedVolume{{Name: "redis-data"}},
+			pod:         podWith(restrictedInt64Ptr(10001)),
 			wantProblem: "is read-only",
 		},
 		{
 			name:        "mount without a volume",
-			container:   withMount(readOnlyRoot(), restrictedVolumeMount{Name: "redis-data", MountPath: redisSnapshotDir}),
+			container:   withMount(readOnlyRoot(), snapshotMount),
+			pod:         restrictedPod{Manifest: manifest, Name: pod, FsGroup: restrictedInt64Ptr(10001)},
 			wantProblem: "names no volume in the pod spec",
 		},
 		{
 			name:      "writable mount backed by an emptyDir",
-			container: withMount(readOnlyRoot(), restrictedVolumeMount{Name: "redis-data", MountPath: redisSnapshotDir}),
-			volumes:   []restrictedVolume{{Name: "redis-data"}},
+			container: withMount(readOnlyRoot(), snapshotMount),
+			pod:       podWith(restrictedInt64Ptr(10001)),
+		},
+		{
+			name:      "writable mount with a matching pod fsGroup",
+			container: withMount(readOnlyRoot(), snapshotMount),
+			pod:       podWith(restrictedInt64Ptr(10001)),
+		},
+		{
+			name: "writable mount with a pod fsGroup matching a different gid",
+			container: func() restrictedContainer {
+				c := withMount(readOnlyRoot(), snapshotMount)
+				c.SecurityContext.RunAsGroup = restrictedInt64Ptr(2000)
+				return c
+			}(),
+			pod: podWith(restrictedInt64Ptr(2000)),
+		},
+		{
+			name:      "pod-level runAsUser with a matching fsGroup",
+			container: withMount(withoutUser(readOnlyRoot()), snapshotMount),
+			pod:       podLevelUser,
+		},
+		{
+			name:        "mount present but the pod declares no fsGroup",
+			container:   withMount(readOnlyRoot(), snapshotMount),
+			pod:         podWith(nil),
+			wantProblem: "no securityContext.fsGroup equal to that user or group",
+		},
+		{
+			name:        "fsGroup names another group",
+			container:   withMount(readOnlyRoot(), snapshotMount),
+			pod:         podWith(restrictedInt64Ptr(999)),
+			wantProblem: "redis-server cannot write its RDB snapshot",
+		},
+		{
+			name:        "no declared uid to match an fsGroup against",
+			container:   withMount(withoutUser(readOnlyRoot()), snapshotMount),
+			pod:         podWith(restrictedInt64Ptr(10001)),
+			wantProblem: "declares no runAsUser/runAsGroup",
 		},
 		{
 			name:      "the labeler does not snapshot",
 			container: restrictedFixtureContainer(manifest, pod, "redis-master-label", "ghcr.io/redis-master-label/redis-master-label:v0.1.0"),
+			pod:       podWith(nil),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := redisSnapshotStorageProblem(tt.container, tt.volumes)
+			err := redisSnapshotStorageProblem(tt.container, tt.pod)
 			if tt.wantProblem == "" {
 				if err != nil {
 					t.Fatalf("problem = %v, want none", err)
