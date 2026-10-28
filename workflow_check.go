@@ -789,6 +789,126 @@ func releaseSingleBuildProblemsIn(path, text string) ([]string, int) {
 	return problems, len(buildLines)
 }
 
+// Release immutable-tag check: a published `vX.Y.Z` tag is the reference the
+// manifests pin, so publishing it twice replaces the digest pods pull while
+// every test stays green. The reviewed shape: release.yml rebuilt and pushed
+// `<image>:${GITHUB_REF_NAME}` unconditionally, so a re-run of the workflow - or
+// a force-push of the same tag after a build-file change - silently moved the
+// tag to a different image, and nothing recorded that the reference had changed.
+// The README and the workflow header claimed the tag was immutable; only a
+// pre-push registry lookup makes that true. The release path must therefore read
+// the manifest the tag currently points at (`docker buildx imagetools inspect`
+// or `docker manifest inspect`) and fail when one exists, before the push. No
+// compiler sees a workflow file, so the check lives here (main_test.go:
+// TestReleaseWorkflowRefusesToOverwritePublishedTag).
+
+const (
+	// dockerImagetoolsInspectCommand reads a manifest from the registry without
+	// building or pulling an image.
+	dockerImagetoolsInspectCommand = "docker buildx imagetools inspect"
+
+	// dockerManifestInspectCommand is the classic Docker CLI form of the same
+	// registry lookup.
+	dockerManifestInspectCommand = "docker manifest inspect"
+
+	// releaseTagAbsentMarker is the registry answer that may be accepted: a
+	// guard that does not name the absent outcome cannot tell "no manifest yet"
+	// from "the lookup failed", so it would refuse every first release or
+	// publish over an existing one.
+	releaseTagAbsentMarker = "not found"
+)
+
+// stepRefusesExistingTag reports whether a step looks up the tag's manifest in
+// the registry and fails the run when the tag is already published. The step
+// must name one of the registry lookup commands, fail with `exit 1`, and accept
+// the absent-tag answer: an inspect without a failure branch records nothing,
+// and an `exit 1` without the absent marker would block the first release too.
+// Comment lines are skipped, so a commented-out guard is not a guard.
+func stepRefusesExistingTag(body string) bool {
+	text := executableStepText(body)
+	inspects := strings.Contains(text, dockerImagetoolsInspectCommand) ||
+		strings.Contains(text, dockerManifestInspectCommand)
+	return inspects &&
+		strings.Contains(text, releaseTagAbsentMarker) &&
+		strings.Contains(text, "exit 1")
+}
+
+// releaseTagOverwriteProblems returns one message per release-triggering
+// workflow under dir that publishes an image without first refusing a tag the
+// registry already holds, plus the number of such workflows that publish
+// anything, so a caller can tell "no problems" apart from "no publish step
+// found, so nothing was checked".
+func releaseTagOverwriteProblems(dir string) ([]string, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var problems []string
+	publishing := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if ext := filepath.Ext(entry.Name()); ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		found, publishes := releaseTagOverwriteProblemsIn(path, string(data))
+		problems = append(problems, found...)
+		if publishes {
+			publishing++
+		}
+	}
+	sort.Strings(problems)
+	return problems, publishing, nil
+}
+
+// releaseTagOverwriteProblemsIn scans one workflow's text. A workflow that
+// never triggers on release tags, or never publishes an image, is not flagged:
+// it cannot move a published tag.
+func releaseTagOverwriteProblemsIn(path, text string) ([]string, bool) {
+	if !triggersOnReleaseTag(text) {
+		return nil, false
+	}
+
+	steps := workflowSteps(text)
+	pushLine := 0
+	for _, step := range steps {
+		if stepPushesImage(step.body) {
+			pushLine = step.line
+			break
+		}
+	}
+	if pushLine == 0 {
+		return nil, false
+	}
+
+	guardLine := 0
+	for _, step := range steps {
+		if guardLine == 0 && stepRefusesExistingTag(step.body) {
+			guardLine = step.line
+		}
+	}
+
+	var problems []string
+	switch {
+	case guardLine == 0:
+		problems = append(problems, fmt.Sprintf(
+			"%s: triggers on release tags (%s) and publishes the image at line %d without first reading the tag's existing manifest (`%s` or `%s`) and failing when it exists, so re-running the workflow or force-pushing the same tag silently replaces the digest the manifests pin",
+			path, releaseTagTrigger, pushLine, dockerImagetoolsInspectCommand, dockerManifestInspectCommand))
+	case guardLine > pushLine:
+		problems = append(problems, fmt.Sprintf(
+			"%s:%d: the already-published-tag guard runs after the image is pushed at line %d, so the published digest is replaced before the tag is checked",
+			path, guardLine, pushLine))
+	}
+	return problems, true
+}
+
 // Module-graph status check: GitHub keys a required status check on the name of
 // the job that reported it, not on the steps that did the work. Branch
 // protection on this repository requires the `update-go_modules-graph` check, so
