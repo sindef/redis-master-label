@@ -229,14 +229,16 @@ func TestMainWiresStartupValidationAndPollLoop(t *testing.T) {
 		{"POD_NAMESPACE defaulting", `*podNamespace = os.Getenv("POD_NAMESPACE")`},
 		{"namespace falls back to default", `*podNamespace = "default"`},
 		{"in-cluster config built", "rest.InClusterConfig()"},
+		{"Kubernetes client request timeout bound", "boundRestConfig(config)"},
 		{"Kubernetes client built", "kubernetes.NewForConfig(config)"},
 		{"Redis options built from flags", "redisOptionsFromFlags()"},
 		{"Redis client built", "redis.NewClient(redisOptions)"},
 		{"health server bound before the loop", "startHealthServer(*healthPort)"},
 		{"poll loop entered", "for {"},
 		{"health server death surfaced in the loop", "case err := <-errCh:"},
-		{"health updated each iteration", "updateHealthStatus(ctx, rdb)"},
-		{"role checked and label applied each iteration", "checkAndLabel(ctx, rdb, clientset)"},
+		{"iteration deadline before the health and label calls", "context.WithTimeout(ctx, backendTimeout())"},
+		{"health updated each iteration", "updateHealthStatus(iterCtx, rdb)"},
+		{"role checked and label applied each iteration", "checkAndLabel(iterCtx, rdb, clientset)"},
 		{"iteration sleeps for the check interval", "time.Sleep(*checkInterval)"},
 	}
 
