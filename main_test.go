@@ -3158,6 +3158,146 @@ func TestReleaseSingleBuildProblems_RegressionFixtures(t *testing.T) {
 // them while the required context stops reporting, and every pull request then
 // waits on a check that can no longer arrive (the reviewed conflict: the job was
 // gone from .github/workflows/ci.yml while the check was still required).
+// The reviewed release_hygiene finding: release.yml's only pre-publish gates
+// compared the tag with the pin and with main, then pushed
+// `<image>:${GITHUB_REF_NAME}` unconditionally. A re-run of the workflow, or a
+// force-push of the same tag after a build-file change, rebuilt and republished
+// under the same tag and replaced the digest manifests pin, with no error and
+// no record. The workflow must ask the registry for the manifest the tag
+// currently points at and refuse a tag it already holds, before the push.
+func TestReleaseWorkflowRefusesToOverwritePublishedTag(t *testing.T) {
+	problems, publishing, err := releaseTagOverwriteProblems(ciWorkflowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publishing != 1 {
+		t.Fatalf("release workflows in %s that publish an image = %d, want exactly 1: the immutable-tag guard has nothing to protect otherwise", ciWorkflowDir, publishing)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s", problem)
+	}
+}
+
+// The fixture step the immutable-tag scan reads: a registry manifest lookup the
+// release refuses to publish over, accepting only the absent-tag answer.
+const releaseFixtureExistingTagGuard = "      - name: Refuse to overwrite an already-published tag\n" +
+	"        shell: bash\n" +
+	"        run: |\n" +
+	"          image=\"example:${GITHUB_REF_NAME}\"\n" +
+	"          if output=$(docker buildx imagetools inspect \"$image\" 2>&1); then\n" +
+	"            echo \"$image already exists\" >&2\n" +
+	"            exit 1\n" +
+	"          fi\n" +
+	"          case \"$output\" in\n" +
+	"            *\"not found\"*) echo \"$image is not published yet\" ;;\n" +
+	"            *) echo \"cannot tell whether $image exists\" >&2; exit 1 ;;\n" +
+	"          esac\n"
+
+// The failure modes the immutable-tag scan has to see: the reviewed shape with
+// no registry lookup at all, a guard moved after the push, a guard that exists
+// only as a comment, one that inspects the tag but never fails when it exists,
+// and one that cannot tell an absent tag from a failed lookup. The ordered
+// guard must pass, and a workflow that publishes nothing on a tag push is not
+// flagged.
+func TestReleaseTagOverwriteProblems_RegressionFixtures(t *testing.T) {
+	commentedGuard := "      - name: Refuse to overwrite an already-published tag\n" +
+		"        # docker buildx imagetools inspect \"$image\" && exit 1\n"
+	neverFails := "      - name: Show the existing tag\n" +
+		"        run: |\n" +
+		"          docker buildx imagetools inspect \"example:${GITHUB_REF_NAME}\"\n" +
+		"          echo \"not found is the only acceptable answer\"\n"
+	rejectsAbsent := "      - name: Refuse to overwrite an already-published tag\n" +
+		"        shell: bash\n" +
+		"        run: |\n" +
+		"          docker buildx imagetools inspect \"example:${GITHUB_REF_NAME}\" || exit 1\n"
+
+	tests := []struct {
+		name        string
+		workflow    string
+		wantPublish int
+		wantProblem string
+	}{
+		{
+			name:        "registry lookup refuses an existing tag before the push",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixtureExistingTagGuard, releaseFixturePush),
+			wantPublish: 1,
+		},
+		{
+			name:        "reviewed pre-fix shape: tag pushed without a registry lookup",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixturePush),
+			wantPublish: 1,
+			wantProblem: dockerImagetoolsInspectCommand,
+		},
+		{
+			name:        "guard moved after the push",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixturePush, releaseFixtureExistingTagGuard),
+			wantPublish: 1,
+			wantProblem: "after the image is pushed",
+		},
+		{
+			name:        "guard present only as a comment",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, commentedGuard, releaseFixturePush),
+			wantPublish: 1,
+			wantProblem: dockerImagetoolsInspectCommand,
+		},
+		{
+			name:        "lookup that never fails when the tag exists",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, neverFails, releaseFixturePush),
+			wantPublish: 1,
+			wantProblem: dockerImagetoolsInspectCommand,
+		},
+		{
+			name:        "guard that cannot accept an absent tag",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, rejectsAbsent, releaseFixturePush),
+			wantPublish: 1,
+			wantProblem: dockerImagetoolsInspectCommand,
+		},
+		{
+			name:        "release-triggering workflow that publishes nothing",
+			workflow:    releaseWorkflowFixture("fetch-depth: 0", releaseFixtureBuild, releaseFixtureExistingTagGuard),
+			wantPublish: 0,
+		},
+		{
+			name:        "no release tag trigger",
+			workflow:    "name: CI\non:\n  pull_request:\n\njobs:\n  go:\n    runs-on: ubuntu-latest\n    steps:\n" + releaseFixtureBuild + releaseFixturePush,
+			wantPublish: 0,
+		},
+	}
+
+	// Each case writes the fixture into its own workflow directory, so the scan
+	// reads exactly the shape under test.
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "release.yml"), []byte(tt.workflow), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			problems, publishing, err := releaseTagOverwriteProblems(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if publishing != tt.wantPublish {
+				t.Fatalf("publishing release workflows = %d, want %d (problems: %v)", publishing, tt.wantPublish, problems)
+			}
+			joined := strings.Join(problems, "\n")
+			if tt.wantProblem == "" {
+				if len(problems) != 0 {
+					t.Fatalf("problems = %v, want none", problems)
+				}
+				return
+			}
+			if !strings.Contains(joined, tt.wantProblem) {
+				t.Fatalf("problems = %v, want one naming %q", problems, tt.wantProblem)
+			}
+		})
+	}
+
+	if _, _, err := releaseTagOverwriteProblems(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("missing workflow directory accepted, want a read error")
+	}
+}
+
 func TestWorkflowsReportModuleGraphCheck(t *testing.T) {
 	problems, jobs, err := moduleGraphJobProblems(ciWorkflowDir)
 	if err != nil {

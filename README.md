@@ -133,9 +133,21 @@ The workflow's step summary reports the pushed digest plus the
 `docker buildx imagetools inspect` output for it.
 Nothing floating (`:latest`) is ever published.
 
+The tag is also not movable: after logging in and before `docker push`, the job
+asks the registry for the manifest `<image>:<tag>` already points at
+(`docker buildx imagetools inspect`) and fails when one exists. Re-running the
+workflow, or force-pushing the same tag after a build-file change, therefore
+cannot replace the digest the manifests pin — bump the version and tag that
+commit instead. Only the registry's "not found" answer lets the release
+continue; any other lookup error fails closed, so an auth or network failure
+cannot bypass the guard.
+
 `TestReleaseWorkflowBuildsImageOnce` fails the pull request when the release
 workflow builds the image a second time instead of pushing the build it
 verified, and when the tag push stops reporting the pushed digest.
+`TestReleaseWorkflowRefusesToOverwritePublishedTag` fails it when the
+already-published-tag guard is dropped, moved after the push, or no longer fails
+on an existing tag.
 
 Before anything is pushed, the release job runs the image it just built and
 inspects its metadata, making the same assertions CI makes on a pull request: the
@@ -301,21 +313,40 @@ volumeMounts:
 - name: redis-data
   mountPath: /data
 # pod spec
+securityContext:
+  fsGroup: 10001
 volumes:
 - name: redis-data
   emptyDir: {}
 ```
+The `fsGroup` is not decoration: the kubelet creates an `emptyDir` owned by
+`root:root` with mode `0755` unless the pod declares one, so a container forced
+to `runAsUser: 10001` cannot write `/data` even though the mount exists. That is
+the bug the example used to ship — `redis:7-alpine` starts Redis under its own
+`redis` user (uid 999), not 10001, so the declared uid owned nothing in the
+emptyDir, every background RDB save failed with `EACCES`, and the leader kept
+answering reads while silently losing persistence. `fsGroup: 10001` makes the
+kubelet give the volume to that group and add it to the container's
+supplementary groups, which is what makes the mount writable for the declared
+user. Keep the value equal to the `redis` container's `runAsUser` (or its
+`runAsGroup`); `TestRedisSnapshotStorageProblem_RegressionFixtures` covers a
+missing and a mismatched `fsGroup`.
+
 Swap the `emptyDir` for a PersistentVolumeClaim if the data must survive a pod
-restart. Declare your own `runAsUser`/`runAsGroup` if the image you use starts
-Redis under a different uid.
+restart. Declare your own `runAsUser`/`runAsGroup` **and a matching `fsGroup`**
+if the image you use starts Redis under a different uid, or the same permission
+failure comes back under a different number.
 
 `TestExampleManifestsEveryContainerMeetsRestrictedStandard` reads every
 Deployment under `manifests/` and asserts the restricted fields on **every**
-container of every pod, plus a writable `/data` mount for a Redis container with
-a read-only root filesystem. It no longer filters by the sidecar image (the
-earlier `TestManifestSidecarsRunUnprivileged` did, which is how the `redis`
-container could stay unhardened while the suite stayed green), and kubeconform
-only checks the schema, where `securityContext` is optional.
+container of every pod, and
+`TestExampleManifestsMountWritableRedisData` asserts a `/data` mount that the
+declared uid can actually write to (a non-read-only mount backed by a declared
+volume, with a pod-level `fsGroup` equal to that uid or its group). Neither
+filters by the sidecar image (the earlier `TestManifestSidecarsRunUnprivileged`
+did, which is how the `redis` container could stay unhardened while the suite
+stayed green), and kubeconform only checks the schema, where `securityContext`
+and `fsGroup` are optional.
 
 The uid matches the image: the final Dockerfile stage creates the
 `labeler` account (uid/gid 10001) and
