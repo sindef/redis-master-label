@@ -14,6 +14,15 @@ spec:
         app: redis
     spec:
       serviceAccountName: redis-master-label
+      # Same as redis-leader.yaml: the redis container below runs as uid 10001,
+      # while the redis:7-alpine image's own user is redis (uid 999), so the
+      # kubelet creates the redis-data emptyDir owned by root:root with mode 0755
+      # unless the pod names an fsGroup. fsGroup 10001 gives the volume to that
+      # group and adds it to the container's supplementary groups, so
+      # redis-server can write its RDB snapshot. Keep it equal to the redis
+      # container's runAsUser/runAsGroup; the manifest test fails otherwise.
+      securityContext:
+        fsGroup: 10001
       containers:
       - name: redis
         image: redis:7-alpine
