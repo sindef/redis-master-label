@@ -253,7 +253,11 @@ Key points for the deployment:
 - Inject Redis connection info via args (address, TLS) and the credential via the `REDIS_PASSWORD` env var from a Secret (see "Example usage in a pod").
 - Ensure the pod has RBAC to `get`/`update` its own Pod object (see provided Role/RoleBinding).
 - Run alongside your Redis container (as sidecar) or as a dedicated pod that points to the Redis service.
-- Expose the health port the labeler is told to listen on and poll `/healthz` from a liveness and a readiness probe (see "Health Check Endpoint"); both example deployments do.
+- Expose the health port the labeler is told to listen on and poll `/healthz`
+  from a liveness probe (see "Health Check Endpoint"); both example deployments
+  do. Add a readiness probe only when the pod backs no Service: the leader pod
+  is the only endpoint of the `redis-leader` Service the replicas replicate
+  from, so its labeler keeps the liveness probe alone.
 - Size every container with `resources.requests` and `resources.limits` (see
   "Resource sizing" below); both example deployments do, so their pods are
   `Burstable` instead of `BestEffort`.
@@ -431,7 +435,7 @@ curl http://localhost:8080/healthz
 Both example deployments wire that endpoint into the kubelet. The
 `redis-master-label` container in `manifests/deployment-example.yaml` and
 `manifests/redis-leader.yaml` declares `containerPort: 8080` (named `health`)
-and polls it with a `livenessProbe` and a `readinessProbe`:
+and a `livenessProbe` that polls it:
 
 ```yaml
 ports:
@@ -443,24 +447,38 @@ livenessProbe:
     port: health
   periodSeconds: 10
   failureThreshold: 3
-readinessProbe:
-  httpGet:
-    path: /healthz
-    port: health
-  periodSeconds: 10
 ```
 
 The liveness probe restarts the labeler after three failing polls, so a sidecar
 whose Redis became unreachable — or whose health listener died — is restarted
-instead of sitting `Running` with a stale `redis-role` label; the readiness
-probe takes the pod out of Service endpoints while the endpoint answers 503.
+instead of sitting `Running` with a stale `redis-role` label.
+
+The `redis-with-labeler` replicas in `manifests/deployment-example.yaml` also
+declare a `readinessProbe` on the same path and port. The leader's labeler in
+`manifests/redis-leader.yaml` deliberately declares only the liveness probe.
+Pod readiness is the AND of every container's readiness, and
+`manifests/redis-leader-service.yaml` selects that leader pod, which is the only
+endpoint of the Service every replica replicates from (`--replicaof
+redis-leader.default.svc.cluster.local 6379` in `deployment-example.yaml`). A
+readiness probe there answers 503 after three consecutive `ROLE` failures, so a
+transient labeler-side Redis hiccup would mark the whole pod `NotReady`, remove
+that sole endpoint and stall all three replicas even though `redis-server` is
+healthy. Keep the liveness probe beside a Service endpoint and no readiness
+probe; a labeler readiness probe is only safe in a pod no Service selects.
+
 Declaring the port alone changes nothing: only a probe makes the kubelet poll
 the endpoint, so `TestManifestSidecarsDeclareHealthProbes` fails the build when
-a labeler container serves `/healthz` on `--health-port` without a probe
-targeting that path and port (or without the matching `containerPort` entry).
-kubeconform only validates the manifest schema and never asks whether anything
-polls the port, which is how the wiring went missing. If you change
-`--health-port`, move the `containerPort` entry and both probe ports with it.
+a labeler container serves `/healthz` on `--health-port` without a liveness
+probe targeting that path and port (or without the matching `containerPort`
+entry).
+`TestManifestServiceBackedLabelerKeepsReadinessOutOfPodEndpoint` reads the
+Service selectors and the Deployment pod labels and fails when a labeler in a
+Service-backed pod declares a readiness probe (the reviewed defect) or loses its
+liveness probe, so the leader's Redis availability cannot be made to depend on
+the labeler again. kubeconform only validates the manifest schema and never
+asks whether anything polls the port or which container's readiness gates an
+endpoint. If you change `--health-port`, move the `containerPort` entry and the
+probe ports with it.
 
 ## Operational notes
 - Labels are applied when the instance is `master` and removed when it's no longer master.
