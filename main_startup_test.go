@@ -236,9 +236,7 @@ func TestMainWiresStartupValidationAndPollLoop(t *testing.T) {
 		{"health server bound before the loop", "startHealthServer(*healthPort)"},
 		{"poll loop entered", "for {"},
 		{"health server death surfaced in the loop", "case err := <-errCh:"},
-		{"iteration deadline before the health and label calls", "context.WithTimeout(ctx, backendTimeout())"},
-		{"health updated each iteration", "updateHealthStatus(iterCtx, rdb)"},
-		{"role checked and label applied each iteration", "checkAndLabel(iterCtx, rdb, clientset)"},
+		{"bounded poll iteration run each loop", "runPollIteration(ctx, rdb, clientset)"},
 		{"iteration sleeps for the check interval", "time.Sleep(*checkInterval)"},
 	}
 
@@ -281,12 +279,48 @@ func TestMainWiresStartupValidationAndPollLoop(t *testing.T) {
 			t.Errorf("main() no longer exits on %s: the branch between %q and %q has no os.Exit(1)", check.name, check.from, check.until)
 		}
 	}
+
+	// The bounded iteration's own ordering moved into runPollIteration, which
+	// main() calls. Pin it there too, so the deadline cannot drift after the
+	// health/label calls or the timeout classification be dropped while main()
+	// still looks correctly wired.
+	iteration := functionSource(t, "runPollIteration")
+	iterationOrdered := []struct {
+		name string
+		text string
+	}{
+		{"iteration deadline before the health and label calls", "context.WithTimeout(ctx, backendTimeout())"},
+		{"health updated each iteration", "updateHealthStatus(iterCtx, rdb)"},
+		{"role checked and label applied each iteration", "checkAndLabel(iterCtx, rdb, clientset)"},
+		{"label-phase timeout classified", "isTimeoutError(err)"},
+		{"timeout recorded as unhealthy without another probe", "recordHealthTimeout()"},
+	}
+	previous = -1
+	for _, step := range iterationOrdered {
+		index := strings.Index(iteration, step.text)
+		if index < 0 {
+			t.Errorf("runPollIteration() no longer contains %s: %q is missing", step.name, step.text)
+			continue
+		}
+		if index < previous {
+			t.Errorf("runPollIteration() no longer runs %s in order: %q appears before an earlier step", step.name, step.text)
+		}
+		previous = index
+	}
 }
 
 // mainFunctionSource returns the source text of main() only, so the wiring
 // assertions above cannot be satisfied by a helper, a comment elsewhere in
 // main.go or dead code outside main().
 func mainFunctionSource(t *testing.T) string {
+	t.Helper()
+	return functionSource(t, "main")
+}
+
+// functionSource returns the source text of one top-level function declared in
+// main.go, so an assertion cannot be satisfied by a helper, a comment or dead
+// code outside that function.
+func functionSource(t *testing.T, name string) string {
 	t.Helper()
 
 	src, err := os.ReadFile("main.go")
@@ -302,7 +336,7 @@ func mainFunctionSource(t *testing.T) string {
 
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv != nil || fn.Name.Name != "main" {
+		if !ok || fn.Recv != nil || fn.Name.Name != name {
 			continue
 		}
 		start := fset.Position(fn.Pos()).Offset
@@ -310,6 +344,6 @@ func mainFunctionSource(t *testing.T) string {
 		return string(src[start:end])
 	}
 
-	t.Fatal("main.go declares no main() function")
+	t.Fatalf("main.go declares no %s() function", name)
 	return ""
 }
