@@ -123,24 +123,9 @@ func main() {
 		default:
 		}
 
-		// Bound the whole iteration so a stalled Redis or Kubernetes API call
-		// turns /healthz into 503 instead of freezing the loop at a stale 200.
-		// Half the check interval leaves room for the sleep between iterations.
-		iterCtx, cancel := context.WithTimeout(ctx, backendTimeout())
-
-		// Update health status based on Redis connectivity
-		updateHealthStatus(iterCtx, rdb)
-
-		if err := checkAndLabel(iterCtx, rdb, clientset); err != nil {
+		if err := runPollIteration(ctx, rdb, clientset); err != nil {
 			fmt.Fprintf(os.Stderr, "error checking Redis role: %v\n", err)
-			// A label-phase timeout is recorded directly. Probing ROLE again
-			// could succeed a moment after the deadline and reset health to
-			// healthy while the backend is still stalled.
-			if isTimeoutError(err) {
-				recordHealthTimeout()
-			}
 		}
-		cancel()
 		time.Sleep(*checkInterval)
 	}
 }
@@ -347,6 +332,27 @@ func backendTimeout() time.Duration {
 		timeout = 100 * time.Millisecond
 	}
 	return timeout
+}
+
+// runPollIteration performs one poll iteration under its own deadline, so a
+// stalled Redis or Kubernetes API call turns /healthz into 503 instead of
+// freezing the loop at a stale 200. Half the check interval leaves room for the
+// sleep between iterations. The returned error is the label-phase error; health
+// was already updated inside the same deadline.
+func runPollIteration(ctx context.Context, rdb roleQuerier, clientset kubernetes.Interface) error {
+	iterCtx, cancel := context.WithTimeout(ctx, backendTimeout())
+	defer cancel()
+
+	updateHealthStatus(iterCtx, rdb)
+
+	err := checkAndLabel(iterCtx, rdb, clientset)
+	if err != nil && isTimeoutError(err) {
+		// A label-phase timeout is recorded directly. Probing ROLE again could
+		// succeed a moment after the deadline and reset health to healthy while
+		// the backend is still stalled.
+		recordHealthTimeout()
+	}
+	return err
 }
 
 // boundRestConfig sets a request timeout on the in-cluster client config.
