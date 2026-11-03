@@ -4,9 +4,9 @@ go 1.27.0
 
 require (
 	github.com/go-redis/redis/v8 v8.11.5
-	k8s.io/api v0.37.1
-	k8s.io/apimachinery v0.37.1
-	k8s.io/client-go v0.37.1
+	k8s.io/api v0.37.2
+	k8s.io/apimachinery v0.37.2
+	k8s.io/client-go v0.37.2
 )
 
 require (
