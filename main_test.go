@@ -20,8 +20,10 @@ import (
 	"github.com/go-redis/redis/v8"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -214,6 +216,162 @@ func TestCheckAndLabel_MissingPodReturnsError(t *testing.T) {
 	err := applyLabel(context.Background(), cs, "master")
 	if err == nil {
 		t.Fatal("applyLabel with no pod, want error")
+	}
+}
+
+// podsGVR is the resource the fake tracker stores pods under.
+func podsGVR() schema.GroupVersionResource {
+	return corev1.SchemeGroupVersion.WithResource("pods")
+}
+
+// conflictOnceReactor installs a reactor that lets the first pod Update fail
+// the way the API server fails it when another writer bumped the pod after our
+// Get, and stores that writer's version in the tracker first so a stale retry
+// would clobber it. Later Updates reach the default reactor.
+func conflictOnceReactor(t *testing.T, cs *k8sfake.Clientset, concurrent *corev1.Pod) *int {
+	t.Helper()
+
+	conflicts := 0
+	cs.PrependReactor("update", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if conflicts > 0 {
+			return false, nil, nil
+		}
+		conflicts++
+
+		concurrent.ResourceVersion = "999"
+		if err := cs.Tracker().Update(podsGVR(), concurrent, testNamespace); err != nil {
+			t.Fatalf("simulate the concurrent writer: %v", err)
+		}
+
+		return true, nil, apierrors.NewConflict(podsGVR().GroupResource(), "test-pod",
+			errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+	})
+	return &conflicts
+}
+
+// The reviewed defect: applyLabel read the pod, mutated its labels and sent the
+// whole object back with Update. Update is resourceVersion-checked, so any
+// other writer touching the pod between the read and the write (kubectl label,
+// an operator, a sidecar, a mutating controller, a second replica of this
+// labeler) failed the write with a 409 Conflict. main only logged that until
+// the next --check-interval, so under steady contention the master pod stayed
+// unlabeled and its Service selector matched nothing for arbitrarily long. A
+// conflict must be retried inside applyLabel on a freshly read pod, so the
+// label lands in the same interval and the other writer's change survives.
+func TestApplyLabel_ConflictBetweenReadAndWriteStillLabelsPod(t *testing.T) {
+	defer configureTestFlags()()
+
+	for _, role := range []string{"master", "slave"} {
+		t.Run(role, func(t *testing.T) {
+			observed := map[string]string{"keep": "me"}
+			if role != "master" {
+				observed[testKey] = testValue
+			}
+			cs := newPodClientset(testPod("test-pod", observed))
+
+			concurrent := testPod("test-pod", map[string]string{"keep": "me", "concurrent": "writer"})
+			if role != "master" {
+				concurrent.Labels[testKey] = testValue
+			}
+			conflicts := conflictOnceReactor(t, cs, concurrent)
+
+			if err := applyLabel(context.Background(), cs, role); err != nil {
+				t.Fatalf("applyLabel as %s with a pod changed between the read and the write: %v", role, err)
+			}
+			if *conflicts != 1 {
+				t.Fatalf("conflicts injected = %d, want 1: the fixture never raced the write", *conflicts)
+			}
+
+			writes := 0
+			for _, action := range cs.Actions() {
+				if action.GetVerb() == "update" {
+					writes++
+				}
+			}
+			if writes != 2 {
+				t.Fatalf("update calls = %d, want 2 (the conflicted write plus one retry)", writes)
+			}
+
+			pod, err := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get pod: %v", err)
+			}
+			if role == "master" {
+				if pod.Labels[testKey] != testValue {
+					t.Fatalf("label %s = %q, want %q: the conflicted label write was never retried", testKey, pod.Labels[testKey], testValue)
+				}
+			} else if value, exists := pod.Labels[testKey]; exists {
+				t.Fatalf("label %s = %q still present, want the key removed", testKey, value)
+			}
+			if pod.Labels["concurrent"] != "writer" {
+				t.Fatalf("label concurrent = %q, want %q: the retry overwrote the concurrent writer's change", pod.Labels["concurrent"], "writer")
+			}
+			if pod.Labels["keep"] != "me" {
+				t.Fatalf("unrelated label keep = %q, want %q", pod.Labels["keep"], "me")
+			}
+		})
+	}
+}
+
+// A pod that stays contended must not spin inside one check interval: the
+// retries are bounded and the failure is still reported, so main logs it and
+// tries again next interval.
+func TestApplyLabel_BoundedConflictRetriesReportTheConflict(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", nil))
+
+	writes := 0
+	cs.PrependReactor("update", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		writes++
+		return true, nil, apierrors.NewConflict(podsGVR().GroupResource(), "test-pod",
+			errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+	})
+
+	err := applyLabel(context.Background(), cs, "master")
+	if err == nil {
+		t.Fatal("applyLabel with every write conflicting, want error")
+	}
+	if writes != labelWriteAttempts {
+		t.Fatalf("update calls = %d, want %d: the retry must be bounded", writes, labelWriteAttempts)
+	}
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("error = %v, want it to still be recognized as a conflict", err)
+	}
+	if !strings.Contains(err.Error(), "still conflicting after 3 attempts") {
+		t.Fatalf("error = %v, want it to name the exhausted attempts", err)
+	}
+
+	pod, getErr := cs.CoreV1().Pods(testNamespace).Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if getErr != nil {
+		t.Fatalf("get pod: %v", getErr)
+	}
+	if _, exists := pod.Labels[testKey]; exists {
+		t.Fatalf("label %s present after every write failed, want it absent", testKey)
+	}
+}
+
+// Only a conflict is worth another read-modify-write. A missing pod, an RBAC
+// denial or an expired deadline fails identically on a retry, so it must be
+// reported after a single attempt instead of tripling the API calls.
+func TestApplyLabel_NonConflictErrorIsNotRetried(t *testing.T) {
+	defer configureTestFlags()()
+	cs := newPodClientset(testPod("test-pod", nil))
+
+	writes := 0
+	cs.PrependReactor("update", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		writes++
+		return true, nil, apierrors.NewForbidden(podsGVR().GroupResource(), "test-pod", errors.New("pods is forbidden: no patch verb"))
+	})
+
+	err := applyLabel(context.Background(), cs, "master")
+	if err == nil {
+		t.Fatal("applyLabel with a forbidden update, want error")
+	}
+	if writes != 1 {
+		t.Fatalf("update calls = %d, want 1: a non-conflict error must not be retried", writes)
+	}
+	if !strings.Contains(err.Error(), "failed to update pod label") {
+		t.Fatalf("error = %v, want the update failure", err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -234,7 +235,38 @@ func roleFromResponse(role interface{}) (string, error) {
 	return roleStr, nil
 }
 
+// labelWriteAttempts bounds the read-modify-write in applyLabel. The write is
+// a whole-object Update, which the API server accepts only for the
+// resourceVersion it handed out on the read: any other writer touching the pod
+// in between (kubectl label, an operator, a sidecar, a mutating controller, a
+// second replica of this labeler) makes it fail with a 409 Conflict. A retry
+// re-reads the pod and replays the one label change on the fresh object, so the
+// label still lands within the same check interval instead of waiting for the
+// next one. The bound keeps a pod that stays contended from spinning: the
+// remaining attempts are cheap, and main's loop tries again next interval.
+const labelWriteAttempts = 3
+
 func applyLabel(ctx context.Context, clientset kubernetes.Interface, roleStr string) error {
+	var err error
+	for attempt := 1; attempt <= labelWriteAttempts; attempt++ {
+		err = applyLabelOnce(ctx, clientset, roleStr)
+		if err == nil {
+			return nil
+		}
+		// Only a conflict is worth another round trip: any other error (missing
+		// pod, RBAC denial, expired deadline) fails the same way on a retry.
+		if !apierrors.IsConflict(err) {
+			return err
+		}
+	}
+
+	return fmt.Errorf("pod %s/%s label update still conflicting after %d attempts: %w", *podNamespace, *podName, labelWriteAttempts, err)
+}
+
+// applyLabelOnce is one read-modify-write of the label. It reports the API
+// server's conflict as a wrapped error so applyLabel can tell a lost
+// resourceVersion race from a real failure.
+func applyLabelOnce(ctx context.Context, clientset kubernetes.Interface, roleStr string) error {
 	pod, err := clientset.CoreV1().Pods(*podNamespace).Get(ctx, *podName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get pod: %w", err)
